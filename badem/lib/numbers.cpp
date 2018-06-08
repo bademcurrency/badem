@@ -79,7 +79,7 @@ bool rai::uint256_union::decode_account (std::string const & source_a)
 	if (!error)
 	{
 		auto bdm_prefix (source_a[0] == 'b' && source_a[1] == 'd' && source_a[2] == 'm' && (source_a[3] == '_' || source_a[3] == '-'));
-		auto badem_prefix (source_a[0] == 'b' && source_a[1] == 'a' && source_a[2] == 'd' && (source_a[4] == 'e' || source_a[4] == 'm'));
+		auto badem_prefix (source_a[0] == 'b' && source_a[1] == 'a' && source_a[2] == 'd' && (source_a[3] == 'e' || source_a[3] == 'm'));
 		error = (bdm_prefix && source_a.size () != 64) || (badem_prefix && source_a.size () != 67);
 		if (!error)
 		{
