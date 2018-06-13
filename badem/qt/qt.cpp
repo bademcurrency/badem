@@ -1572,11 +1572,11 @@ wallet (wallet_a)
 	ratio_group->addButton (bademcikbutton);
 	ratio_group->addButton (rawbutton);
 	ratio_group->setId (badembutton, 0);
-	ratio_group->setId (banoshibutton, 1);
+	ratio_group->setId (bademcikbutton, 1);
 	ratio_group->setId (rawbutton, 2);
 	scale_layout->addWidget (scale_label);
 	scale_layout->addWidget (badembutton);
-	scale_layout->addWidget (banoshibutton);
+	scale_layout->addWidget (bademcikbutton);
 	scale_layout->addWidget (rawbutton);
 	scale_window->setLayout (scale_layout);
 
@@ -1630,10 +1630,10 @@ wallet (wallet_a)
 			this->wallet.change_rendering_ratio (rai::BADEM_ratio);
 		}
 	});
-	QObject::connect (banoshibutton, &QRadioButton::toggled, [this]() {
-		if (banoshibutton->isChecked ())
+	QObject::connect (bademcikbutton, &QRadioButton::toggled, [this]() {
+		if (bademcikbutton->isChecked ())
 		{
-			this->wallet.change_rendering_ratio (rai::banoshi_ratio);
+			this->wallet.change_rendering_ratio (rai::bademcik_ratio);
 		}
 	});
 	QObject::connect (rawbutton, &QRadioButton::toggled, [this]() {
