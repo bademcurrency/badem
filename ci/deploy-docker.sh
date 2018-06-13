@@ -7,7 +7,7 @@ docker login -u nanocurrency -p "$DOCKER_PASSWORD"
 
 # We push this just so it can be a cache next time
 if [ "$TRAVIS_BRANCH" = "master" ]; then
-    "$scripts"/custom-timeout.sh 30 docker push bademcurrency/badem-ci
+    "$scripts"/custom-timeout.sh 30 docker push bademcurrency/badem
 fi
 
 tags=()
