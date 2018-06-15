@@ -364,8 +364,8 @@ public:
 			BOOST_LOG (node.log) << boost::str (boost::format ("Received confirm_ack message from %1% for %2% sequence %3%") % sender % message_a.vote->block->hash ().to_string () % std::to_string (message_a.vote->sequence));
 		}
 		node.stats.inc (rai::stat::type::message, rai::stat::detail::confirm_ack, rai::stat::dir::in);
-		node.peers.contacted (sender, message_a.version_using);
-		node.peers.insert (sender, message_a.version_using);
+		node.peers.contacted (sender, message_a.header.version_using);
+		node.peers.insert (sender, message_a.header.version_using);
 		node.process_active (message_a.vote->block);
 		node.vote_processor.vote (message_a.vote, sender);
 	}
@@ -807,6 +807,12 @@ lmdb_max_dbs (128)
 			preconfigured_peers.push_back ("");
 			preconfigured_representatives.push_back (rai::account ("36B3AFC042CCB5099DC163FA2BFE42D6E486991B685EAAB0DF73714D91A59400"));
 			preconfigured_representatives.push_back (rai::account ("29126049B40D1755C0A1C02B71646EEAB9E1707C16E94B47100F3228D59B1EB2"));
+			
+			
+			
+			
+			
+			
 			state_block_parse_canary = rai::block_hash ("7928ECD2678F7F2EDF817679A74B74F9F409A050E7422B184584B1B2424ADADA");
 			state_block_generate_canary = rai::block_hash ("85EC32326D12E540D04C51E4F498508676EAE26655DCF7F7312834460DE5EB54");
 			break;
@@ -950,7 +956,7 @@ bool rai::node_config::upgrade_json (unsigned version, boost::property_tree::ptr
 			tree_a.put ("version", "11");
 			result = true;
 		case 11:
-{
+		{
 			auto online_weight_quorum_l (tree_a.get<std::string> ("online_weight_quorom"));
 			tree_a.erase ("online_weight_quorom");
 			tree_a.put ("online_weight_quorum", online_weight_quorum_l);
@@ -1693,6 +1699,7 @@ void rai::node::send_keepalive (rai::endpoint const & endpoint_a)
 	assert (endpoint_l.address ().is_v6 ());
 	network.send_keepalive (endpoint_l);
 }
+
 void rai::node::process_fork (MDB_txn * transaction_a, std::shared_ptr<rai::block> block_a)
 {
 	auto root (block_a->root ());
@@ -2439,6 +2446,7 @@ public:
 	rai::block_hash root;
 	std::mutex mutex;
 	std::map<boost::asio::ip::address, uint16_t> outstanding;
+	std::vector<std::pair<std::string, uint16_t>> need_resolve;
 	std::atomic_flag completed;
 };
 }
@@ -3408,10 +3416,6 @@ void rai::active_transactions::erase (rai::block const & block_a)
 	}
 }
 
-rai::active_transactions::active_transactions (rai::node & node_a) :
-node (node_a)
-{
-}
 rai::active_transactions::active_transactions (rai::node & node_a) :
 node (node_a)
 {
