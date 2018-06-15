@@ -177,7 +177,11 @@ public:
 
 void ledger_processor::state_block (rai::state_block const & block_a)
 {
-	state_block_impl (block_a);
+	result.code = ledger.state_block_parsing_enabled (transaction) ? rai::process_result::progress : rai::process_result::state_block_disabled;
+	if (result.code == rai::process_result::progress)
+	{
+		state_block_impl (block_a);
+	}
 }
 
 void ledger_processor::state_block_impl (rai::state_block const & block_a)
@@ -498,14 +502,15 @@ size_t rai::shared_ptr_block_hash::operator() (std::shared_ptr<rai::block> const
 
 bool rai::shared_ptr_block_hash::operator() (std::shared_ptr<rai::block> const & lhs, std::shared_ptr<rai::block> const & rhs) const
 {
-	return lhs->hash () == rhs->hash ();
+	return *lhs == *rhs;
 }
 
-rai::ledger::ledger (rai::block_store & store_a, rai::stat & stat_a) :
-
+rai::ledger::ledger (rai::block_store & store_a, rai::stat & stat_a, rai::block_hash const & state_block_parse_canary_a, rai::block_hash const & state_block_generate_canary_a) :
 store (store_a),
 stats (stat_a),
-check_bootstrap_weights (true)
+check_bootstrap_weights (true),
+state_block_parse_canary (state_block_parse_canary_a),
+state_block_generate_canary (state_block_generate_canary_a)
 {
 }
 
@@ -547,7 +552,7 @@ rai::uint128_t rai::ledger::balance (MDB_txn * transaction_a, rai::block_hash co
 {
 	balance_visitor visitor (transaction_a, store);
 	visitor.compute (hash_a);
-	return visitor.balance;
+	return visitor.result;
 }
 
 // Balance for an account by account number
@@ -740,7 +745,7 @@ rai::uint128_t rai::ledger::amount (MDB_txn * transaction_a, rai::block_hash con
 {
 	amount_visitor amount (transaction_a, store);
 	amount.compute (hash_a);
-	return amount.amount;
+	return amount.result;
 }
 
 // Return latest block for account
@@ -787,6 +792,16 @@ void rai::ledger::dump_account_chain (rai::account const & account_a)
 		std::cerr << hash.to_string () << std::endl;
 		hash = block->previous ();
 	}
+}
+
+bool rai::ledger::state_block_parsing_enabled (MDB_txn * transaction_a)
+{
+	return store.block_exists (transaction_a, state_block_parse_canary);
+}
+
+bool rai::ledger::state_block_generation_enabled (MDB_txn * transaction_a)
+{
+	return state_block_parsing_enabled (transaction_a) && store.block_exists (transaction_a, state_block_generate_canary);
 }
 
 void rai::ledger::checksum_update (MDB_txn * transaction_a, rai::block_hash const & hash_a)
