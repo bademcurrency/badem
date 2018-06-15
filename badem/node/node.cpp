@@ -1660,7 +1660,7 @@ stats (config.stat_config)
 					{
 						break;
 					}
-					BOOST_LOG (log) << "Using bootstrap rep weight: " << account.to_account () << " -> " << weight.format_balance (BADEM_ratio, 0, true) << " BADEM";
+					BOOST_LOG (log) << "Using bootstrap rep weight: " << account.to_account () << " -> " << weight.format_balance (BDM_ratio, 0, true) << " BDM";
 					ledger.bootstrap_weights[account] = weight.number ();
 				}
 			}
@@ -2159,13 +2159,13 @@ void rai::node::backup_wallet ()
 
 int rai::node::price (rai::uint128_t const & balance_a, int amount_a)
 {
-	assert (balance_a >= amount_a * rai::kBADEM_ratio);
+	assert (balance_a >= amount_a * rai::kBDM_ratio);
 	auto balance_l (balance_a);
 	double result (0.0);
 	for (auto i (0); i < amount_a; ++i)
 	{
-		balance_l -= rai::kBADEM_ratio;
-		auto balance_scaled ((balance_l / rai::BADEM_ratio).convert_to<double> ());
+		balance_l -= rai::kBDM_ratio;
+		auto balance_scaled ((balance_l / rai::BDM_ratio).convert_to<double> ());
 		auto units (balance_scaled / 1000.0);
 		auto unit_price (((free_cutoff - units) / free_cutoff) * price_max);
 		result += std::min (std::max (0.0, unit_price), price_max);
