@@ -79,7 +79,7 @@ bool rai::uint256_union::decode_account (std::string const & source_a)
 	if (!error)
 	{
 		auto bdm_prefix (source_a[0] == 'b' && source_a[1] == 'd' && source_a[2] == 'm' && (source_a[3] == '_' || source_a[3] == '-'));
-		error = (ban_prefix && source_a.size () != 64);
+		error = (bdm_prefix && source_a.size () != 64);
 		if (!error)
 		{
 			if (bdm_prefix)
