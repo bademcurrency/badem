@@ -310,8 +310,10 @@ TEST (uint256_union, big_endian_union_function)
 TEST (uint256_union, decode_nano_variant)
 {
 	rai::uint256_union key;
-	ASSERT_FALSE (key.decode_account ("bdm_1111111111111111111111111111111111111111111111111111hifc8npp"));
-ASSERT_FALSE (key.decode_account ("badem_1111111111111111111111111111111111111111111111111111hifc8npp"));
+	ASSERT_FALSE (key.decode_account ("TR6ZJ4pdp6HC76xMRpVDny5x2s8AEbrhFue3NKVxYYdmKuTEib"));
+	ASSERT_EQ (rai::badem_test_account, key);
+}
+
 TEST (uint256_union, decode_account_variations)
 {
 	for (int i = 0; i < 100; i++)
