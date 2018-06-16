@@ -63,7 +63,7 @@ public:
 	// Tell the network our view of the winner
 	void broadcast_winner ();
 	// Change our winner to agree with the network
-	void compute_rep_votes (MDB_txn *, std::shared_ptr<rai::block>);
+	void compute_rep_votes (MDB_txn *);
 	// Confirm this block if quorum is met
 	void confirm_if_quorum (MDB_txn *);
 	rai::votes votes;
@@ -101,7 +101,6 @@ public:
 	bool active (rai::block const &);
 	void announce_votes ();
 	std::deque<std::shared_ptr<rai::block>> list_blocks ();
-	void erase (rai::block const &);
 	void stop ();
 	boost::multi_index_container<
 	rai::conflict_info,
@@ -299,8 +298,7 @@ public:
 class block_arrival
 {
 public:
-	// Return `true' to indicated an error if the block has already been inserted
-	bool add (rai::block_hash const &);
+	void add (rai::block_hash const &);
 	bool recent (rai::block_hash const &);
 	boost::multi_index_container<
 	rai::block_arrival_info,
@@ -429,13 +427,13 @@ public:
 	rai::account random_representative ();
 	uint16_t peering_port;
 	rai::logging logging;
-	std::vector<std::pair<std::string, uint16_t>> work_peers;
+	std::vector<std::pair<boost::asio::ip::address, uint16_t>> work_peers;
 	std::vector<std::string> preconfigured_peers;
 	std::vector<rai::account> preconfigured_representatives;
 	unsigned bootstrap_fraction_numerator;
 	rai::amount receive_minimum;
 	rai::amount online_weight_minimum;
-	unsigned online_weight_quorum;
+	unsigned online_weight_quorom;
 	unsigned password_fanout;
 	unsigned io_threads;
 	unsigned work_threads;
@@ -544,12 +542,11 @@ public:
 	void ongoing_store_flush ();
 	void backup_wallet ();
 	int price (rai::uint128_t const &, int);
-	void work_generate_blocking (rai::block &);
-	uint64_t work_generate_blocking (rai::uint256_union const &);
-	void work_generate (rai::uint256_union const &, std::function<void(uint64_t)>);
+	void generate_work (rai::block &);
+	uint64_t generate_work (rai::uint256_union const &);
+	void generate_work (rai::uint256_union const &, std::function<void(uint64_t)>);
 	void add_initial_peers ();
 	void block_confirm (std::shared_ptr<rai::block>);
-	void process_fork (MDB_txn *, std::shared_ptr<rai::block>);
 	rai::uint128_t delta ();
 	boost::asio::io_service & service;
 	rai::node_config config;

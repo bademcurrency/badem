@@ -781,7 +781,11 @@ peering_port (peering_port_a),
 logging (logging_a),
 bootstrap_fraction_numerator (1),
 receive_minimum (rai::RAW_ratio),
+<<<<<<< HEAD
 online_weight_minimum (60000 * rai::kBDM_ratio),
+=======
+online_weight_minimum (60000 * rai::kBADEM_ratio),
+>>>>>>> parent of 89f8d569... Merging with version 14.1
 online_weight_quorom (50),
 password_fanout (1024),
 io_threads (std::max<unsigned> (4, std::thread::hardware_concurrency ())),
@@ -800,13 +804,17 @@ state_block_generate_canary (0)
 			preconfigured_representatives.push_back (rai::genesis_account);
 			break;
 		case rai::badem_networks::badem_beta_network:
-			preconfigured_peers.push_back ("");
+			preconfigured_peers.push_back ("peers-beta.banano.co.in");
 			preconfigured_representatives.push_back (rai::account ("22DB2DF76D0AB4B474FC0E7E6C324403B500E8432D4E7BB33B4580DFB53748CE"));
 			state_block_parse_canary = rai::block_hash ("73C5E7D1EE86BBCE2163B8155C812D7CD0624C513EB52D32D487094058EABF70");
 			state_block_generate_canary = rai::block_hash ("2B8BE5A233991AED695820578A958895BD5D317AA9B8C27A02D9ADF9094D3B3B");
 			break;
 		case rai::badem_networks::badem_live_network:
+<<<<<<< HEAD
 			preconfigured_peers.push_back ("rai.raiblocks.net");
+=======
+			preconfigured_peers.push_back ("tarzan.banano.co.in");
+>>>>>>> parent of 89f8d569... Merging with version 14.1
 			preconfigured_representatives.push_back (rai::account ("36B3AFC042CCB5099DC163FA2BFE42D6E486991B685EAAB0DF73714D91A59400"));
 			preconfigured_representatives.push_back (rai::account ("29126049B40D1755C0A1C02B71646EEAB9E1707C16E94B47100F3228D59B1EB2"));
 

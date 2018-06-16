@@ -13,12 +13,12 @@ using uint128_t = boost::multiprecision::uint128_t;
 using uint256_t = boost::multiprecision::uint256_t;
 using uint512_t = boost::multiprecision::uint512_t;
 // SI dividers
-rai::uint128_t const kBDM_ratio = rai::uint128_t ("100000000000000000000000000000000"); // 10^32
-rai::uint128_t const BDM_ratio = rai::uint128_t ("100000000000000000000000000000"); // 10^29
+rai::uint128_t const kBADEM_ratio = rai::uint128_t ("100000000000000000000000000000000"); // 10^32
+rai::uint128_t const BADEM_ratio = rai::uint128_t ("100000000000000000000000000000"); // 10^29
 rai::uint128_t const bademcik_ratio = rai::uint128_t ("1000000000000000000000000000"); // 10^27
 rai::uint128_t const RAW_ratio = rai::uint128_t ("1"); // 10^0
-rai::uint128_t const mBDM_ratio = rai::uint128_t ("100000000000000000000000000"); // 10^26
-rai::uint128_t const uBDM_ratio = rai::uint128_t ("100000000000000000000000"); // 10^23
+rai::uint128_t const mBADEM_ratio = rai::uint128_t ("100000000000000000000000000"); // 10^26
+rai::uint128_t const uBADEM_ratio = rai::uint128_t ("100000000000000000000000"); // 10^23
 
 union uint128_union
 {

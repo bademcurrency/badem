@@ -116,7 +116,6 @@ public:
 	void process_request ();
 	void account_balance ();
 	void account_block_count ();
-	void account_count ();
 	void account_create ();
 	void account_get ();
 	void account_history ();
@@ -150,6 +149,7 @@ public:
 	void delegators_count ();
 	void deterministic_key ();
 	void frontiers ();
+	void frontier_count ();
 	void history ();
 	void keepalive ();
 	void key_create ();
