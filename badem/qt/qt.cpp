@@ -916,7 +916,7 @@ std::string badem_qt::status::color ()
 }
 
 badem_qt::wallet::wallet (QApplication & application_a, badem_qt::eventloop_processor & processor_a, rai::node & node_a, std::shared_ptr<rai::wallet> wallet_a, rai::account & account_a) :
-rendering_ratio (rai::BADEM_ratio),
+rendering_ratio (rai::BDM_ratio),
 node (node_a),
 wallet_m (wallet_a),
 account (account_a),
@@ -1713,7 +1713,7 @@ wallet (wallet_a)
 	QObject::connect (badembutton, &QRadioButton::toggled, [this]() {
 		if (badembutton->isChecked ())
 		{
-			this->wallet.change_rendering_ratio (rai::BADEM_ratio);
+			this->wallet.change_rendering_ratio (rai::BDM_ratio);
 		}
 	});
 	QObject::connect (bademcikbutton, &QRadioButton::toggled, [this]() {
