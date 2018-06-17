@@ -781,17 +781,8 @@ peering_port (peering_port_a),
 logging (logging_a),
 bootstrap_fraction_numerator (1),
 receive_minimum (rai::RAW_ratio),
-<<<<<<< HEAD
 online_weight_minimum (60000 * rai::kBDM_ratio),
-<<<<<<< HEAD
-=======
-online_weight_minimum (60000 * rai::kBADEM_ratio),
->>>>>>> parent of 89f8d569... Merging with version 14.1
-online_weight_quorom (50),
-=======
 online_weight_quorum (50),
->>>>>>> parent of 05888a4e... fixing node.cpp
-password_fanout (1024),
 io_threads (std::max<unsigned> (4, std::thread::hardware_concurrency ())),
 work_threads (std::max<unsigned> (4, std::thread::hardware_concurrency ())),
 enable_voting (true),
@@ -806,29 +797,14 @@ lmdb_max_dbs (128)
 			preconfigured_representatives.push_back (rai::genesis_account);
 			break;
 		case rai::badem_networks::badem_beta_network:
-			preconfigured_peers.push_back ("peers-beta.banano.co.in");
+			preconfigured_peers.push_back ("rai.raiblocks.net");
 			preconfigured_representatives.push_back (rai::account ("22DB2DF76D0AB4B474FC0E7E6C324403B500E8432D4E7BB33B4580DFB53748CE"));
 			state_block_parse_canary = rai::block_hash ("73C5E7D1EE86BBCE2163B8155C812D7CD0624C513EB52D32D487094058EABF70");
 			state_block_generate_canary = rai::block_hash ("2B8BE5A233991AED695820578A958895BD5D317AA9B8C27A02D9ADF9094D3B3B");
 			break;
-		case rai::badem_networks::badem_live_network:
-<<<<<<< HEAD
-<<<<<<< HEAD
-			preconfigured_peers.push_back ("rai.raiblocks.net");
-=======
-			preconfigured_peers.push_back ("tarzan.banano.co.in");
->>>>>>> parent of 89f8d569... Merging with version 14.1
-=======
-			preconfigured_peers.push_back ("");
->>>>>>> parent of 05888a4e... fixing node.cpp
-			preconfigured_representatives.push_back (rai::account ("36B3AFC042CCB5099DC163FA2BFE42D6E486991B685EAAB0DF73714D91A59400"));
+		case rai::badem_networks::badem_live_network:			preconfigured_peers.push_back ("rai.raiblocks.net");
+		preconfigured_representatives.push_back (rai::account ("36B3AFC042CCB5099DC163FA2BFE42D6E486991B685EAAB0DF73714D91A59400"));
 			preconfigured_representatives.push_back (rai::account ("29126049B40D1755C0A1C02B71646EEAB9E1707C16E94B47100F3228D59B1EB2"));
-			
-			
-			
-			
-			
-			
 			state_block_parse_canary = rai::block_hash ("7928ECD2678F7F2EDF817679A74B74F9F409A050E7422B184584B1B2424ADADA");
 			state_block_generate_canary = rai::block_hash ("85EC32326D12E540D04C51E4F498508676EAE26655DCF7F7312834460DE5EB54");
 			break;
@@ -966,15 +942,15 @@ bool rai::node_config::upgrade_json (unsigned version, boost::property_tree::ptr
 			result = true;
 		case 10:
 			tree_a.put ("online_weight_minimum", online_weight_minimum.to_string_dec ());
-			tree_a.put ("online_weight_quorom", std::to_string (online_weight_quorum));
+			tree_a.put ("online_weight_quorum", std::to_string (online_weight_quorum));
 			tree_a.erase ("inactive_supply");
 			tree_a.erase ("version");
 			tree_a.put ("version", "11");
 			result = true;
 		case 11:
 		{
-			auto online_weight_quorum_l (tree_a.get<std::string> ("online_weight_quorom"));
-			tree_a.erase ("online_weight_quorom");
+			auto online_weight_quorum_l (tree_a.get<std::string> ("online_weight_quorum"));
+			tree_a.erase ("online_weight_quorum");
 			tree_a.put ("online_weight_quorum", online_weight_quorum_l);
 			tree_a.erase ("version");
 			tree_a.put ("version", "12");

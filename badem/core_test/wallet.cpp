@@ -851,8 +851,8 @@ TEST (wallet, send_race)
 	rai::keypair key2;
 	for (auto i (1); i < 60; ++i)
 	{
-		ASSERT_NE (nullptr, system.wallet (0)->send_action (rai::test_genesis_key.pub, key2.pub, rai::kBADEM_ratio));
-		ASSERT_EQ (rai::genesis_amount - rai::kBADEM_ratio * i, system.nodes[0]->balance (rai::test_genesis_key.pub));
+		ASSERT_NE (nullptr, system.wallet (0)->send_action (rai::test_genesis_key.pub, key2.pub, rai::kBDM_ratio));
+		ASSERT_EQ (rai::genesis_amount - rai::kBDM_ratio * i, system.nodes[0]->balance (rai::test_genesis_key.pub));
 	}
 }
 
