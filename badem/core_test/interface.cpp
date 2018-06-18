@@ -28,7 +28,7 @@ TEST (interface, badem_uint256_to_address)
 	rai::uint256_union zero (0);
 	char text[65] = { 0 };
 	badem_uint256_to_address (zero.bytes.data (), text);
-	ASSERT_STREQ ("badem_1111111111111111111111111111111111111111111111111111hifc8npp", text);
+	ASSERT_STREQ ("bdm_1111111111111111111111111111111111111111111111111111hifc8npp", text);
 }
 
 TEST (interface, badem_uint512_to_string)
@@ -65,9 +65,9 @@ TEST (interface, badem_uint512_from_string)
 
 TEST (interface, badem_valid_address)
 {
-	ASSERT_EQ (0, badem_valid_address ("badem_1111111111111111111111111111111111111111111111111111hifc8npp"));
-	ASSERT_EQ (1, badem_valid_address ("badem_1111111111111111111111111111111111111111111111111111hifc8nppp"));
-	ASSERT_EQ (1, badem_valid_address ("badem_1111111211111111111111111111111111111111111111111111hifc8npp"));
+	ASSERT_EQ (0, badem_valid_address ("bdm_1111111111111111111111111111111111111111111111111111hifc8npp"));
+	ASSERT_EQ (1, badem_valid_address ("bdm_1111111111111111111111111111111111111111111111111111hifc8nppp"));
+	ASSERT_EQ (1, badem_valid_address ("bdm_1111111211111111111111111111111111111111111111111111hifc8npp"));
 }
 
 TEST (interface, badem_seed_create)

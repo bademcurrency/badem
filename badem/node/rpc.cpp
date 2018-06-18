@@ -2104,7 +2104,7 @@ void rai::rpc_handler::badem_from_raw ()
 	rai::uint128_union amount;
 	if (!amount.decode_dec (amount_text))
 	{
-		auto result (amount.number () / rai::BADEM_ratio);
+		auto result (amount.number () / rai::BDM_ratio);
 		boost::property_tree::ptree response_l;
 		response_l.put ("amount", result.convert_to<std::string> ());
 		response (response_l);
@@ -2121,7 +2121,7 @@ void rai::rpc_handler::badem_to_raw ()
 	rai::uint128_union amount;
 	if (!amount.decode_dec (amount_text))
 	{
-		auto result (amount.number () * rai::BADEM_ratio);
+		auto result (amount.number () * rai::BDM_ratio);
 		if (result > amount.number ())
 		{
 			boost::property_tree::ptree response_l;

@@ -702,7 +702,7 @@ wallet (wallet_a)
 			show_line_ok (*account_line);
 			this->history.refresh ();
 			auto balance (this->wallet.node.balance_pending (account));
-			auto final_text (std::string ("Balance (BADEM): ") + wallet.format_balance (balance.first));
+			auto final_text (std::string ("Balance (BDM): ") + wallet.format_balance (balance.first));
 			if (!balance.second.is_zero ())
 			{
 				final_text += "\nPending: " + wallet.format_balance (balance.second);
@@ -832,7 +832,7 @@ std::string badem_qt::status::color ()
 }
 
 badem_qt::wallet::wallet (QApplication & application_a, badem_qt::eventloop_processor & processor_a, rai::node & node_a, std::shared_ptr<rai::wallet> wallet_a, rai::account & account_a) :
-rendering_ratio (rai::BADEM_ratio),
+rendering_ratio (rai::BDM_ratio),
 node (node_a),
 wallet_m (wallet_a),
 account (account_a),
@@ -1265,7 +1265,7 @@ void badem_qt::wallet::change_rendering_ratio (rai::uint128_t const & rendering_
 std::string badem_qt::wallet::format_balance (rai::uint128_t const & balance) const
 {
 	auto balance_str = rai::amount (balance).format_balance (rendering_ratio, 0, false);
-	auto unit = std::string ("BADEM");
+	auto unit = std::string ("BDM");
 	if (rendering_ratio == rai::bademcik_ratio)
 	{
 		unit = std::string ("bademcik");
@@ -1547,7 +1547,7 @@ scale_window (new QWidget),
 scale_layout (new QHBoxLayout),
 scale_label (new QLabel ("Scale:")),
 ratio_group (new QButtonGroup),
-badembutton (new QRadioButton ("BADEM")),
+badembutton (new QRadioButton ("BDM")),
 bademcikbutton (new QRadioButton ("bademcik")),
 rawbutton (new QRadioButton ("raw")),
 back (new QPushButton ("Back")),
@@ -1627,7 +1627,7 @@ wallet (wallet_a)
 	QObject::connect (badembutton, &QRadioButton::toggled, [this]() {
 		if (badembutton->isChecked ())
 		{
-			this->wallet.change_rendering_ratio (rai::BADEM_ratio);
+			this->wallet.change_rendering_ratio (rai::BDM_ratio);
 		}
 	});
 	QObject::connect (bademcikbutton, &QRadioButton::toggled, [this]() {

@@ -13,7 +13,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleIconFile</key>
-	<string>Badem.icns</string>
+	<string>badem.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>net.badem.badem_wallet</string>
 </dict>

@@ -29,7 +29,7 @@ int badem_uint256_from_string (const char * source, badem_uint256 destination);
 // Return 0 on success, nonzero on error
 int badem_uint512_from_string (const char * source, badem_uint512 destination);
 
-// Check if the null-terminated string 'account' is a valid xrb account number
+// Check if the null-terminated string 'account' is a valid bdm account number
 // Return 0 on correct, nonzero on invalid
 int badem_valid_address (const char * account);
 

@@ -37,15 +37,9 @@
         "preconfigured_peers": [
             ""
         ],
-        "preconfigured_representatives": [
-            "badem_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43"
-            
-            
-            
-            
-           
-            
-        ],
+        "preconfigured_representatives": [ // List of defaults representatives, which you delegate voting weight, of your wallet
+           "bdm_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43"
+       ],
         "inactive_supply": "0",
         "password_fanout": "1024",
         "io_threads": "4",

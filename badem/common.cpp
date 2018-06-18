@@ -15,14 +15,14 @@
 namespace
 {
 char const * test_private_key_data = "34F0A37AAD20F4A260F0A5B3CB3D7FB50673212263E58A380BC10474BB039CE4";
-char const * test_public_key_data = "B0311EA55708D6A53C75CDBF88300259C6D018522FE3D4D0A242E431F9E8B6D0"; // badem_3e3j5tkog48pnny9dmfzj1r16pg8t1e76dz5tmac6iq689wyjfpiij4txtdo
-char const * beta_public_key_data = "2D1D8E3C9D12200F92FE816B10DAF4A53883A2C320AC903BDFBECF91DC7AAD5D"; // badem_1daxjrybt6j13ybhx1dd45fhbbbrigje8a7ek1xxzhphk9g9odcxn874any1
-char const * live_public_key_data = "1A89922741BA8FB529EB7C9A1A465C813417B91383D18E7CCF9003F61495DDCA"; // badem_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43
+char const * test_public_key_data = "B0311EA55708D6A53C75CDBF88300259C6D018522FE3D4D0A242E431F9E8B6D0"; // bdm_3e3j5tkog48pnny9dmfzj1r16pg8t1e76dz5tmac6iq689wyjfpiij4txtdo
+char const * beta_public_key_data = "2D1D8E3C9D12200F92FE816B10DAF4A53883A2C320AC903BDFBECF91DC7AAD5D"; // bdm_1daxjrybt6j13ybhx1dd45fhbbbrigje8a7ek1xxzhphk9g9odcxn874any1
+char const * live_public_key_data = "1A89922741BA8FB529EB7C9A1A465C813417B91383D18E7CCF9003F61495DDCA"; // bdm_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43
 char const * test_genesis_data = R"%%%({
 	"type": "open",
 	"source": "B0311EA55708D6A53C75CDBF88300259C6D018522FE3D4D0A242E431F9E8B6D0",
-	"representative": "badem_3e3j5tkog48pnny9dmfzj1r16pg8t1e76dz5tmac6iq689wyjfpiij4txtdo",
-	"account": "badem_3e3j5tkog48pnny9dmfzj1r16pg8t1e76dz5tmac6iq689wyjfpiij4txtdo",
+	"representative": "bdm_3e3j5tkog48pnny9dmfzj1r16pg8t1e76dz5tmac6iq689wyjfpiij4txtdo",
+	"account": "bdm_3e3j5tkog48pnny9dmfzj1r16pg8t1e76dz5tmac6iq689wyjfpiij4txtdo",
 	"work": "9680625b39d3363d",
 	"signature": "ECDA914373A2F0CA1296475BAEE40500A7F0A7AD72A5A80C81D7FAB7F6C802B2CC7DB50F5DD0FB25B2EF11761FA7344A158DD5A700B21BD47DE5BD0F63153A02"
 })%%%";
@@ -30,8 +30,8 @@ char const * test_genesis_data = R"%%%({
 char const * beta_genesis_data = R"%%%({
 	"type": "open",
 	"source": "2D1D8E3C9D12200F92FE816B10DAF4A53883A2C320AC903BDFBECF91DC7AAD5D",
-	"representative": "badem_1daxjrybt6j13ybhx1dd45fhbbbrigje8a7ek1xxzhphk9g9odcxn874any1",
-	"account": "badem_1daxjrybt6j13ybhx1dd45fhbbbrigje8a7ek1xxzhphk9g9odcxn874any1",
+	"representative": "bdm_1daxjrybt6j13ybhx1dd45fhbbbrigje8a7ek1xxzhphk9g9odcxn874any1",
+	"account": "bdm_1daxjrybt6j13ybhx1dd45fhbbbrigje8a7ek1xxzhphk9g9odcxn874any1",
 	"work": "d967179634337e2d",
 	"signature": "AF7F1917ED42989442FD6ED7D367F0EF3D010AC1B6D7F37556F6D9666B1CD5F59108C92CD0D249DE10592EBC8B721C5C655DD0824C82304DBF13FEE654A87E03"
 })%%%";
@@ -39,8 +39,8 @@ char const * beta_genesis_data = R"%%%({
 char const * live_genesis_data = R"%%%({
 	"type": "open",
 	"source": "1A89922741BA8FB529EB7C9A1A465C813417B91383D18E7CCF9003F61495DDCA",
-	"representative": "badem_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43",
-	"account": "badem_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43",
+	"representative": "bdm_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43",
+	"account": "bdm_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43",
 	"work": "f1c935a200662651",
 	"signature": "2971C2F11CCBB69846ACA4A5CDD72FA28094D9C8641788C24256C47792776EC1A685E1877700E7D2DC2ECDA25AC418BD82A4F816EFA8A23645001205FA369B06"
 })%%%";

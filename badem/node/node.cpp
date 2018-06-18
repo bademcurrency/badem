@@ -781,7 +781,7 @@ peering_port (peering_port_a),
 logging (logging_a),
 bootstrap_fraction_numerator (1),
 receive_minimum (rai::RAW_ratio),
-online_weight_minimum (60000 * rai::kBADEM_ratio),
+online_weight_minimum (60000 * rai::kBDM_ratio),
 online_weight_quorom (50),
 password_fanout (1024),
 io_threads (std::max<unsigned> (4, std::thread::hardware_concurrency ())),
@@ -800,7 +800,7 @@ state_block_generate_canary (0)
 			preconfigured_representatives.push_back (rai::genesis_account);
 			break;
 		case rai::badem_networks::badem_beta_network:
-			preconfigured_peers.push_back ("peers-beta.banano.co.in");
+			preconfigured_peers.push_back ("");
 			preconfigured_representatives.push_back (rai::account ("22DB2DF76D0AB4B474FC0E7E6C324403B500E8432D4E7BB33B4580DFB53748CE"));
 			state_block_parse_canary = rai::block_hash ("73C5E7D1EE86BBCE2163B8155C812D7CD0624C513EB52D32D487094058EABF70");
 			state_block_generate_canary = rai::block_hash ("2B8BE5A233991AED695820578A958895BD5D317AA9B8C27A02D9ADF9094D3B3B");
@@ -1671,7 +1671,7 @@ stats (config.stat_config)
 					{
 						break;
 					}
-					BOOST_LOG (log) << "Using bootstrap rep weight: " << account.to_account () << " -> " << weight.format_balance (BADEM_ratio, 0, true) << " BADEM";
+					BOOST_LOG (log) << "Using bootstrap rep weight: " << account.to_account () << " -> " << weight.format_balance (BDM_ratio, 0, true) << " BDM";
 					ledger.bootstrap_weights[account] = weight.number ();
 				}
 			}
@@ -2126,13 +2126,13 @@ void rai::node::backup_wallet ()
 
 int rai::node::price (rai::uint128_t const & balance_a, int amount_a)
 {
-	assert (balance_a >= amount_a * rai::kBADEM_ratio);
+	assert (balance_a >= amount_a * rai::kBDM_ratio);
 	auto balance_l (balance_a);
 	double result (0.0);
 	for (auto i (0); i < amount_a; ++i)
 	{
-		balance_l -= rai::kBADEM_ratio;
-		auto balance_scaled ((balance_l / rai::BADEM_ratio).convert_to<double> ());
+		balance_l -= rai::kBDM_ratio;
+		auto balance_scaled ((balance_l / rai::BDM_ratio).convert_to<double> ());
 		auto units (balance_scaled / 1000.0);
 		auto unit_price (((free_cutoff - units) / free_cutoff) * price_max);
 		result += std::min (std::max (0.0, unit_price), price_max);

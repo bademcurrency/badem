@@ -54,7 +54,7 @@ void rai::uint256_union::encode_account (std::string & destination_a) const
 		number_l >>= 5;
 		destination_a.push_back (account_encode (r));
 	}
-	destination_a.append ("_medab"); // badem_
+	destination_a.append ("_medab"); // bdm_
 	std::reverse (destination_a.begin (), destination_a.end ());
 }
 
@@ -78,13 +78,13 @@ bool rai::uint256_union::decode_account (std::string const & source_a)
 	auto error (source_a.size () < 5);
 	if (!error)
 	{
-		auto bdm_prefix (source_a[0] == 'b' && source_a[1] == 'd' && source_a[2] == 'm' && (source_a[3] == '_' || source_a[3] == '-'));
-		error = (bdm_prefix && source_a.size () != 64);
+		auto badem_prefix (source_a[0] == 'b' && source_a[1] == 'd' && source_a[2] == 'm' && (source_a[3] == '_' || source_a[3] == '-'));
+		error = (badem_prefix && source_a.size () != 64);
 		if (!error)
 		{
-			if (bdm_prefix)
+			if (badem_prefix)
 			{
-				auto i (source_a.begin () + (bdm_prefix ? 4 : 5));
+				auto i (source_a.begin () + (badem_prefix ? 4 : 5));
 				if (*i == '1' || *i == '3')
 				{
 					rai::uint512_t number_l;
