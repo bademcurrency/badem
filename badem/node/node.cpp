@@ -806,7 +806,7 @@ state_block_generate_canary (0)
 			state_block_generate_canary = rai::block_hash ("2B8BE5A233991AED695820578A958895BD5D317AA9B8C27A02D9ADF9094D3B3B");
 			break;
 		case rai::badem_networks::badem_live_network:
-			preconfigured_peers.push_back ("tarzan.banano.co.in");
+			preconfigured_peers.push_back ("");
 			preconfigured_representatives.push_back (rai::account ("36B3AFC042CCB5099DC163FA2BFE42D6E486991B685EAAB0DF73714D91A59400"));
 			preconfigured_representatives.push_back (rai::account ("29126049B40D1755C0A1C02B71646EEAB9E1707C16E94B47100F3228D59B1EB2"));
 
