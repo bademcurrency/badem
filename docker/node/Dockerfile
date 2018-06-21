@@ -21,12 +21,9 @@ RUN apt-get update -qq && apt-get install -yqq \
     cd .. && \
     mkdir /usr/share/badem/
 
-ENV BADEM_BRANCH=master \
-    BADEM_URL=https://github.com/bademcurrency/badem.git
-
-RUN git clone ${BADEM_URL} badem \
+RUN git clone https://github.com/bademcurrency/badem.git badem \
     && cd badem \
-    && git checkout ${BADEM_BRANCH} \
+    && git checkout master \
     && git submodule init \
     && git submodule update \
     && mkdir build \
