@@ -1,35 +1,32 @@
 FROM ubuntu:16.04
 
-ENV BOOST_BASENAME=boost_1_66_0 \
-    BOOST_ROOT=/tmp/boost_install  \
-    BOOST_URL=https://sourceforge.net/projects/boost/files/boost/1.66.0/boost_1_66_0.tar.gz/download
+ARG NETWORK=live
+
+ENV BOOST_ROOT=/tmp/boost_install
+
+ADD ci /tmp/ci
 
 RUN apt-get update -qq && apt-get install -yqq \
     build-essential \
     cmake \
     g++ \
     wget && \
-    wget -qO ${BOOST_BASENAME}.tar.gz ${BOOST_URL} && \
-    tar xzf ${BOOST_BASENAME}.tar.gz && \
-    cd ${BOOST_BASENAME} && \
-    ./bootstrap.sh --with-libraries=filesystem,iostreams,log,program_options,thread && \
-    ./b2 --prefix=${BOOST_ROOT} link=static install && \
-    rm -rf ${BOOST_BASENAME} && \
-    rm -f ${BOOST_BASENAME}.tar.gz && \
-    cd .. && \
-    mkdir /usr/share/badem/
+    chmod +x /tmp/ci/bootstrap_boost.sh 
+    /tmp/ci/bootstrap_boost.sh -m
 
 ADD ./ /tmp/src
 
 RUN mkdir /tmp/build && \
     cd /tmp/build && \
-    cmake -DBOOST_ROOT=${BOOST_ROOT} && \
+    cmake /tmp/src -DBOOST_ROOT=${BOOST_ROOT} -DACTIVE_NETWORK=badem_${NETWORK}_network && \
     make badem_node && \
-    cd ..
+    cd .. && \
+    echo ${NETWORK} > /etc/badem-network
 
 FROM ubuntu:16.04
 COPY --from=0 /tmp/build/badem_node /usr/bin
+COPY --from=0 /etc/badem-network /etc
 COPY docker/node/entry.sh /entry.sh
-COPY docker/node/config.json /usr/share/badem/config.json
+COPY docker/node/config /usr/share/badem/config
 RUN chmod +x /entry.sh
 CMD ["/bin/bash",  "/entry.sh"]
