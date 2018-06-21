@@ -12,8 +12,8 @@ RUN apt-get update -qq && apt-get install -yqq \
     wget -qO ${BOOST_BASENAME}.tar.gz ${BOOST_URL} && \
     tar xzf ${BOOST_BASENAME}.tar.gz && \
     cd ${BOOST_BASENAME} && \
-    ./bootstrap.sh && \
-    ./b2 -d0 --prefix=${BOOST_ROOT} link=static install && \
+    ./bootstrap.sh --with-libraries=filesystem,iostreams,log,program_options,thread && \
+    ./b2 --prefix=${BOOST_ROOT} link=static install && \
     rm -rf ${BOOST_BASENAME} && \
     rm -f ${BOOST_BASENAME}.tar.gz && \
     cd .. && \
@@ -23,7 +23,7 @@ ADD ./ /tmp/src
 
 RUN mkdir /tmp/build && \
     cd /tmp/build && \
-    cmake /tmp/src -DBOOST_ROOT=${BOOST_ROOT} && \
+    cmake -DBOOST_ROOT=${BOOST_ROOT} && \
     make badem_node && \
     cd ..
 
