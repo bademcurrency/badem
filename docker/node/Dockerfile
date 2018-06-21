@@ -6,8 +6,6 @@ ENV BOOST_ROOT=/tmp/boost_install \
     BOOST_BASENAME=boost_1_66_0 \
     BOOST_URL=https://sourceforge.net/projects/boost/files/boost/1.66.0/boost_1_66_0.tar.gz/download
 
-ADD ci /tmp/ci
-
 WORKDIR "/tmp"
 
 RUN apt-get update -qq && apt-get install -yqq \
