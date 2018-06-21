@@ -1,41 +1,40 @@
 FROM ubuntu:16.04
 
-ARG NETWORK=live
-
-ENV BOOST_ROOT=/tmp/boost_install \
-    BOOST_BASENAME=boost_1_66_0 \
-    BOOST_URL=https://sourceforge.net/projects/boost/files/boost/1.66.0/boost_1_66_0.tar.gz/download
-
-WORKDIR "/tmp"
-
 RUN apt-get update -qq && apt-get install -yqq \
     build-essential \
     cmake \
     g++ \
     wget && \
-    wget -qO ${BOOST_BASENAME}.tar.gz ${BOOST_URL} && \
-    tar xzf ${BOOST_BASENAME}.tar.gz && \
-    cd ${BOOST_BASENAME} && \
-    ./bootstrap.sh && \
-    ./b2 -d0 --prefix=${BOOST_ROOT} link=static install && \
-    rm -rf ${BOOST_BASENAME} && \
-    rm -f ${BOOST_BASENAME}.tar.gz && \
-    cd .. && \
-    mkdir /usr/share/badem/
 
-ADD ./ /tmp/src
+ENV BOOST_URL=https://netix.dl.sourceforge.net/project/boost/boost/1.66.0/boost_1_66_0.tar.gz
+    BOOST_ROOT=/tmp/boost_install \
 
-RUN mkdir /tmp/build && \
-    cd /tmp/build && \
-    cmake /tmp/src -DBOOST_ROOT=${BOOST_ROOT} -DACTIVE_NETWORK=badem_${NETWORK}_network && \
-    make badem_node && \
-    cd .. && \
-    echo ${NETWORK} > /etc/badem-network
+WORKDIR /
 
-FROM ubuntu:16.04
-COPY --from=0 /tmp/build/badem_node /usr/bin
-COPY --from=0 /etc/badem-network /etc
-COPY docker/node/entry.sh /entry.sh
-COPY docker/node/config /usr/share/badem/config
-RUN chmod +x /entry.sh
-CMD ["/bin/bash",  "/entry.sh"]
+RUN wget -O boost.tar.gz ${BOOST_URL} \
+    && mkdir boost \
+    && tar xzf boost.tar.gz -C boost --strip-components 1 \
+    && rm boost.tar.gz \
+    && cd boost \
+    && ./bootstrap.sh \
+    && ./b2 -d0 --prefix=${BOOST_ROOT} link=static install \
+    && cd .. && rm -rf boost
+
+ENV BADEM_BRANCH=master \
+    BADEM_URL=https://github.com/bademcurrency/badem.git
+
+RUN git clone ${BADEM_URL} badem \
+    && cd badem \
+    && git checkout ${BADEM_BRANCH} \
+    && git submodule init \
+    && git submodule update \
+    && mkdir build \
+    && cd build \
+    && cmake -DBOOST_ROOT=${BOOST_ROOT}-G "Unix Makefiles" .. \
+    && make badem_node \
+    && mv badem_node / \
+    && rm -rf badem
+
+EXPOSE 7075 7075/udp 7076
+
+CMD ["/badem_node", "--daemon"]
