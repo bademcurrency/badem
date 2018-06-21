@@ -10,6 +10,7 @@ RUN apt-get update -qq && apt-get install -yqq \
     build-essential \
     cmake \
     g++ \
+    git \
     wget && \
     wget -qO ${BOOST_BASENAME}.tar.gz ${BOOST_URL} && \
     tar xzf ${BOOST_BASENAME}.tar.gz && \
@@ -28,7 +29,7 @@ RUN git clone https://github.com/bademcurrency/badem.git badem \
     && git submodule update \
     && mkdir build \
     && cd build \
-    && cmake -DBOOST_ROOT=${BOOST_ROOT}-G "Unix Makefiles" .. \
+    && cmake -DBOOST_ROOT=${BOOST_ROOT}-G "Unix Makefiles" \
     && make badem_node \
     && mv badem_node / \
     && rm -rf badem
