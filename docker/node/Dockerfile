@@ -6,8 +6,8 @@ RUN apt-get update -qq && apt-get install -yqq \
     g++ \
     wget && \
 
-ENV BOOST_URL=https://netix.dl.sourceforge.net/project/boost/boost/1.66.0/boost_1_66_0.tar.gz
-    BOOST_ROOT=/tmp/boost_install \
+ENV BOOST_URL=https://netix.dl.sourceforge.net/project/boost/boost/1.66.0/boost_1_66_0.tar.gz \
+    BOOST_ROOT=/tmp/boost_install
 
 WORKDIR /
 
