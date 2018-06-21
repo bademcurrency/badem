@@ -29,7 +29,7 @@ RUN git clone https://github.com/bademcurrency/badem.git badem \
     && git submodule update \
     && mkdir build \
     && cd build \
-    && cmake -DBOOST_ROOT=${BOOST_ROOT}-G "Unix Makefiles" \
+    && cmake -DBOOST_ROOT=${BOOST_ROOT} -G "Unix Makefiles" \
     && make badem_node \
     && mv badem_node / \
     && rm -rf badem
