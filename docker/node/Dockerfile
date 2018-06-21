@@ -2,17 +2,28 @@ FROM ubuntu:16.04
 
 ARG NETWORK=live
 
-ENV BOOST_ROOT=/tmp/boost_install
+ENV BOOST_ROOT=/tmp/boost_install \
+    BOOST_BASENAME=boost_1_66_0 \
+    BOOST_URL=https://sourceforge.net/projects/boost/files/boost/1.66.0/boost_1_66_0.tar.gz/download
 
 ADD ci /tmp/ci
+
+WORKDIR "/tmp"
 
 RUN apt-get update -qq && apt-get install -yqq \
     build-essential \
     cmake \
     g++ \
     wget && \
-    chmod +x /tmp/ci/bootstrap_boost.sh 
-    /tmp/ci/bootstrap_boost.sh -m
+    wget -qO ${BOOST_BASENAME}.tar.gz ${BOOST_URL} && \
+    tar xzf ${BOOST_BASENAME}.tar.gz && \
+    cd ${BOOST_BASENAME} && \
+    ./bootstrap.sh && \
+    ./b2 -d0 --prefix=${BOOST_ROOT} link=static install && \
+    rm -rf ${BOOST_BASENAME} && \
+    rm -f ${BOOST_BASENAME}.tar.gz && \
+    cd .. && \
+    mkdir /usr/share/badem/
 
 ADD ./ /tmp/src
 
