@@ -1,24 +1,25 @@
 FROM ubuntu:16.04
 
+ENV BOOST_ROOT=/tmp/boost_install \
+    BOOST_BASENAME=boost_1_66_0 \
+    BOOST_URL=https://sourceforge.net/projects/boost/files/boost/1.66.0/boost_1_66_0.tar.gz/download
+
+WORKDIR /
+
 RUN apt-get update -qq && apt-get install -yqq \
     build-essential \
     cmake \
     g++ \
     wget && \
-
-ENV BOOST_URL=https://netix.dl.sourceforge.net/project/boost/boost/1.66.0/boost_1_66_0.tar.gz \
-    BOOST_ROOT=/tmp/boost_install
-
-WORKDIR /
-
-RUN wget -O boost.tar.gz ${BOOST_URL} \
-    && mkdir boost \
-    && tar xzf boost.tar.gz -C boost --strip-components 1 \
-    && rm boost.tar.gz \
-    && cd boost \
-    && ./bootstrap.sh \
-    && ./b2 -d0 --prefix=${BOOST_ROOT} link=static install \
-    && cd .. && rm -rf boost
+    wget -qO ${BOOST_BASENAME}.tar.gz ${BOOST_URL} && \
+    tar xzf ${BOOST_BASENAME}.tar.gz && \
+    cd ${BOOST_BASENAME} && \
+    ./bootstrap.sh && \
+    ./b2 -d0 --prefix=${BOOST_ROOT} link=static install && \
+    rm -rf ${BOOST_BASENAME} && \
+    rm -f ${BOOST_BASENAME}.tar.gz && \
+    cd .. && \
+    mkdir /usr/share/badem/
 
 ENV BADEM_BRANCH=master \
     BADEM_URL=https://github.com/bademcurrency/badem.git
