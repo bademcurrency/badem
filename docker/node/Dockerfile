@@ -32,6 +32,6 @@ RUN git clone https://github.com/bademcurrency/badem.git badem \
     && mv badem_node / \
     && rm -rf badem
 
-EXPOSE 7075 7075/udp 7076
+EXPOSE 2224 2224/udp 2225
 
 CMD ["/badem_node", "--daemon"]
