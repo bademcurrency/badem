@@ -3055,7 +3055,7 @@ void rai::election::confirm_once (MDB_txn * transaction_a)
 	{
 		auto tally_l (node.ledger.tally (transaction_a, votes));
 		assert (tally_l.size () > 0);
-		auto have_quorum_l = have_quorum (tally_l);
+		auto have_quorom_l = have_quorom (tally_l);
 		auto winner (tally_l.begin ());
 		auto block_l (winner->second);
 		if (node.config.logging.vote_logging () || !votes.uncontested ())
@@ -3072,7 +3072,7 @@ void rai::election::confirm_once (MDB_txn * transaction_a)
 		}
 		if (!(*block_l == *status.winner))
 		{
-			if (have_quorum_l)
+			if (have_quorom_l)
 			{
 				auto node_l (node.shared ());
 				node_l->block_processor.force (block_l);
@@ -3084,7 +3084,7 @@ void rai::election::confirm_once (MDB_txn * transaction_a)
 			}
 		}
 		status.tally = winner->first;
-		if (have_quorum_l)
+		if (have_quorom_l)
 		{
 			auto winner_l (status.winner);
 			auto node_l (node.shared ());
@@ -3101,7 +3101,7 @@ void rai::election::confirm_once (MDB_txn * transaction_a)
 	}
 }
 
-bool rai::election::have_quorum (rai::tally_t const & tally_a)
+bool rai::election::have_quorom (rai::tally_t const & tally_a)
 {
 	auto i (tally_a.begin ());
 	auto first (i->first);
@@ -3112,11 +3112,11 @@ bool rai::election::have_quorum (rai::tally_t const & tally_a)
 	return result;
 }
 
-void rai::election::confirm_if_quorum (MDB_txn * transaction_a)
+void rai::election::confirm_if_quorom (MDB_txn * transaction_a)
 {
 	auto tally_l (node.ledger.tally (transaction_a, votes));
-	auto quorum (have_quorum (tally_l));
-	if (quorum)
+	auto quorom (have_quorom (tally_l));
+	if (quorom)
 	{
 		confirm_once (transaction_a);
 	}
@@ -3171,7 +3171,7 @@ bool rai::election::vote (std::shared_ptr<rai::vote> vote_a)
 			last_votes[vote_a->account] = { std::chrono::steady_clock::now (), vote_a->sequence, vote_a->block->hash () };
 			node.network.republish_vote (vote_a);
 			votes.vote (vote_a);
-			confirm_if_quorum (transaction);
+			confirm_if_quorom (transaction);
 		}
 	}
 	return replay;

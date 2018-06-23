@@ -59,13 +59,13 @@ public:
 	election (rai::node &, std::shared_ptr<rai::block>, std::function<void(std::shared_ptr<rai::block>)> const &);
 	bool vote (std::shared_ptr<rai::vote>);
 	// Check if we have vote quorum
-	bool have_quorum (rai::tally_t const &);
+	bool have_quorom (rai::tally_t const &);
 	// Tell the network our view of the winner
 	void broadcast_winner ();
 	// Change our winner to agree with the network
 	void compute_rep_votes (MDB_txn *);
 	// Confirm this block if quorum is met
-	void confirm_if_quorum (MDB_txn *);
+	void confirm_if_quorom (MDB_txn *);
 	rai::votes votes;
 	rai::node & node;
 	std::unordered_map<rai::account, rai::vote_info> last_votes;
