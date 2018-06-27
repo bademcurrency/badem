@@ -1,8 +1,10 @@
 FROM ubuntu:16.04
 
-ENV BOOST_BASENAME=boost_1_66_0 \
-    BOOST_ROOT=/tmp/boost_install  \
-    BOOST_URL=https://netix.dl.sourceforge.net/project/boost/boost/1.66.0/boost_1_66_0.tar.gz
+ENV BOOST_ROOT=/tmp/boost_install \
+    BOOST_BASENAME=boost_1_66_0 \
+    BOOST_URL=https://sourceforge.net/projects/boost/files/boost/1.66.0/boost_1_66_0.tar.gz/download
+
+WORKDIR /
 
 RUN apt-get update -qq && apt-get install -yqq \
     build-essential \
@@ -20,17 +22,16 @@ RUN apt-get update -qq && apt-get install -yqq \
     cd .. && \
     mkdir /usr/share/badem/
 
-ADD ./ /tmp/src
+RUN git clone https://github.com/bademcurrency/badem.git badem \
+    && cd badem \
+    && git checkout master \
+    && git submodule init \
+    && git submodule update \
+    && cmake -DBOOST_ROOT=${BOOST_ROOT} -G "Unix Makefiles" \
+    && make badem_node \
+    && mv badem_node / \
+    && rm -rf badem
 
-RUN mkdir /tmp/build && \
-    cd /tmp/build && \
-    cmake /tmp/src -DBOOST_ROOT=${BOOST_ROOT} && \
-    make badem_node && \
-    cd ..
+EXPOSE 2224 2224/udp 2225
 
-FROM ubuntu:16.04
-COPY --from=0 /tmp/build/badem_node /usr/bin
-COPY docker/node/entry.sh /entry.sh
-COPY docker/node/config.json /usr/share/badem/config.json
-RUN chmod +x /entry.sh
-CMD ["/bin/bash",  "/entry.sh"]
+CMD ["/badem_node", "--daemon"]
