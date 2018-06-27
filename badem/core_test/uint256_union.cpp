@@ -319,19 +319,19 @@ TEST (uint256_union, decode_account_variations)
 	for (int i = 0; i < 100; i++)
 	{
 		rai::raw_key key;
-		badem_generate_random (key.data.bytes.data ());
+		bdm_generate_random (key.data.bytes.data ());
 		rai::uint256_union pub;
-		badem_key_account (key.data.bytes.data (), pub.bytes.data ());
+		bdm_key_account (key.data.bytes.data (), pub.bytes.data ());
 
 		char account[65] = { 0 };
-		badem_uint256_to_address (pub.bytes.data (), account);
+		bdm_uint256_to_address (pub.bytes.data (), account);
 
 		// Replace first digit after bdm_ with '0'..'9', make sure only one of them is valid
 		int errors = 0;
 		for (int variation = 0; variation < 10; variation++)
 		{
 			account[4] = static_cast<char> (variation + 48);
-			errors += badem_valid_address (account);
+			errors += bdm_valid_address (account);
 		}
 
 		ASSERT_EQ (errors, 9);

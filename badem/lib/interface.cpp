@@ -15,77 +15,77 @@
 #include <cstring>
 
 extern "C" {
-void badem_uint128_to_dec (badem_uint128 source, char * destination)
+void bdm_uint128_to_dec (bdm_uint128 source, char * destination)
 {
 	auto const & number (*reinterpret_cast<rai::uint128_union *> (source));
 	strncpy (destination, number.to_string_dec ().c_str (), 32);
 }
 
-void badem_uint256_to_string (badem_uint256 source, char * destination)
+void bdm_uint256_to_string (bdm_uint256 source, char * destination)
 {
 	auto const & number (*reinterpret_cast<rai::uint256_union *> (source));
 	strncpy (destination, number.to_string ().c_str (), 64);
 }
 
-void badem_uint256_to_address (badem_uint256 source, char * destination)
+void bdm_uint256_to_address (bdm_uint256 source, char * destination)
 {
 	auto const & number (*reinterpret_cast<rai::uint256_union *> (source));
 	strncpy (destination, number.to_account ().c_str (), 65);
 }
 
-void badem_uint512_to_string (badem_uint512 source, char * destination)
+void bdm_uint512_to_string (bdm_uint512 source, char * destination)
 {
 	auto const & number (*reinterpret_cast<rai::uint512_union *> (source));
 	strncpy (destination, number.to_string ().c_str (), 128);
 }
 
-int badem_uint128_from_dec (const char * source, badem_uint128 destination)
+int bdm_uint128_from_dec (const char * source, bdm_uint128 destination)
 {
 	auto & number (*reinterpret_cast<rai::uint128_union *> (destination));
 	auto error (number.decode_dec (source));
 	return error ? 1 : 0;
 }
 
-int badem_uint256_from_string (const char * source, badem_uint256 destination)
+int bdm_uint256_from_string (const char * source, bdm_uint256 destination)
 {
 	auto & number (*reinterpret_cast<rai::uint256_union *> (destination));
 	auto error (number.decode_hex (source));
 	return error ? 1 : 0;
 }
 
-int badem_uint512_from_string (const char * source, badem_uint512 destination)
+int bdm_uint512_from_string (const char * source, bdm_uint512 destination)
 {
 	auto & number (*reinterpret_cast<rai::uint512_union *> (destination));
 	auto error (number.decode_hex (source));
 	return error ? 1 : 0;
 }
 
-int badem_valid_address (const char * account_a)
+int bdm_valid_address (const char * account_a)
 {
 	rai::uint256_union account;
 	auto error (account.decode_account (account_a));
 	return error ? 1 : 0;
 }
 
-void badem_generate_random (badem_uint256 seed)
+void bdm_generate_random (bdm_uint256 seed)
 {
 	auto & number (*reinterpret_cast<rai::uint256_union *> (seed));
 	rai::random_pool.GenerateBlock (number.bytes.data (), number.bytes.size ());
 }
 
-void badem_seed_key (badem_uint256 seed, int index, badem_uint256 destination)
+void bdm_seed_key (bdm_uint256 seed, int index, bdm_uint256 destination)
 {
 	auto & seed_l (*reinterpret_cast<rai::uint256_union *> (seed));
 	auto & destination_l (*reinterpret_cast<rai::uint256_union *> (destination));
 	rai::deterministic_key (seed_l, index, destination_l);
 }
 
-void badem_key_account (const badem_uint256 key, badem_uint256 pub)
+void bdm_key_account (const bdm_uint256 key, bdm_uint256 pub)
 {
 	ed25519_publickey (key, pub);
 }
 
-char * badem_sign_transaction (const char * transaction, const badem_uint256 private_key)
+char * bdm_sign_transaction (const char * transaction, const bdm_uint256 private_key)
 {
 	char * result (nullptr);
 	try
@@ -113,7 +113,7 @@ char * badem_sign_transaction (const char * transaction, const badem_uint256 pri
 	return result;
 }
 
-char * badem_work_transaction (const char * transaction)
+char * bdm_work_transaction (const char * transaction)
 {
 	char * result (nullptr);
 	try

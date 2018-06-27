@@ -16,8 +16,8 @@ namespace
 {
 char const * test_private_key_data = "34F0A37AAD20F4A260F0A5B3CB3D7FB50673212263E58A380BC10474BB039CE4";
 char const * test_public_key_data = "B0311EA55708D6A53C75CDBF88300259C6D018522FE3D4D0A242E431F9E8B6D0"; // bdm_3e3j5tkog48pnny9dmfzj1r16pg8t1e76dz5tmac6iq689wyjfpiij4txtdo
-char const * beta_public_key_data = "2D1D8E3C9D12200F92FE816B10DAF4A53883A2C320AC903BDFBECF91DC7AAD5D"; // bdm_1daxjrybt6j13ybhx1dd45fhbbbrigje8a7ek1xxzhphk9g9odcxn874any1
-char const * live_public_key_data = "1A89922741BA8FB529EB7C9A1A465C813417B91383D18E7CCF9003F61495DDCA"; // bdm_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43
+char const * beta_public_key_data = "499D3E2FC2DB9FC2D0D4C445AD073C713E5634D7B2BBF24F57A727A1BABF68AB"; // bdm_1kex9rqw7pwzrdafbj47on5mrwbycrtfheouyb9ohbs9n8xdyt7d4xso99rb
+char const * live_public_key_data = "565936F0F5F7A41201FD3F831A52B6B1CDBB74AE2C3E8A590ABA08C048F111FA"; // bdm_1oks8urhdxx64a1zthw55bbdfegfqftcwd3yjbeiogiar36h46htzzkmmw3e
 char const * test_genesis_data = R"%%%({
 	"type": "open",
 	"source": "B0311EA55708D6A53C75CDBF88300259C6D018522FE3D4D0A242E431F9E8B6D0",
@@ -29,20 +29,20 @@ char const * test_genesis_data = R"%%%({
 
 char const * beta_genesis_data = R"%%%({
 	"type": "open",
-	"source": "2D1D8E3C9D12200F92FE816B10DAF4A53883A2C320AC903BDFBECF91DC7AAD5D",
-	"representative": "bdm_1daxjrybt6j13ybhx1dd45fhbbbrigje8a7ek1xxzhphk9g9odcxn874any1",
-	"account": "bdm_1daxjrybt6j13ybhx1dd45fhbbbrigje8a7ek1xxzhphk9g9odcxn874any1",
-	"work": "d967179634337e2d",
-	"signature": "AF7F1917ED42989442FD6ED7D367F0EF3D010AC1B6D7F37556F6D9666B1CD5F59108C92CD0D249DE10592EBC8B721C5C655DD0824C82304DBF13FEE654A87E03"
+	"source": "499D3E2FC2DB9FC2D0D4C445AD073C713E5634D7B2BBF24F57A727A1BABF68AB",
+	"representative": "bdm_1kex9rqw7pwzrdafbj47on5mrwbycrtfheouyb9ohbs9n8xdyt7d4xso99rb",
+	"account": "bdm_1kex9rqw7pwzrdafbj47on5mrwbycrtfheouyb9ohbs9n8xdyt7d4xso99rb",
+	"work": "f066e9305cbee8c8",
+	"signature": "45776E6CE2011A662BF1F59D4C7376FCF1249B31D345F582CC62381BB902C28C20EDE58FF57772D7CD65365FB4C3CD158C4FECE63AB3B0E0B0CC87A8ECC24607"
 })%%%";
 
 char const * live_genesis_data = R"%%%({
 	"type": "open",
-	"source": "1A89922741BA8FB529EB7C9A1A465C813417B91383D18E7CCF9003F61495DDCA",
-	"representative": "bdm_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43",
-	"account": "bdm_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43",
-	"work": "f1c935a200662651",
-	"signature": "2971C2F11CCBB69846ACA4A5CDD72FA28094D9C8641788C24256C47792776EC1A685E1877700E7D2DC2ECDA25AC418BD82A4F816EFA8A23645001205FA369B06"
+	"source": "565936F0F5F7A41201FD3F831A52B6B1CDBB74AE2C3E8A590ABA08C048F111FA",
+	"representative": "bdm_1oks8urhdxx64a1zthw55bbdfegfqftcwd3yjbeiogiar36h46htzzkmmw3e",
+	"account": "bdm_1oks8urhdxx64a1zthw55bbdfegfqftcwd3yjbeiogiar36h46htzzkmmw3e",
+	"work": "948c664ac4c86930",
+	"signature": "378B2DCA3B4F2D196435C1EBB01A405A627E270AFE98C07042358BD379E4DFD8215E9C817E995787DFB4E06826115A4BA8F2DB6C79020DA4E85E0F4DD19B0606"
 })%%%";
 
 class ledger_constants
@@ -264,7 +264,8 @@ rai::block_counts::block_counts () :
 send (0),
 receive (0),
 open (0),
-change (0)
+change (0),
+state (0)
 {
 }
 
@@ -426,74 +427,84 @@ std::string rai::vote::to_json () const
 
 rai::amount_visitor::amount_visitor (MDB_txn * transaction_a, rai::block_store & store_a) :
 transaction (transaction_a),
-store (store_a)
+store (store_a),
+current_amount (0),
+current_balance (0),
+amount (0)
 {
 }
 
 void rai::amount_visitor::send_block (rai::send_block const & block_a)
 {
-	balance_visitor prev (transaction, store);
-	prev.compute (block_a.hashables.previous);
-	result = prev.result - block_a.hashables.balance.number ();
-	current = 0;
+	current_balance = block_a.hashables.previous;
+	amount = block_a.hashables.balance.number ();
+	current_amount = 0;
 }
 
 void rai::amount_visitor::receive_block (rai::receive_block const & block_a)
 {
-	current = block_a.hashables.source;
+	current_amount = block_a.hashables.source;
 }
 
 void rai::amount_visitor::open_block (rai::open_block const & block_a)
 {
 	if (block_a.hashables.source != rai::genesis_account)
 	{
-		current = block_a.hashables.source;
+		current_amount = block_a.hashables.source;
 	}
 	else
 	{
-		result = rai::genesis_amount;
-		current = 0;
+		amount = rai::genesis_amount;
+		current_amount = 0;
 	}
 }
 
 void rai::amount_visitor::state_block (rai::state_block const & block_a)
 {
-	balance_visitor prev (transaction, store);
-	prev.compute (block_a.hashables.previous);
-	result = block_a.hashables.balance.number ();
-	result = result < prev.result ? prev.result - result : result - prev.result;
-	current = 0;
+	current_balance = block_a.hashables.previous;
+	amount = block_a.hashables.balance.number ();
+	current_amount = 0;
 }
 
 void rai::amount_visitor::change_block (rai::change_block const & block_a)
 {
-	result = 0;
-	current = 0;
+	amount = 0;
+	current_amount = 0;
 }
 
 void rai::amount_visitor::compute (rai::block_hash const & block_hash)
 {
-	current = block_hash;
-	while (!current.is_zero ())
+	current_amount = block_hash;
+	while (!current_amount.is_zero () || !current_balance.is_zero ())
 	{
-		auto block (store.block_get (transaction, current));
-		if (block != nullptr)
+		if (!current_amount.is_zero ())
 		{
-			block->visit (*this);
-		}
-		else
-		{
-			if (block_hash == rai::genesis_account)
+			auto block (store.block_get (transaction, current_amount));
+			if (block != nullptr)
 			{
-				result = std::numeric_limits<rai::uint128_t>::max ();
-				current = 0;
+				block->visit (*this);
 			}
 			else
 			{
-				assert (false);
-				result = 0;
-				current = 0;
+				if (block_hash == rai::genesis_account)
+				{
+					amount = std::numeric_limits<rai::uint128_t>::max ();
+					current_amount = 0;
+				}
+				else
+				{
+					assert (false);
+					amount = 0;
+					current_amount = 0;
+				}
 			}
+		}
+		else
+		{
+			balance_visitor prev (transaction, store);
+			prev.compute (current_balance);
+			amount = amount < prev.balance ? prev.balance - amount : amount - prev.balance;
+			current_balance = 0;
 		}
 	}
 }
@@ -501,15 +512,16 @@ void rai::amount_visitor::compute (rai::block_hash const & block_hash)
 rai::balance_visitor::balance_visitor (MDB_txn * transaction_a, rai::block_store & store_a) :
 transaction (transaction_a),
 store (store_a),
-current (0),
-result (0)
+current_balance (0),
+current_amount (0),
+balance (0)
 {
 }
 
 void rai::balance_visitor::send_block (rai::send_block const & block_a)
 {
-	result += block_a.hashables.balance.number ();
-	current = 0;
+	balance += block_a.hashables.balance.number ();
+	current_balance = 0;
 }
 
 void rai::balance_visitor::receive_block (rai::receive_block const & block_a)
@@ -517,24 +529,20 @@ void rai::balance_visitor::receive_block (rai::receive_block const & block_a)
 	rai::block_info block_info;
 	if (!store.block_info_get (transaction, block_a.hash (), block_info))
 	{
-		result += block_info.balance.number ();
-		current = 0;
+		balance += block_info.balance.number ();
+		current_balance = 0;
 	}
 	else
 	{
-		amount_visitor source (transaction, store);
-		source.compute (block_a.hashables.source);
-		result += source.result;
-		current = block_a.hashables.previous;
+		current_amount = block_a.hashables.source;
+		current_balance = block_a.hashables.previous;
 	}
 }
 
 void rai::balance_visitor::open_block (rai::open_block const & block_a)
 {
-	amount_visitor source (transaction, store);
-	source.compute (block_a.hashables.source);
-	result += source.result;
-	current = 0;
+	current_amount = block_a.hashables.source;
+	current_balance = 0;
 }
 
 void rai::balance_visitor::change_block (rai::change_block const & block_a)
@@ -542,29 +550,39 @@ void rai::balance_visitor::change_block (rai::change_block const & block_a)
 	rai::block_info block_info;
 	if (!store.block_info_get (transaction, block_a.hash (), block_info))
 	{
-		result += block_info.balance.number ();
-		current = 0;
+		balance += block_info.balance.number ();
+		current_balance = 0;
 	}
 	else
 	{
-		current = block_a.hashables.previous;
+		current_balance = block_a.hashables.previous;
 	}
 }
 
 void rai::balance_visitor::state_block (rai::state_block const & block_a)
 {
-	result = block_a.hashables.balance.number ();
-	current = 0;
+	balance = block_a.hashables.balance.number ();
+	current_balance = 0;
 }
 
 void rai::balance_visitor::compute (rai::block_hash const & block_hash)
 {
-	current = block_hash;
-	while (!current.is_zero ())
+	current_balance = block_hash;
+	while (!current_balance.is_zero () || !current_amount.is_zero ())
 	{
-		auto block (store.block_get (transaction, current));
-		assert (block != nullptr);
-		block->visit (*this);
+		if (!current_amount.is_zero ())
+		{
+			amount_visitor source (transaction, store);
+			source.compute (current_amount);
+			balance += source.amount;
+			current_amount = 0;
+		}
+		else
+		{
+			auto block (store.block_get (transaction, current_balance));
+			assert (block != nullptr);
+			block->visit (*this);
+		}
 	}
 }
 
@@ -713,6 +731,31 @@ void rai::vote::serialize (rai::stream & stream_a)
 	write (stream_a, signature);
 	write (stream_a, sequence);
 	rai::serialize_block (stream_a, *block);
+}
+
+bool rai::vote::deserialize (rai::stream & stream_a)
+{
+	auto result (read (stream_a, account));
+	if (!result)
+	{
+		result = read (stream_a, signature);
+		if (!result)
+		{
+			result = read (stream_a, sequence);
+			if (!result)
+			{
+				block = rai::deserialize_block (stream_a, block_type ());
+				result = block == nullptr;
+			}
+		}
+	}
+	return result;
+}
+
+bool rai::vote::validate ()
+{
+	auto result (rai::validate_message (account, hash (), signature));
+	return result;
 }
 
 rai::genesis::genesis ()
