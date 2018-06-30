@@ -1,0 +1,65 @@
+{
+    "version": "2",
+    "rpc_enable": "true",
+    "rpc": {
+        "address": "::ffff:0.0.0.0",
+        "port": "2225",
+        "enable_control": "true",
+        "frontier_request_limit": "16384",
+        "chain_request_limit": "16384"
+    },
+    "node": {
+        "version": "12",
+        "peering_port": "2224",
+        "bootstrap_fraction_numerator": "1",
+        "receive_minimum": "1",
+        "logging": {
+            "version": "3",
+            "ledger": "false",
+            "ledger_duplicate": "false",
+            "vote": "false",
+            "network": "true",
+            "network_message": "false",
+            "network_publish": "false",
+            "network_packet": "false",
+            "network_keepalive": "false",
+            "node_lifetime_tracing": "false",
+            "insufficient_work": "true",
+            "log_rpc": "true",
+            "bulk_pull": "false",
+            "work_generation_time": "true",
+            "log_to_cerr": "false",
+            "max_size": "16777216",
+            "rotation_size": "4194304",
+            "flush": "true"
+        },
+        "work_peers": "",
+        "preconfigured_peers": [
+            "node.badem.io"
+        ],
+        "preconfigured_representatives": [
+            "bdm_1oks8urhdxx64a1zthw55bbdfegfqftcwd3yjbeiogiar36h46htzzkmmw3e",
+            "bdm_1kex9rqw7pwzrdafbj47on5mrwbycrtfheouyb9ohbs9n8xdyt7d4xso99rb"
+        ],
+        "online_weight_minimum": "6000000000000000000000000000000000000",
+        "online_weight_quorum": "50",
+        "password_fanout": "1024",
+        "io_threads": "4",
+        "work_threads": "4",
+        "enable_voting": "true",
+        "bootstrap_connections": "4",
+        "bootstrap_connections_max": "64",
+        "callback_address": "",
+        "callback_port": "0",
+        "callback_target": "",
+        "lmdb_max_dbs": "128",
+        "state_block_parse_canary": "40F2479DFE7F000010F3479DFE7F00004005489DFE7F000020F3479DFE7F0000",
+        "state_block_generate_canary": "C08467020000000096F86F0000000000050000000000000000130155B0146C40"
+    },
+    "opencl_enable": "false",
+    "opencl": {
+        "platform": "0",
+        "device": "0",
+        "threads": "1048576"
+    }
+}
