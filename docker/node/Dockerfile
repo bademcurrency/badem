@@ -35,7 +35,3 @@ RUN git clone https://github.com/bademcurrency/badem.git badem \
 EXPOSE 2224 2224/udp 2225
 
 CMD ["/badem_node", "--daemon"]
-
-RUN cd Badem \
-    rm config.json \
-    wget https://raw.githubusercontent.com/bademcurrency/badem/master/docker/node/config/config.json
