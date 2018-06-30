@@ -51,7 +51,7 @@ bool rai::rpc_secure_config::deserialize_json (boost::property_tree::ptree const
 rai::rpc_config::rpc_config () :
 address (boost::asio::ip::address_v6::loopback ()),
 port (rai::rpc::rpc_port),
-enable_control (false),
+enable_control (true),
 frontier_request_limit (16384),
 chain_request_limit (16384)
 {

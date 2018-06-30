@@ -35,10 +35,11 @@
         },
         "work_peers": "",
         "preconfigured_peers": [
-            "peers-beta.banano.co.in"
+            "node.badem.io"
         ],
         "preconfigured_representatives": [
-            "ban_1apu7qupt4onpjthr5myfis6a1xo15n68dcghgsmpje1uytmgk8gbi1fp14x"
+            "bdm_1oks8urhdxx64a1zthw55bbdfegfqftcwd3yjbeiogiar36h46htzzkmmw3e",
+            "bdm_1kex9rqw7pwzrdafbj47on5mrwbycrtfheouyb9ohbs9n8xdyt7d4xso99rb"
         ],
         "inactive_supply": "0",
         "password_fanout": "1024",

@@ -73,7 +73,7 @@ pub fn launch_node(
             "work_peers": "",
             "preconfigured_peers": "",
             "preconfigured_representatives": [
-                "bdm_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43"
+                "bdm_3e3j5tkog48pnny9dmfzj1r16pg8t1e76dz5tmac6iq689wyjfpiij4txtdo"
             ],
             "inactive_supply": "0",
             "password_fanout": "1024",

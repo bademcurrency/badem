@@ -35,10 +35,11 @@
         },
         "work_peers": "",
         "preconfigured_peers": [
-            ""
+            "node.badem.io"
         ],
         "preconfigured_representatives": [ // List of defaults representatives, which you delegate voting weight, of your wallet
-           "bdm_18nbkamn5gnhpnnypz6t5b57s1bn4ywj91yjjsyez615yrcbdqgcuxms6e43"
+           "bdm_1oks8urhdxx64a1zthw55bbdfegfqftcwd3yjbeiogiar36h46htzzkmmw3e",
+           "bdm_1kex9rqw7pwzrdafbj47on5mrwbycrtfheouyb9ohbs9n8xdyt7d4xso99rb"
        ],
         "inactive_supply": "0",
         "password_fanout": "1024",
