@@ -41,8 +41,6 @@
             "bdm_1oks8urhdxx64a1zthw55bbdfegfqftcwd3yjbeiogiar36h46htzzkmmw3e",
             "bdm_1kex9rqw7pwzrdafbj47on5mrwbycrtfheouyb9ohbs9n8xdyt7d4xso99rb"
         ],
-        "online_weight_minimum": "6000000000000000000000000000000000000",
-        "online_weight_quorum": "50",
         "password_fanout": "1024",
         "io_threads": "4",
         "work_threads": "4",
@@ -53,8 +51,6 @@
         "callback_port": "0",
         "callback_target": "",
         "lmdb_max_dbs": "128",
-        "state_block_parse_canary": "40F2479DFE7F000010F3479DFE7F00004005489DFE7F000020F3479DFE7F0000",
-        "state_block_generate_canary": "C08467020000000096F86F0000000000050000000000000000130155B0146C40"
     },
     "opencl_enable": "false",
     "opencl": {

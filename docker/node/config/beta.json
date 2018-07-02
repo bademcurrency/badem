@@ -3,18 +3,18 @@
     "rpc_enable": "true",
     "rpc": {
         "address": "::ffff:0.0.0.0",
-        "port": "2225",
+        "port": "55000",
         "enable_control": "true",
         "frontier_request_limit": "16384",
         "chain_request_limit": "16384"
     },
     "node": {
-        "version": "8",
+        "version": "12",
         "peering_port": "54000",
         "bootstrap_fraction_numerator": "1",
         "receive_minimum": "10000000000000000000000000000",
         "logging": {
-            "version": "2",
+            "version": "3",
             "ledger": "false",
             "ledger_duplicate": "false",
             "vote": "false",
@@ -37,16 +37,16 @@
         "preconfigured_peers": [
             "node.badem.io"
         ],
-        "preconfigured_representatives": [
+        "preconfigured_representatives": [ // Beta is not active.
             "bdm_1oks8urhdxx64a1zthw55bbdfegfqftcwd3yjbeiogiar36h46htzzkmmw3e",
             "bdm_1kex9rqw7pwzrdafbj47on5mrwbycrtfheouyb9ohbs9n8xdyt7d4xso99rb"
         ],
-        "inactive_supply": "0",
         "password_fanout": "1024",
         "io_threads": "4",
         "work_threads": "4",
         "enable_voting": "true",
         "bootstrap_connections": "16",
+        "bootstrap_connections_max": "64",
         "callback_address": "",
         "callback_port": "0",
         "callback_target": "",
