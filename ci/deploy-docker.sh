@@ -3,7 +3,7 @@ set -e
 
 scripts="$(dirname "$0")"
 
-docker login -u "$DOCKER_USER" -p "$DOCKER_PASSWORD"
+echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USER" --password-stdin
 
 # We push this just so it can be a cache next time
 if [ "$TRAVIS_BRANCH" = "master" ]; then
