@@ -35,11 +35,10 @@
         },
         "work_peers": "",
         "preconfigured_peers": [
-            "node.badem.io"
+            ""
         ],
         "preconfigured_representatives": [
-           "bdm_1oks8urhdxx64a1zthw55bbdfegfqftcwd3yjbeiogiar36h46htzzkmmw3e",
-           "bdm_1kex9rqw7pwzrdafbj47on5mrwbycrtfheouyb9ohbs9n8xdyt7d4xso99rb"
+           "bdm_1i8aw9e8hpjjfub61m6cf7j6zz9zj37iopxkffehha84hi91akjn1n9s51fg"
        ],
         "password_fanout": "1024",
         "io_threads": "4",

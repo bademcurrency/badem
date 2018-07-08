@@ -798,9 +798,8 @@ lmdb_max_dbs (128)
 			preconfigured_representatives.push_back (rai::genesis_account);
 			break;
 		case rai::badem_networks::badem_live_network:
-			preconfigured_peers.push_back ("node.badem.io");
-			preconfigured_representatives.push_back (rai::account ("565936F0F5F7A41201FD3F831A52B6B1CDBB74AE2C3E8A590ABA08C048F111FA"));
-			preconfigured_representatives.push_back (rai::account ("499D3E2FC2DB9FC2D0D4C445AD073C713E5634D7B2BBF24F57A727A1BABF68AB"));
+			preconfigured_peers.push_back ("");
+			preconfigured_representatives.push_back (rai::account ("40C8E1D867DA316ED2404C8A69624FFCFF884B0ADBB26B58F7A0C27C0E044A34"));
 			break;
 		default:
 			assert (false);
