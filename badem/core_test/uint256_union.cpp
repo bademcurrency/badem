@@ -94,8 +94,6 @@ TEST (uint128_union, balance_format)
 	ASSERT_EQ ("0.01", rai::amount (rai::RAW_ratio * 10000).format_balance (rai::BDM_ratio, 2, true));
 	ASSERT_EQ ("123456789", rai::amount (rai::BDM_ratio * 123456789).format_balance (rai::BDM_ratio, 2, false));
 	ASSERT_EQ ("123,456,789", rai::amount (rai::BDM_ratio * 123456789).format_balance (rai::BDM_ratio, 2, true));
-	ASSERT_EQ ("123,456,789.12", rai::amount (rai::BDM_ratio * 123456789 + rai::bademcik_ratio * 123).format_balance (rai::BDM_ratio, 2, true));
-	ASSERT_EQ ("12-3456-789+123", rai::amount (rai::BDM_ratio * 123456789 + rai::bademcik_ratio * 123).format_balance (rai::BDM_ratio, 4, true, std::locale (std::cout.getloc (), new test_punct)));
 }
 
 TEST (unions, identity)

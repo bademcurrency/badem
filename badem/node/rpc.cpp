@@ -2138,47 +2138,6 @@ void rai::rpc_handler::bdm_to_raw ()
 	}
 }
 
-void rai::rpc_handler::bademcik_from_raw ()
-{
-	std::string amount_text (request.get<std::string> ("amount"));
-	rai::uint128_union amount;
-	if (!amount.decode_dec (amount_text))
-	{
-		auto result (amount.number () / rai::bademcik_ratio);
-		boost::property_tree::ptree response_l;
-		response_l.put ("amount", result.convert_to<std::string> ());
-		response (response_l);
-	}
-	else
-	{
-		error_response (response, "Bad amount number");
-	}
-}
-
-void rai::rpc_handler::bademcik_to_raw ()
-{
-	std::string amount_text (request.get<std::string> ("amount"));
-	rai::uint128_union amount;
-	if (!amount.decode_dec (amount_text))
-	{
-		auto result (amount.number () * rai::bademcik_ratio);
-		if (result > amount.number ())
-		{
-			boost::property_tree::ptree response_l;
-			response_l.put ("amount", result.convert_to<std::string> ());
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Amount too big");
-		}
-	}
-	else
-	{
-		error_response (response, "Bad amount number");
-	}
-}
-
 void rai::rpc_handler::password_change ()
 {
 	if (rpc.config.enable_control)
@@ -4772,14 +4731,6 @@ void rai::rpc_handler::process_request ()
 		else if (action == "key_expand")
 		{
 			key_expand ();
-		}
-		else if (action == "bademcik_from_raw")
-		{
-			bademcik_from_raw ();
-		}
-		else if (action == "bademcik_to_raw")
-		{
-			bademcik_to_raw ();
 		}
 		else if (action == "ledger")
 		{

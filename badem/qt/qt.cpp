@@ -1352,11 +1352,7 @@ std::string badem_qt::wallet::format_balance (rai::uint128_t const & balance) co
 {
 	auto balance_str = rai::amount (balance).format_balance (rendering_ratio, 0, false);
 	auto unit = std::string ("BDM");
-	if (rendering_ratio == rai::bademcik_ratio)
-	{
-		unit = std::string ("bademcik");
-	}
-	else if (rendering_ratio == rai::RAW_ratio)
+	if (rendering_ratio == rai::RAW_ratio)
 	{
 		unit = std::string ("raw");
 	}
@@ -1635,7 +1631,6 @@ scale_layout (new QHBoxLayout),
 scale_label (new QLabel ("Scale:")),
 ratio_group (new QButtonGroup),
 badembutton (new QRadioButton ("BADEM")),
-bademcikbutton (new QRadioButton ("bademcik")),
 rawbutton (new QRadioButton ("raw")),
 back (new QPushButton ("Back")),
 ledger_window (new QWidget),
@@ -1656,14 +1651,11 @@ peers_back (new QPushButton ("Back")),
 wallet (wallet_a)
 {
 	ratio_group->addButton (badembutton);
-	ratio_group->addButton (bademcikbutton);
 	ratio_group->addButton (rawbutton);
 	ratio_group->setId (badembutton, 0);
-	ratio_group->setId (bademcikbutton, 1);
 	ratio_group->setId (rawbutton, 2);
 	scale_layout->addWidget (scale_label);
 	scale_layout->addWidget (badembutton);
-	scale_layout->addWidget (bademcikbutton);
 	scale_layout->addWidget (rawbutton);
 	scale_window->setLayout (scale_layout);
 
@@ -1716,12 +1708,6 @@ wallet (wallet_a)
 		if (badembutton->isChecked ())
 		{
 			this->wallet.change_rendering_ratio (rai::BDM_ratio);
-		}
-	});
-	QObject::connect (bademcikbutton, &QRadioButton::toggled, [this]() {
-		if (bademcikbutton->isChecked ())
-		{
-			this->wallet.change_rendering_ratio (rai::bademcik_ratio);
 		}
 	});
 	QObject::connect (rawbutton, &QRadioButton::toggled, [this]() {

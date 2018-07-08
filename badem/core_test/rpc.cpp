@@ -1806,44 +1806,6 @@ TEST (rpc, bdm_from_raw)
 	ASSERT_EQ ("1", response1.json.get<std::string> ("amount"));
 }
 
-TEST (rpc, bademcik_to_raw)
-{
-	rai::system system (24000, 1);
-	rai::node_init init1;
-	auto & node1 (*system.nodes[0]);
-	rai::rpc rpc (system.service, node1, rai::rpc_config (true));
-	rpc.start ();
-	boost::property_tree::ptree request1;
-	request1.put ("action", "bademcik_to_raw");
-	request1.put ("amount", "1");
-	test_response response1 (request1, rpc, system.service);
-	while (response1.status == 0)
-	{
-		system.poll ();
-	}
-	ASSERT_EQ (200, response1.status);
-	ASSERT_EQ (rai::bademcik_ratio.convert_to<std::string> (), response1.json.get<std::string> ("amount"));
-}
-
-TEST (rpc, bademcik_from_raw)
-{
-	rai::system system (24000, 1);
-	rai::node_init init1;
-	auto & node1 (*system.nodes[0]);
-	rai::rpc rpc (system.service, node1, rai::rpc_config (true));
-	rpc.start ();
-	boost::property_tree::ptree request1;
-	request1.put ("action", "bademcik_from_raw");
-	request1.put ("amount", rai::bademcik_ratio.convert_to<std::string> ());
-	test_response response1 (request1, rpc, system.service);
-	while (response1.status == 0)
-	{
-		system.poll ();
-	}
-	ASSERT_EQ (200, response1.status);
-	ASSERT_EQ ("1", response1.json.get<std::string> ("amount"));
-}
-
 TEST (rpc, raw_to_raw)
 {
 	rai::system system (24000, 1);

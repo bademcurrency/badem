@@ -67,7 +67,6 @@ public:
 	QLabel * scale_label;
 	QButtonGroup * ratio_group;
 	QRadioButton * badembutton;
-	QRadioButton * bademcikbutton;
 	QRadioButton * rawbutton;
 	QPushButton * back;
 

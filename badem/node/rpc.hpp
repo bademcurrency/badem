@@ -154,8 +154,6 @@ public:
 	void keepalive ();
 	void key_create ();
 	void key_expand ();
-	void bademcik_to_raw ();
-	void bademcik_from_raw ();
 	void ledger ();
 	void bdm_to_raw ();
 	void bdm_from_raw ();
