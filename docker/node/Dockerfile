@@ -24,9 +24,9 @@ RUN apt-get update -qq && apt-get install -yqq \
 
 RUN git clone https://github.com/bademcurrency/badem.git badem \
     && cd badem \
-    && git checkout master \
     && git submodule init \
     && git submodule update \
+    && git checkout numbers \
     && cmake -DBOOST_ROOT=${BOOST_ROOT} -G "Unix Makefiles" \
     && make badem_node \
     && mv badem_node / \
