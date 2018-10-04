@@ -13,7 +13,7 @@ using uint128_t = boost::multiprecision::uint128_t;
 using uint256_t = boost::multiprecision::uint256_t;
 using uint512_t = boost::multiprecision::uint512_t;
 // SI dividers
-rai::uint128_t const kBDM_ratio = rai::uint128_t ("10000"); // 10^5
+rai::uint128_t const kBDM_ratio = rai::uint128_t ("100000"); // 10^5
 rai::uint128_t const BDM_ratio = rai::uint128_t ("100"); // 10^2
 rai::uint128_t const RAW_ratio = rai::uint128_t ("1"); // 10^0
 
