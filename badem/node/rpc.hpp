@@ -5,10 +5,14 @@
 #include <boost/beast.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
-#include <badem/node/utility.hpp>
+#include <badem/lib/blocks.hpp>
+#include <badem/lib/errors.hpp>
+#include <badem/lib/jsonconfig.hpp>
+#include <badem/secure/blockstore.hpp>
+#include <badem/secure/utility.hpp>
 #include <unordered_map>
 
-namespace rai
+namespace badem
 {
 void error_response (std::function<void(boost::property_tree::ptree const &)> response_a, std::string const & message_a);
 class node;
@@ -17,8 +21,8 @@ class rpc_secure_config
 {
 public:
 	rpc_secure_config ();
-	void serialize_json (boost::property_tree::ptree &) const;
-	bool deserialize_json (boost::property_tree::ptree const &);
+	badem::error serialize_json (badem::jsonconfig &) const;
+	badem::error deserialize_json (badem::jsonconfig &);
 
 	/** If true, enable TLS */
 	bool enable;
@@ -38,16 +42,17 @@ public:
 class rpc_config
 {
 public:
-	rpc_config ();
-	rpc_config (bool);
-	void serialize_json (boost::property_tree::ptree &) const;
-	bool deserialize_json (boost::property_tree::ptree const &);
+	rpc_config (bool = false);
+	badem::error serialize_json (badem::jsonconfig &) const;
+	badem::error deserialize_json (badem::jsonconfig &);
 	boost::asio::ip::address_v6 address;
 	uint16_t port;
 	bool enable_control;
 	uint64_t frontier_request_limit;
 	uint64_t chain_request_limit;
 	rpc_secure_config secure;
+	uint8_t max_json_depth;
+	bool enable_sign_hash;
 };
 enum class payment_status
 {
@@ -64,55 +69,64 @@ class payment_observer;
 class rpc
 {
 public:
-	rpc (boost::asio::io_service &, rai::node &, rai::rpc_config const &);
-	void start ();
+	rpc (boost::asio::io_context &, badem::node &, badem::rpc_config const &);
+	virtual ~rpc () = default;
+
+	/**
+	 * Start serving RPC requests if \p rpc_enabled_a, otherwise this will only
+	 * add a block observer since requests may still arrive via IPC.
+	 */
+	void start (bool rpc_enabled_a = true);
+	void add_block_observer ();
 	virtual void accept ();
 	void stop ();
-	void observer_action (rai::account const &);
+	void observer_action (badem::account const &);
 	boost::asio::ip::tcp::acceptor acceptor;
 	std::mutex mutex;
-	std::unordered_map<rai::account, std::shared_ptr<rai::payment_observer>> payment_observers;
-	rai::rpc_config config;
-	rai::node & node;
+	std::unordered_map<badem::account, std::shared_ptr<badem::payment_observer>> payment_observers;
+	badem::rpc_config config;
+	badem::node & node;
 	bool on;
-	static uint16_t const rpc_port = rai::badem_network == rai::badem_networks::badem_live_network ? 2225 : 55000;
+	static uint16_t const rpc_port = badem::is_live_network ? 2225 : 55000;
 };
-class rpc_connection : public std::enable_shared_from_this<rai::rpc_connection>
+class rpc_connection : public std::enable_shared_from_this<badem::rpc_connection>
 {
 public:
-	rpc_connection (rai::node &, rai::rpc &);
+	rpc_connection (badem::node &, badem::rpc &);
+	virtual ~rpc_connection () = default;
 	virtual void parse_connection ();
 	virtual void read ();
-	virtual void write_result (std::string body, unsigned version);
-	std::shared_ptr<rai::node> node;
-	rai::rpc & rpc;
+	virtual void prepare_head (unsigned version, boost::beast::http::status status = boost::beast::http::status::ok);
+	virtual void write_result (std::string body, unsigned version, boost::beast::http::status status = boost::beast::http::status::ok);
+	std::shared_ptr<badem::node> node;
+	badem::rpc & rpc;
 	boost::asio::ip::tcp::socket socket;
 	boost::beast::flat_buffer buffer;
 	boost::beast::http::request<boost::beast::http::string_body> request;
 	boost::beast::http::response<boost::beast::http::string_body> res;
 	std::atomic_flag responded;
 };
-class payment_observer : public std::enable_shared_from_this<rai::payment_observer>
+class payment_observer : public std::enable_shared_from_this<badem::payment_observer>
 {
 public:
-	payment_observer (std::function<void(boost::property_tree::ptree const &)> const &, rai::rpc &, rai::account const &, rai::amount const &);
+	payment_observer (std::function<void(boost::property_tree::ptree const &)> const &, badem::rpc &, badem::account const &, badem::amount const &);
 	~payment_observer ();
 	void start (uint64_t);
 	void observe ();
 	void timeout ();
-	void complete (rai::payment_status);
+	void complete (badem::payment_status);
 	std::mutex mutex;
 	std::condition_variable condition;
-	rai::rpc & rpc;
-	rai::account account;
-	rai::amount amount;
+	badem::rpc & rpc;
+	badem::account account;
+	badem::amount amount;
 	std::function<void(boost::property_tree::ptree const &)> response;
 	std::atomic_flag completed;
 };
-class rpc_handler : public std::enable_shared_from_this<rai::rpc_handler>
+class rpc_handler : public std::enable_shared_from_this<badem::rpc_handler>
 {
 public:
-	rpc_handler (rai::node &, rai::rpc &, std::string const &, std::function<void(boost::property_tree::ptree const &)> const &);
+	rpc_handler (badem::node &, badem::rpc &, std::string const &, std::string const &, std::function<void(boost::property_tree::ptree const &)> const &);
 	void process_request ();
 	void account_balance ();
 	void account_block_count ();
@@ -133,7 +147,7 @@ public:
 	void accounts_frontiers ();
 	void accounts_pending ();
 	void available_supply ();
-	void block ();
+	void block_info ();
 	void block_confirm ();
 	void blocks ();
 	void blocks_info ();
@@ -144,8 +158,13 @@ public:
 	void block_hash ();
 	void bootstrap ();
 	void bootstrap_any ();
-	void chain ();
+	void bootstrap_lazy ();
+	void bootstrap_status ();
+	void chain (bool = false);
+	void confirmation_active ();
 	void confirmation_history ();
+	void confirmation_info ();
+	void confirmation_quorum ();
 	void delegators ();
 	void delegators_count ();
 	void deterministic_key ();
@@ -154,14 +173,14 @@ public:
 	void keepalive ();
 	void key_create ();
 	void key_expand ();
-	void bademcik_to_raw ();
-	void bademcik_from_raw ();
 	void ledger ();
-	void bdm_to_raw ();
-	void bdm_from_raw ();
+	void mbadem_to_raw (badem::uint128_t = badem::BDM_ratio);
+	void mbadem_from_raw (badem::uint128_t = badem::BDM_ratio);
+	void node_id ();
+	void node_id_delete ();
 	void password_change ();
 	void password_enter ();
-	void password_valid (bool wallet_locked);
+	void password_valid (bool = false);
 	void payment_begin ();
 	void payment_init ();
 	void payment_end ();
@@ -170,8 +189,6 @@ public:
 	void pending ();
 	void pending_exists ();
 	void process ();
-	void raw_to_raw ();
-	void raw_from_raw ();
 	void receive ();
 	void receive_minimum ();
 	void receive_minimum_set ();
@@ -181,18 +198,19 @@ public:
 	void search_pending ();
 	void search_pending_all ();
 	void send ();
+	void sign ();
 	void stats ();
+	void stats_clear ();
 	void stop ();
-	void successors ();
 	void unchecked ();
 	void unchecked_clear ();
 	void unchecked_get ();
 	void unchecked_keys ();
+	void uptime ();
 	void validate_account_number ();
 	void version ();
 	void wallet_add ();
 	void wallet_add_watch ();
-	void wallet_balance_total ();
 	void wallet_balances ();
 	void wallet_change_seed ();
 	void wallet_contains ();
@@ -200,6 +218,8 @@ public:
 	void wallet_destroy ();
 	void wallet_export ();
 	void wallet_frontiers ();
+	void wallet_history ();
+	void wallet_info ();
 	void wallet_key_valid ();
 	void wallet_ledger ();
 	void wallet_lock ();
@@ -217,11 +237,28 @@ public:
 	void work_peers ();
 	void work_peers_clear ();
 	std::string body;
-	rai::node & node;
-	rai::rpc & rpc;
+	std::string request_id;
+	badem::node & node;
+	badem::rpc & rpc;
 	boost::property_tree::ptree request;
 	std::function<void(boost::property_tree::ptree const &)> response;
+	void response_errors ();
+	std::error_code ec;
+	boost::property_tree::ptree response_l;
+	std::shared_ptr<badem::wallet> wallet_impl ();
+	bool wallet_locked_impl (badem::transaction const &, std::shared_ptr<badem::wallet>);
+	bool wallet_account_impl (badem::transaction const &, std::shared_ptr<badem::wallet>, badem::account const &);
+	badem::account account_impl (std::string = "");
+	badem::amount amount_impl ();
+	std::shared_ptr<badem::block> block_impl (bool = true);
+	badem::block_hash hash_impl (std::string = "hash");
+	badem::amount threshold_optional_impl ();
+	uint64_t work_optional_impl ();
+	uint64_t count_impl ();
+	uint64_t count_optional_impl (uint64_t = std::numeric_limits<uint64_t>::max ());
+	uint64_t offset_optional_impl (uint64_t = 0);
+	bool rpc_control_impl ();
 };
 /** Returns the correct RPC implementation based on TLS configuration */
-std::unique_ptr<rai::rpc> get_rpc (boost::asio::io_service & service_a, rai::node & node_a, rai::rpc_config const & config_a);
+std::unique_ptr<badem::rpc> get_rpc (boost::asio::io_context & io_ctx_a, badem::node & node_a, badem::rpc_config const & config_a);
 }

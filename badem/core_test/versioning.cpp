@@ -1,30 +1,34 @@
 #include <gtest/gtest.h>
 
-#include <badem/blockstore.hpp>
-#include <badem/versioning.hpp>
+#include <badem/secure/blockstore.hpp>
+#include <badem/secure/versioning.hpp>
 
 TEST (versioning, account_info_v1)
 {
-	auto file (rai::unique_path ());
-	rai::account account (1);
-	rai::open_block open (1, 2, 3, nullptr);
-	rai::account_info_v1 v1 (open.hash (), open.hash (), 3, 4);
+	auto file (badem::unique_path ());
+	badem::account account (1);
+	badem::open_block open (1, 2, 3, nullptr);
+	badem::account_info_v1 v1 (open.hash (), open.hash (), 3, 4);
 	{
+		badem::logging logging;
 		auto error (false);
-		rai::block_store store (error, file);
+		badem::mdb_store store (error, logging, file);
 		ASSERT_FALSE (error);
-		rai::transaction transaction (store.environment, nullptr, true);
-		store.block_put (transaction, open.hash (), open);
-		auto status (mdb_put (transaction, store.accounts, rai::mdb_val (account), v1.val (), 0));
+		store.stop ();
+		auto transaction (store.tx_begin (true));
+		badem::block_sideband sideband (badem::block_type::open, 0, 0, 0, 0, 0);
+		store.block_put (transaction, open.hash (), open, sideband);
+		auto status (mdb_put (store.env.tx (transaction), store.accounts_v0, badem::mdb_val (account), v1.val (), 0));
 		ASSERT_EQ (0, status);
 		store.version_put (transaction, 1);
 	}
 	{
+		badem::logging logging;
 		auto error (false);
-		rai::block_store store (error, file);
+		badem::mdb_store store (error, logging, file);
 		ASSERT_FALSE (error);
-		rai::transaction transaction (store.environment, nullptr, false);
-		rai::account_info v2;
+		auto transaction (store.tx_begin ());
+		badem::account_info v2;
 		ASSERT_FALSE (store.account_get (transaction, account, v2));
 		ASSERT_EQ (open.hash (), v2.open_block);
 		ASSERT_EQ (v1.balance, v2.balance);

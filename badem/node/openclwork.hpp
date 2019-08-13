@@ -1,22 +1,24 @@
 #pragma once
 
-#include <badem/node/xorshift.hpp>
-
 #include <boost/optional.hpp>
 #include <boost/property_tree/ptree.hpp>
+#include <badem/lib/errors.hpp>
+#include <badem/lib/jsonconfig.hpp>
+#include <badem/node/xorshift.hpp>
 
 #include <map>
 #include <mutex>
 #include <vector>
 
 #ifdef __APPLE__
+#define CL_SILENCE_DEPRECATION
 #include <OpenCL/opencl.h>
 #else
 #define CL_USE_DEPRECATED_OPENCL_1_2_APIS
 #include <CL/cl.h>
 #endif
 
-namespace rai
+namespace badem
 {
 class logging;
 class opencl_platform
@@ -30,7 +32,7 @@ class opencl_environment
 public:
 	opencl_environment (bool &);
 	void dump (std::ostream & stream);
-	std::vector<rai::opencl_platform> platforms;
+	std::vector<badem::opencl_platform> platforms;
 };
 union uint256_union;
 class work_pool;
@@ -39,8 +41,8 @@ class opencl_config
 public:
 	opencl_config ();
 	opencl_config (unsigned, unsigned, unsigned);
-	void serialize_json (boost::property_tree::ptree &) const;
-	bool deserialize_json (boost::property_tree::ptree const &);
+	badem::error serialize_json (badem::jsonconfig &) const;
+	badem::error deserialize_json (badem::jsonconfig &);
 	unsigned platform;
 	unsigned device;
 	unsigned threads;
@@ -48,11 +50,11 @@ public:
 class opencl_work
 {
 public:
-	opencl_work (bool &, rai::opencl_config const &, rai::opencl_environment &, rai::logging &);
+	opencl_work (bool &, badem::opencl_config const &, badem::opencl_environment &, badem::logging &);
 	~opencl_work ();
-	boost::optional<uint64_t> generate_work (rai::uint256_union const &);
-	static std::unique_ptr<opencl_work> create (bool, rai::opencl_config const &, rai::logging &);
-	rai::opencl_config const & config;
+	boost::optional<uint64_t> generate_work (badem::uint256_union const &);
+	static std::unique_ptr<opencl_work> create (bool, badem::opencl_config const &, badem::logging &);
+	badem::opencl_config const & config;
 	std::mutex mutex;
 	cl_context context;
 	cl_mem attempt_buffer;
@@ -61,7 +63,7 @@ public:
 	cl_program program;
 	cl_kernel kernel;
 	cl_command_queue queue;
-	rai::xorshift1024star rand;
-	rai::logging & logging;
+	badem::xorshift1024star rand;
+	badem::logging & logging;
 };
 }

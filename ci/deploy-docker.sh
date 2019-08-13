@@ -3,7 +3,7 @@ set -e
 
 scripts="$(dirname "$0")"
 
-echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USER" --password-stdin
+echo "$DOCKER_PASSWORD" | docker login -u bademcurrency --password-stdin
 
 # We push this just so it can be a cache next time
 if [ "$TRAVIS_BRANCH" = "master" ]; then
@@ -11,8 +11,10 @@ if [ "$TRAVIS_BRANCH" = "master" ]; then
 fi
 
 tags=()
-if [ -n "$TRAVIS_TAG" ]; then
-    tags+=("$TRAVIS_TAG" latest)
+if [[ "${TRAVIS_TAG}" =~ 'RC' ]]; then
+    tags+=("$TRAVIS_TAG" latest-including-rc)
+elif [ -n "$TRAVIS_TAG" ]; then
+    tags+=("$TRAVIS_TAG" latest latest-including-rc)
 elif [ -n "$TRAVIS_BRANCH" ]; then
     tags+=("$TRAVIS_BRANCH")
 fi

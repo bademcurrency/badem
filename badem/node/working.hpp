@@ -1,8 +1,8 @@
 #pragma once
 
-#include <badem/common.hpp>
+#include <badem/secure/common.hpp>
 
-namespace rai
+namespace badem
 {
 boost::filesystem::path app_path ();
 }

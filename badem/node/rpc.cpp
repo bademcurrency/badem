@@ -1,185 +1,167 @@
 #include <boost/algorithm/string.hpp>
-#include <boost/property_tree/ptree.hpp>
-#include <badem/node/rpc.hpp>
-
 #include <badem/lib/interface.h>
 #include <badem/node/node.hpp>
-
-#include <ed25519-donna/ed25519.h>
+#include <badem/node/rpc.hpp>
 
 #ifdef BADEM_SECURE_RPC
 #include <badem/node/rpc_secure.hpp>
 #endif
 
-rai::rpc_secure_config::rpc_secure_config () :
+#include <badem/lib/errors.hpp>
+
+namespace
+{
+void construct_json (badem::seq_con_info_component * component, boost::property_tree::ptree & parent);
+}
+
+badem::rpc_secure_config::rpc_secure_config () :
 enable (false),
 verbose_logging (false)
 {
 }
 
-void rai::rpc_secure_config::serialize_json (boost::property_tree::ptree & tree_a) const
+badem::error badem::rpc_secure_config::serialize_json (badem::jsonconfig & json) const
 {
-	tree_a.put ("enable", enable);
-	tree_a.put ("verbose_logging", verbose_logging);
-	tree_a.put ("server_key_passphrase", server_key_passphrase);
-	tree_a.put ("server_cert_path", server_cert_path);
-	tree_a.put ("server_key_path", server_key_path);
-	tree_a.put ("server_dh_path", server_dh_path);
-	tree_a.put ("client_certs_path", client_certs_path);
+	json.put ("enable", enable);
+	json.put ("verbose_logging", verbose_logging);
+	json.put ("server_key_passphrase", server_key_passphrase);
+	json.put ("server_cert_path", server_cert_path);
+	json.put ("server_key_path", server_key_path);
+	json.put ("server_dh_path", server_dh_path);
+	json.put ("client_certs_path", client_certs_path);
+	return json.get_error ();
 }
 
-bool rai::rpc_secure_config::deserialize_json (boost::property_tree::ptree const & tree_a)
+badem::error badem::rpc_secure_config::deserialize_json (badem::jsonconfig & json)
 {
-	auto error (false);
-	try
-	{
-		enable = tree_a.get<bool> ("enable");
-		verbose_logging = tree_a.get<bool> ("verbose_logging");
-		server_key_passphrase = tree_a.get<std::string> ("server_key_passphrase");
-		server_cert_path = tree_a.get<std::string> ("server_cert_path");
-		server_key_path = tree_a.get<std::string> ("server_key_path");
-		server_dh_path = tree_a.get<std::string> ("server_dh_path");
-		client_certs_path = tree_a.get<std::string> ("client_certs_path");
-	}
-	catch (std::runtime_error const &)
-	{
-		error = true;
-	}
-	return error;
+	json.get_required<bool> ("enable", enable);
+	json.get_required<bool> ("verbose_logging", verbose_logging);
+	json.get_required<std::string> ("server_key_passphrase", server_key_passphrase);
+	json.get_required<std::string> ("server_cert_path", server_cert_path);
+	json.get_required<std::string> ("server_key_path", server_key_path);
+	json.get_required<std::string> ("server_dh_path", server_dh_path);
+	json.get_required<std::string> ("client_certs_path", client_certs_path);
+	return json.get_error ();
 }
 
-rai::rpc_config::rpc_config () :
+badem::rpc_config::rpc_config (bool enable_control_a) :
 address (boost::asio::ip::address_v6::loopback ()),
-port (rai::rpc::rpc_port),
-enable_control (true),
-frontier_request_limit (16384),
-chain_request_limit (16384)
-{
-}
-
-rai::rpc_config::rpc_config (bool enable_control_a) :
-address (boost::asio::ip::address_v6::loopback ()),
-port (rai::rpc::rpc_port),
+port (badem::rpc::rpc_port),
 enable_control (enable_control_a),
 frontier_request_limit (16384),
-chain_request_limit (16384)
+chain_request_limit (16384),
+max_json_depth (20),
+enable_sign_hash (false)
 {
 }
 
-void rai::rpc_config::serialize_json (boost::property_tree::ptree & tree_a) const
+badem::error badem::rpc_config::serialize_json (badem::jsonconfig & json) const
 {
-	tree_a.put ("address", address.to_string ());
-	tree_a.put ("port", std::to_string (port));
-	tree_a.put ("enable_control", enable_control);
-	tree_a.put ("frontier_request_limit", frontier_request_limit);
-	tree_a.put ("chain_request_limit", chain_request_limit);
+	json.put ("address", address.to_string ());
+	json.put ("port", port);
+	json.put ("enable_control", enable_control);
+	json.put ("frontier_request_limit", frontier_request_limit);
+	json.put ("chain_request_limit", chain_request_limit);
+	json.put ("max_json_depth", max_json_depth);
+	json.put ("enable_sign_hash", enable_sign_hash);
+	return json.get_error ();
 }
 
-bool rai::rpc_config::deserialize_json (boost::property_tree::ptree const & tree_a)
+badem::error badem::rpc_config::deserialize_json (badem::jsonconfig & json)
 {
-	auto result (false);
-	try
+	auto rpc_secure_l (json.get_optional_child ("secure"));
+	if (rpc_secure_l)
 	{
-		auto rpc_secure_l (tree_a.get_child_optional ("secure"));
-		if (rpc_secure_l)
-		{
-			result = secure.deserialize_json (rpc_secure_l.get ());
-		}
+		secure.deserialize_json (*rpc_secure_l);
+	}
 
-		if (!result)
-		{
-			auto address_l (tree_a.get<std::string> ("address"));
-			auto port_l (tree_a.get<std::string> ("port"));
-			enable_control = tree_a.get<bool> ("enable_control");
-			auto frontier_request_limit_l (tree_a.get<std::string> ("frontier_request_limit"));
-			auto chain_request_limit_l (tree_a.get<std::string> ("chain_request_limit"));
-			try
-			{
-				port = std::stoul (port_l);
-				result = port > std::numeric_limits<uint16_t>::max ();
-				frontier_request_limit = std::stoull (frontier_request_limit_l);
-				chain_request_limit = std::stoull (chain_request_limit_l);
-			}
-			catch (std::logic_error const &)
-			{
-				result = true;
-			}
-			boost::system::error_code ec;
-			address = boost::asio::ip::address_v6::from_string (address_l, ec);
-			if (ec)
-			{
-				result = true;
-			}
-		}
-	}
-	catch (std::runtime_error const &)
-	{
-		result = true;
-	}
-	return result;
+	json.get_required<boost::asio::ip::address_v6> ("address", address);
+	json.get_optional<uint16_t> ("port", port);
+	json.get_optional<bool> ("enable_control", enable_control);
+	json.get_optional<uint64_t> ("frontier_request_limit", frontier_request_limit);
+	json.get_optional<uint64_t> ("chain_request_limit", chain_request_limit);
+	json.get_optional<uint8_t> ("max_json_depth", max_json_depth);
+	json.get_optional<bool> ("enable_sign_hash", enable_sign_hash);
+	return json.get_error ();
 }
 
-rai::rpc::rpc (boost::asio::io_service & service_a, rai::node & node_a, rai::rpc_config const & config_a) :
-acceptor (service_a),
+badem::rpc::rpc (boost::asio::io_context & io_ctx_a, badem::node & node_a, badem::rpc_config const & config_a) :
+acceptor (io_ctx_a),
 config (config_a),
 node (node_a)
 {
 }
 
-void rai::rpc::start ()
+void badem::rpc::add_block_observer ()
 {
-	auto endpoint (rai::tcp_endpoint (config.address, config.port));
-	acceptor.open (endpoint.protocol ());
-	acceptor.set_option (boost::asio::ip::tcp::acceptor::reuse_address (true));
-
-	boost::system::error_code ec;
-	acceptor.bind (endpoint, ec);
-	if (ec)
-	{
-		BOOST_LOG (node.log) << boost::str (boost::format ("Error while binding for RPC on port %1%: %2%") % endpoint.port () % ec.message ());
-		throw std::runtime_error (ec.message ());
-	}
-
-	acceptor.listen ();
-	node.observers.blocks.add ([this](std::shared_ptr<rai::block> block_a, rai::account const & account_a, rai::uint128_t const &, bool) {
+	node.observers.blocks.add ([this](std::shared_ptr<badem::block> block_a, badem::account const & account_a, badem::uint128_t const &, bool) {
 		observer_action (account_a);
 	});
-
-	accept ();
 }
 
-void rai::rpc::accept ()
+void badem::rpc::start (bool rpc_enabled_a)
 {
-	auto connection (std::make_shared<rai::rpc_connection> (node, *this));
+	if (rpc_enabled_a)
+	{
+		auto endpoint (badem::tcp_endpoint (config.address, config.port));
+		acceptor.open (endpoint.protocol ());
+		acceptor.set_option (boost::asio::ip::tcp::acceptor::reuse_address (true));
+
+		boost::system::error_code ec;
+		acceptor.bind (endpoint, ec);
+		if (ec)
+		{
+			BOOST_LOG (node.log) << boost::str (boost::format ("Error while binding for RPC on port %1%: %2%") % endpoint.port () % ec.message ());
+			throw std::runtime_error (ec.message ());
+		}
+
+		acceptor.listen ();
+	}
+
+	add_block_observer ();
+
+	if (rpc_enabled_a)
+	{
+		accept ();
+	}
+}
+
+void badem::rpc::accept ()
+{
+	auto connection (std::make_shared<badem::rpc_connection> (node, *this));
 	acceptor.async_accept (connection->socket, [this, connection](boost::system::error_code const & ec) {
-		if (!ec)
+		if (ec != boost::asio::error::operation_aborted && acceptor.is_open ())
 		{
 			accept ();
+		}
+		if (!ec)
+		{
 			connection->parse_connection ();
 		}
 		else
 		{
-			BOOST_LOG (this->node.log) << boost::str (boost::format ("Error accepting RPC connections: %1%") % ec);
+			BOOST_LOG (this->node.log) << boost::str (boost::format ("Error accepting RPC connections: %1% (%2%)") % ec.message () % ec.value ());
 		}
 	});
 }
 
-void rai::rpc::stop ()
+void badem::rpc::stop ()
 {
 	acceptor.close ();
 }
 
-rai::rpc_handler::rpc_handler (rai::node & node_a, rai::rpc & rpc_a, std::string const & body_a, std::function<void(boost::property_tree::ptree const &)> const & response_a) :
+badem::rpc_handler::rpc_handler (badem::node & node_a, badem::rpc & rpc_a, std::string const & body_a, std::string const & request_id_a, std::function<void(boost::property_tree::ptree const &)> const & response_a) :
 body (body_a),
+request_id (request_id_a),
 node (node_a),
 rpc (rpc_a),
 response (response_a)
 {
 }
 
-void rai::rpc::observer_action (rai::account const & account_a)
+void badem::rpc::observer_action (badem::account const & account_a)
 {
-	std::shared_ptr<rai::payment_observer> observer;
+	std::shared_ptr<badem::payment_observer> observer;
 	{
 		std::lock_guard<std::mutex> lock (mutex);
 		auto existing (payment_observers.find (account_a));
@@ -194,11 +176,178 @@ void rai::rpc::observer_action (rai::account const & account_a)
 	}
 }
 
-void rai::error_response (std::function<void(boost::property_tree::ptree const &)> response_a, std::string const & message_a)
+void badem::error_response (std::function<void(boost::property_tree::ptree const &)> response_a, std::string const & message_a)
 {
 	boost::property_tree::ptree response_l;
 	response_l.put ("error", message_a);
 	response_a (response_l);
+}
+
+void badem::rpc_handler::response_errors ()
+{
+	if (ec || response_l.empty ())
+	{
+		boost::property_tree::ptree response_error;
+		response_error.put ("error", ec ? ec.message () : "Empty response");
+		response (response_error);
+	}
+	else
+	{
+		response (response_l);
+	}
+}
+
+std::shared_ptr<badem::wallet> badem::rpc_handler::wallet_impl ()
+{
+	if (!ec)
+	{
+		std::string wallet_text (request.get<std::string> ("wallet"));
+		badem::uint256_union wallet;
+		if (!wallet.decode_hex (wallet_text))
+		{
+			auto existing (node.wallets.items.find (wallet));
+			if (existing != node.wallets.items.end ())
+			{
+				return existing->second;
+			}
+			else
+			{
+				ec = badem::error_common::wallet_not_found;
+			}
+		}
+		else
+		{
+			ec = badem::error_common::bad_wallet_number;
+		}
+	}
+	return nullptr;
+}
+
+bool badem::rpc_handler::wallet_locked_impl (badem::transaction const & transaction_a, std::shared_ptr<badem::wallet> wallet_a)
+{
+	bool result (false);
+	if (!ec)
+	{
+		if (!wallet_a->store.valid_password (transaction_a))
+		{
+			ec = badem::error_common::wallet_locked;
+			result = true;
+		}
+	}
+	return result;
+}
+
+bool badem::rpc_handler::wallet_account_impl (badem::transaction const & transaction_a, std::shared_ptr<badem::wallet> wallet_a, badem::account const & account_a)
+{
+	bool result (false);
+	if (!ec)
+	{
+		if (wallet_a->store.find (transaction_a, account_a) != wallet_a->store.end ())
+		{
+			result = true;
+		}
+		else
+		{
+			ec = badem::error_common::account_not_found_wallet;
+		}
+	}
+	return result;
+}
+
+badem::account badem::rpc_handler::account_impl (std::string account_text)
+{
+	badem::account result (0);
+	if (!ec)
+	{
+		if (account_text.empty ())
+		{
+			account_text = request.get<std::string> ("account");
+		}
+		if (result.decode_account (account_text))
+		{
+			ec = badem::error_common::bad_account_number;
+		}
+	}
+	return result;
+}
+
+badem::amount badem::rpc_handler::amount_impl ()
+{
+	badem::amount result (0);
+	if (!ec)
+	{
+		std::string amount_text (request.get<std::string> ("amount"));
+		if (result.decode_dec (amount_text))
+		{
+			ec = badem::error_common::invalid_amount;
+		}
+	}
+	return result;
+}
+
+std::shared_ptr<badem::block> badem::rpc_handler::block_impl (bool signature_work_required)
+{
+	std::shared_ptr<badem::block> result;
+	if (!ec)
+	{
+		std::string block_text (request.get<std::string> ("block"));
+		boost::property_tree::ptree block_l;
+		std::stringstream block_stream (block_text);
+		boost::property_tree::read_json (block_stream, block_l);
+		if (!signature_work_required)
+		{
+			block_l.put ("signature", "0");
+			block_l.put ("work", "0");
+		}
+		result = badem::deserialize_block_json (block_l);
+		if (result == nullptr)
+		{
+			ec = badem::error_blocks::invalid_block;
+		}
+	}
+	return result;
+}
+
+badem::block_hash badem::rpc_handler::hash_impl (std::string search_text)
+{
+	badem::block_hash result (0);
+	if (!ec)
+	{
+		std::string hash_text (request.get<std::string> (search_text));
+		if (result.decode_hex (hash_text))
+		{
+			ec = badem::error_blocks::invalid_block_hash;
+		}
+	}
+	return result;
+}
+
+badem::amount badem::rpc_handler::threshold_optional_impl ()
+{
+	badem::amount result (0);
+	boost::optional<std::string> threshold_text (request.get_optional<std::string> ("threshold"));
+	if (!ec && threshold_text.is_initialized ())
+	{
+		if (result.decode_dec (threshold_text.get ()))
+		{
+			ec = badem::error_common::bad_threshold;
+		}
+	}
+	return result;
+}
+
+uint64_t badem::rpc_handler::work_optional_impl ()
+{
+	uint64_t result (0);
+	boost::optional<std::string> work_text (request.get_optional<std::string> ("work"));
+	if (!ec && work_text.is_initialized ())
+	{
+		if (badem::from_string_hex (work_text.get (), result))
+		{
+			ec = badem::error_common::bad_work_format;
+		}
+	}
+	return result;
 }
 
 namespace
@@ -225,132 +374,171 @@ bool decode_unsigned (std::string const & text, uint64_t & number)
 }
 }
 
-void rai::rpc_handler::account_balance ()
+uint64_t badem::rpc_handler::count_impl ()
 {
-	std::string account_text (request.get<std::string> ("account"));
-	rai::uint256_union account;
-	auto error (account.decode_account (account_text));
-	if (!error)
+	uint64_t result (0);
+	if (!ec)
 	{
-		auto balance (node.balance_pending (account));
-		boost::property_tree::ptree response_l;
-		response_l.put ("balance", balance.first.convert_to<std::string> ());
-		response_l.put ("pending", balance.second.convert_to<std::string> ());
-		response (response_l);
+		std::string count_text (request.get<std::string> ("count"));
+		if (decode_unsigned (count_text, result) || result == 0)
+		{
+			ec = badem::error_common::invalid_count;
+		}
 	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
+	return result;
 }
 
-void rai::rpc_handler::account_block_count ()
+uint64_t badem::rpc_handler::count_optional_impl (uint64_t result)
 {
-	std::string account_text (request.get<std::string> ("account"));
-	rai::uint256_union account;
-	auto error (account.decode_account (account_text));
-	if (!error)
+	boost::optional<std::string> count_text (request.get_optional<std::string> ("count"));
+	if (!ec && count_text.is_initialized ())
 	{
-		rai::transaction transaction (node.store.environment, nullptr, false);
-		rai::account_info info;
-		if (!node.store.account_get (transaction, account, info))
+		if (decode_unsigned (count_text.get (), result))
 		{
-			boost::property_tree::ptree response_l;
-			response_l.put ("block_count", std::to_string (info.block_count));
-			response (response_l);
+			ec = badem::error_common::invalid_count;
+		}
+	}
+	return result;
+}
+
+uint64_t badem::rpc_handler::offset_optional_impl (uint64_t result)
+{
+	boost::optional<std::string> offset_text (request.get_optional<std::string> ("offset"));
+	if (!ec && offset_text.is_initialized ())
+	{
+		if (decode_unsigned (offset_text.get (), result))
+		{
+			ec = badem::error_rpc::invalid_offset;
+		}
+	}
+	return result;
+}
+
+bool badem::rpc_handler::rpc_control_impl ()
+{
+	bool result (false);
+	if (!ec)
+	{
+		if (!rpc.config.enable_control)
+		{
+			ec = badem::error_rpc::rpc_control_disabled;
 		}
 		else
 		{
-			error_response (response, "Account not found");
+			result = true;
 		}
 	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
+	return result;
 }
 
-void rai::rpc_handler::account_create ()
+void badem::rpc_handler::account_balance ()
 {
-	if (rpc.config.enable_control)
+	auto account (account_impl ());
+	if (!ec)
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
+		auto balance (node.balance_pending (account));
+		response_l.put ("balance", balance.first.convert_to<std::string> ());
+		response_l.put ("pending", balance.second.convert_to<std::string> ());
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::account_block_count ()
+{
+	auto account (account_impl ());
+	if (!ec)
+	{
+		auto transaction (node.store.tx_begin_read ());
+		badem::account_info info;
+		if (!node.store.account_get (transaction, account, info))
 		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
+			response_l.put ("block_count", std::to_string (info.block_count));
+		}
+		else
+		{
+			ec = badem::error_common::account_not_found;
+		}
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::account_create ()
+{
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	if (!ec)
+	{
+		const bool generate_work = request.get<bool> ("work", true);
+		badem::account new_key;
+		auto index_text (request.get_optional<std::string> ("index"));
+		if (index_text.is_initialized ())
+		{
+			uint64_t index;
+			if (decode_unsigned (index_text.get (), index) || index > static_cast<uint64_t> (std::numeric_limits<uint32_t>::max ()))
 			{
-				const bool generate_work = request.get<bool> ("work", true);
-				rai::account new_key (existing->second->deterministic_insert (generate_work));
-				if (!new_key.is_zero ())
-				{
-					boost::property_tree::ptree response_l;
-					response_l.put ("account", new_key.to_account ());
-					response (response_l);
-				}
-				else
-				{
-					error_response (response, "Wallet is locked");
-				}
+				ec = badem::error_common::invalid_index;
 			}
 			else
 			{
-				error_response (response, "Wallet not found");
+				new_key = wallet->deterministic_insert (static_cast<uint32_t> (index), generate_work);
 			}
 		}
 		else
 		{
-			error_response (response, "Bad wallet number");
+			new_key = wallet->deterministic_insert (generate_work);
+		}
+
+		if (!ec)
+		{
+			if (!new_key.is_zero ())
+			{
+				response_l.put ("account", new_key.to_account ());
+			}
+			else
+			{
+				ec = badem::error_common::wallet_locked;
+			}
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::account_get ()
+void badem::rpc_handler::account_get ()
 {
 	std::string key_text (request.get<std::string> ("key"));
-	rai::uint256_union pub;
-	auto error (pub.decode_hex (key_text));
-	if (!error)
+	badem::uint256_union pub;
+	if (!pub.decode_hex (key_text))
 	{
-		boost::property_tree::ptree response_l;
 		response_l.put ("account", pub.to_account ());
-		response (response_l);
 	}
 	else
 	{
-		error_response (response, "Bad public key");
+		ec = badem::error_common::bad_public_key;
 	}
+	response_errors ();
 }
 
-void rai::rpc_handler::account_info ()
+void badem::rpc_handler::account_info ()
 {
-	std::string account_text (request.get<std::string> ("account"));
-	rai::uint256_union account;
-	auto error (account.decode_account (account_text));
-	if (!error)
+	auto account (account_impl ());
+	if (!ec)
 	{
 		const bool representative = request.get<bool> ("representative", false);
 		const bool weight = request.get<bool> ("weight", false);
 		const bool pending = request.get<bool> ("pending", false);
-		rai::transaction transaction (node.store.environment, nullptr, false);
-		rai::account_info info;
+		auto transaction (node.store.tx_begin_read ());
+		badem::account_info info;
 		if (!node.store.account_get (transaction, account, info))
 		{
-			boost::property_tree::ptree response_l;
 			response_l.put ("frontier", info.head.to_string ());
 			response_l.put ("open_block", info.open_block.to_string ());
 			response_l.put ("representative_block", info.rep_block.to_string ());
 			std::string balance;
-			rai::uint128_union (info.balance).encode_dec (balance);
+			badem::uint128_union (info.balance).encode_dec (balance);
 			response_l.put ("balance", balance);
 			response_l.put ("modified_timestamp", std::to_string (info.modified));
 			response_l.put ("block_count", std::to_string (info.block_count));
+			response_l.put ("account_version", info.epoch == badem::epoch::epoch_1 ? "1" : "0");
 			if (representative)
 			{
 				auto block (node.store.block_get (transaction, info.rep_block));
@@ -367,328 +555,204 @@ void rai::rpc_handler::account_info ()
 				auto account_pending (node.ledger.account_pending (transaction, account));
 				response_l.put ("pending", account_pending.convert_to<std::string> ());
 			}
-			response (response_l);
 		}
 		else
 		{
-			error_response (response, "Account not found");
+			ec = badem::error_common::account_not_found;
 		}
 	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::account_key ()
+void badem::rpc_handler::account_key ()
 {
-	std::string account_text (request.get<std::string> ("account"));
-	rai::account account;
-	auto error (account.decode_account (account_text));
-	if (!error)
+	auto account (account_impl ());
+	if (!ec)
 	{
-		boost::property_tree::ptree response_l;
 		response_l.put ("key", account.to_string ());
-		response (response_l);
 	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::account_list ()
+void badem::rpc_handler::account_list ()
 {
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union wallet;
-	auto error (wallet.decode_hex (wallet_text));
-	if (!error)
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		auto existing (node.wallets.items.find (wallet));
-		if (existing != node.wallets.items.end ())
+		boost::property_tree::ptree accounts;
+		auto transaction (node.wallets.tx_begin_read ());
+		for (auto i (wallet->store.begin (transaction)), j (wallet->store.end ()); i != j; ++i)
 		{
-			boost::property_tree::ptree response_l;
-			boost::property_tree::ptree accounts;
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			for (auto i (existing->second->store.begin (transaction)), j (existing->second->store.end ()); i != j; ++i)
-			{
-				boost::property_tree::ptree entry;
-				entry.put ("", rai::uint256_union (i->first.uint256 ()).to_account ());
-				accounts.push_back (std::make_pair ("", entry));
-			}
-			response_l.add_child ("accounts", accounts);
-			response (response_l);
+			boost::property_tree::ptree entry;
+			entry.put ("", badem::account (i->first).to_account ());
+			accounts.push_back (std::make_pair ("", entry));
 		}
-		else
-		{
-			error_response (response, "Wallet not found");
-		}
+		response_l.add_child ("accounts", accounts);
 	}
-	else
-	{
-		error_response (response, "Bad wallet number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::account_move ()
+void badem::rpc_handler::account_move ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
 		std::string source_text (request.get<std::string> ("source"));
 		auto accounts_text (request.get_child ("accounts"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
+		badem::uint256_union source;
+		if (!source.decode_hex (source_text))
 		{
-			auto existing (node.wallets.items.find (wallet));
+			auto existing (node.wallets.items.find (source));
 			if (existing != node.wallets.items.end ())
 			{
-				auto wallet (existing->second);
-				rai::uint256_union source;
-				auto error (source.decode_hex (source_text));
-				if (!error)
+				auto source (existing->second);
+				std::vector<badem::public_key> accounts;
+				for (auto i (accounts_text.begin ()), n (accounts_text.end ()); i != n; ++i)
 				{
-					auto existing (node.wallets.items.find (source));
-					if (existing != node.wallets.items.end ())
-					{
-						auto source (existing->second);
-						std::vector<rai::public_key> accounts;
-						for (auto i (accounts_text.begin ()), n (accounts_text.end ()); i != n; ++i)
-						{
-							rai::public_key account;
-							account.decode_hex (i->second.get<std::string> (""));
-							accounts.push_back (account);
-						}
-						rai::transaction transaction (node.store.environment, nullptr, true);
-						auto error (wallet->store.move (transaction, source->store, accounts));
-						boost::property_tree::ptree response_l;
-						response_l.put ("moved", error ? "0" : "1");
-						response (response_l);
-					}
-					else
-					{
-						error_response (response, "Source not found");
-					}
+					badem::public_key account;
+					account.decode_account (i->second.get<std::string> (""));
+					accounts.push_back (account);
 				}
-				else
-				{
-					error_response (response, "Bad source number");
-				}
+				auto transaction (node.wallets.tx_begin_write ());
+				auto error (wallet->store.move (transaction, source->store, accounts));
+				response_l.put ("moved", error ? "0" : "1");
 			}
 			else
 			{
-				error_response (response, "Wallet not found");
+				ec = badem::error_rpc::source_not_found;
 			}
 		}
 		else
 		{
-			error_response (response, "Bad wallet number");
+			ec = badem::error_rpc::bad_source;
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::account_remove ()
+void badem::rpc_handler::account_remove ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	auto account (account_impl ());
+	if (!ec)
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		std::string account_text (request.get<std::string> ("account"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
+		auto transaction (node.wallets.tx_begin_write ());
+		wallet_locked_impl (transaction, wallet);
+		wallet_account_impl (transaction, wallet, account);
+		if (!ec)
 		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
-			{
-				auto wallet (existing->second);
-				rai::transaction transaction (node.store.environment, nullptr, true);
-				if (existing->second->store.valid_password (transaction))
-				{
-					rai::account account_id;
-					auto error (account_id.decode_account (account_text));
-					if (!error)
-					{
-						auto account (wallet->store.find (transaction, account_id));
-						if (account != wallet->store.end ())
-						{
-							wallet->store.erase (transaction, account_id);
-							boost::property_tree::ptree response_l;
-							response_l.put ("removed", "1");
-							response (response_l);
-						}
-						else
-						{
-							error_response (response, "Account not found in wallet");
-						}
-					}
-					else
-					{
-						error_response (response, "Bad account number");
-					}
-				}
-				else
-				{
-					error_response (response, "Wallet locked");
-				}
-			}
-			else
-			{
-				error_response (response, "Wallet not found");
-			}
-		}
-		else
-		{
-			error_response (response, "Bad wallet number");
+			wallet->store.erase (transaction, account);
+			response_l.put ("removed", "1");
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::account_representative ()
+void badem::rpc_handler::account_representative ()
 {
-	std::string account_text (request.get<std::string> ("account"));
-	rai::account account;
-	auto error (account.decode_account (account_text));
-	if (!error)
+	auto account (account_impl ());
+	if (!ec)
 	{
-		rai::transaction transaction (node.store.environment, nullptr, false);
-		rai::account_info info;
-		auto error (node.store.account_get (transaction, account, info));
-		if (!error)
+		auto transaction (node.store.tx_begin_read ());
+		badem::account_info info;
+		if (!node.store.account_get (transaction, account, info))
 		{
 			auto block (node.store.block_get (transaction, info.rep_block));
 			assert (block != nullptr);
-			boost::property_tree::ptree response_l;
 			response_l.put ("representative", block->representative ().to_account ());
-			response (response_l);
 		}
 		else
 		{
-			error_response (response, "Account not found");
+			ec = badem::error_common::account_not_found;
 		}
 	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::account_representative_set ()
+void badem::rpc_handler::account_representative_set ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	auto account (account_impl ());
+	if (!ec)
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
+		std::string representative_text (request.get<std::string> ("representative"));
+		badem::account representative;
+		if (!representative.decode_account (representative_text))
 		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
+			auto work (work_optional_impl ());
+			if (!ec && work)
 			{
-				auto wallet (existing->second);
-				std::string account_text (request.get<std::string> ("account"));
-				rai::account account;
-				auto error (account.decode_account (account_text));
-				if (!error)
+				auto transaction (node.wallets.tx_begin_write ());
+				wallet_locked_impl (transaction, wallet);
+				if (!ec)
 				{
-					std::string representative_text (request.get<std::string> ("representative"));
-					rai::account representative;
-					auto error (representative.decode_account (representative_text));
-					if (!error)
+					badem::account_info info;
+					auto block_transaction (node.store.tx_begin_read ());
+					if (!node.store.account_get (block_transaction, account, info))
 					{
-						uint64_t work (0);
-						boost::optional<std::string> work_text (request.get_optional<std::string> ("work"));
-						if (work_text.is_initialized ())
+						if (badem::work_validate (info.head, work))
 						{
-							auto work_error (rai::from_string_hex (work_text.get (), work));
-							if (work_error)
-							{
-								error_response (response, "Bad work");
-							}
+							ec = badem::error_common::invalid_work;
 						}
-						if (work)
-						{
-							rai::transaction transaction (node.store.environment, nullptr, true);
-							rai::account_info info;
-							if (!node.store.account_get (transaction, account, info))
-							{
-								if (!rai::work_validate (info.head, work))
-								{
-									existing->second->store.work_put (transaction, account, work);
-								}
-								else
-								{
-									error_response (response, "Invalid work");
-								}
-							}
-							else
-							{
-								error_response (response, "Account not found");
-							}
-						}
-						auto response_a (response);
-						wallet->change_async (account, representative, [response_a](std::shared_ptr<rai::block> block) {
-							rai::block_hash hash (0);
-							if (block != nullptr)
-							{
-								hash = block->hash ();
-							}
-							boost::property_tree::ptree response_l;
-							response_l.put ("block", hash.to_string ());
-							response_a (response_l);
-						},
-						work == 0);
+					}
+					else
+					{
+						ec = badem::error_common::account_not_found;
 					}
 				}
-				else
-				{
-					error_response (response, "Bad account number");
-				}
+			}
+			if (!ec)
+			{
+				bool generate_work (work == 0); // Disable work generation if "work" option is provided
+				auto response_a (response);
+				// clang-format off
+				wallet->change_async (account, representative, [response_a](std::shared_ptr<badem::block> block) {
+					badem::block_hash hash (0);
+					if (block != nullptr)
+					{
+						hash = block->hash ();
+					}
+					boost::property_tree::ptree response_l;
+					response_l.put ("block", hash.to_string ());
+					response_a (response_l);
+				},
+				work, generate_work);
+				// clang-format on
 			}
 		}
+		else
+		{
+			ec = badem::error_rpc::bad_representative_number;
+		}
 	}
-	else
+	// Because of change_async
+	if (ec)
 	{
-		error_response (response, "RPC control is disabled");
+		response_errors ();
 	}
 }
 
-void rai::rpc_handler::account_weight ()
+void badem::rpc_handler::account_weight ()
 {
-	std::string account_text (request.get<std::string> ("account"));
-	rai::uint256_union account;
-	auto error (account.decode_account (account_text));
-	if (!error)
+	auto account (account_impl ());
+	if (!ec)
 	{
 		auto balance (node.weight (account));
-		boost::property_tree::ptree response_l;
 		response_l.put ("weight", balance.convert_to<std::string> ());
-		response (response_l);
 	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::accounts_balances ()
+void badem::rpc_handler::accounts_balances ()
 {
-	boost::property_tree::ptree response_l;
 	boost::property_tree::ptree balances;
 	for (auto & accounts : request.get_child ("accounts"))
 	{
-		std::string account_text = accounts.second.data ();
-		rai::uint256_union account;
-		auto error (account.decode_account (account_text));
-		if (!error)
+		auto account (account_impl (accounts.second.data ()));
+		if (!ec)
 		{
 			boost::property_tree::ptree entry;
 			auto balance (node.balance_pending (account));
@@ -696,80 +760,43 @@ void rai::rpc_handler::accounts_balances ()
 			entry.put ("pending", balance.second.convert_to<std::string> ());
 			balances.push_back (std::make_pair (account.to_account (), entry));
 		}
-		else
-		{
-			error_response (response, "Bad account number");
-		}
 	}
 	response_l.add_child ("balances", balances);
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::accounts_create ()
+void badem::rpc_handler::accounts_create ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	auto count (count_impl ());
+	if (!ec)
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
+		const bool generate_work = request.get<bool> ("work", false);
+		boost::property_tree::ptree accounts;
+		for (auto i (0); accounts.size () < count; ++i)
 		{
-			uint64_t count;
-			std::string count_text (request.get<std::string> ("count"));
-			auto count_error (decode_unsigned (count_text, count));
-			if (!count_error && count != 0)
+			badem::account new_key (wallet->deterministic_insert (generate_work));
+			if (!new_key.is_zero ())
 			{
-				auto existing (node.wallets.items.find (wallet));
-				if (existing != node.wallets.items.end ())
-				{
-					const bool generate_work = request.get<bool> ("work", false);
-					boost::property_tree::ptree response_l;
-					boost::property_tree::ptree accounts;
-					for (auto i (0); accounts.size () < count; ++i)
-					{
-						rai::account new_key (existing->second->deterministic_insert (generate_work));
-						if (!new_key.is_zero ())
-						{
-							boost::property_tree::ptree entry;
-							entry.put ("", new_key.to_account ());
-							accounts.push_back (std::make_pair ("", entry));
-						}
-					}
-					response_l.add_child ("accounts", accounts);
-					response (response_l);
-				}
-				else
-				{
-					error_response (response, "Wallet not found");
-				}
-			}
-			else
-			{
-				error_response (response, "Invalid count limit");
+				boost::property_tree::ptree entry;
+				entry.put ("", new_key.to_account ());
+				accounts.push_back (std::make_pair ("", entry));
 			}
 		}
-		else
-		{
-			error_response (response, "Bad wallet number");
-		}
+		response_l.add_child ("accounts", accounts);
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::accounts_frontiers ()
+void badem::rpc_handler::accounts_frontiers ()
 {
-	boost::property_tree::ptree response_l;
 	boost::property_tree::ptree frontiers;
-	rai::transaction transaction (node.store.environment, nullptr, false);
+	auto transaction (node.store.tx_begin_read ());
 	for (auto & accounts : request.get_child ("accounts"))
 	{
-		std::string account_text = accounts.second.data ();
-		rai::uint256_union account;
-		auto error (account.decode_account (account_text));
-		if (!error)
+		auto account (account_impl (accounts.second.data ()));
+		if (!ec)
 		{
 			auto latest (node.ledger.latest (transaction, account));
 			if (!latest.is_zero ())
@@ -777,455 +804,392 @@ void rai::rpc_handler::accounts_frontiers ()
 				frontiers.put (account.to_account (), latest.to_string ());
 			}
 		}
-		else
-		{
-			error_response (response, "Bad account number");
-		}
 	}
 	response_l.add_child ("frontiers", frontiers);
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::accounts_pending ()
+void badem::rpc_handler::accounts_pending ()
 {
-	uint64_t count (std::numeric_limits<uint64_t>::max ());
-	rai::uint128_union threshold (0);
-	boost::optional<std::string> count_text (request.get_optional<std::string> ("count"));
-	if (count_text.is_initialized ())
-	{
-		auto error (decode_unsigned (count_text.get (), count));
-		if (error)
-		{
-			error_response (response, "Invalid count limit");
-		}
-	}
-	boost::optional<std::string> threshold_text (request.get_optional<std::string> ("threshold"));
-	if (threshold_text.is_initialized ())
-	{
-		auto error_threshold (threshold.decode_dec (threshold_text.get ()));
-		if (error_threshold)
-		{
-			error_response (response, "Bad threshold number");
-		}
-	}
+	auto count (count_optional_impl ());
+	auto threshold (threshold_optional_impl ());
 	const bool source = request.get<bool> ("source", false);
-	boost::property_tree::ptree response_l;
+	const bool include_active = request.get<bool> ("include_active", false);
 	boost::property_tree::ptree pending;
-	rai::transaction transaction (node.store.environment, nullptr, false);
+	auto transaction (node.store.tx_begin_read ());
 	for (auto & accounts : request.get_child ("accounts"))
 	{
-		std::string account_text = accounts.second.data ();
-		rai::uint256_union account;
-		if (!account.decode_account (account_text))
+		auto account (account_impl (accounts.second.data ()));
+		if (!ec)
 		{
 			boost::property_tree::ptree peers_l;
-			rai::account end (account.number () + 1);
-			for (auto i (node.store.pending_begin (transaction, rai::pending_key (account, 0))), n (node.store.pending_begin (transaction, rai::pending_key (end, 0))); i != n && peers_l.size () < count; ++i)
+			for (auto i (node.store.pending_begin (transaction, badem::pending_key (account, 0))); badem::pending_key (i->first).account == account && peers_l.size () < count; ++i)
 			{
-				rai::pending_key key (i->first);
-				if (threshold.is_zero () && !source)
+				badem::pending_key key (i->first);
+				std::shared_ptr<badem::block> block (include_active ? nullptr : node.store.block_get (transaction, key.hash));
+				if (include_active || (block && !node.active.active (*block)))
 				{
-					boost::property_tree::ptree entry;
-					entry.put ("", key.hash.to_string ());
-					peers_l.push_back (std::make_pair ("", entry));
-				}
-				else
-				{
-					rai::pending_info info (i->second);
-					if (info.amount.number () >= threshold.number ())
+					if (threshold.is_zero () && !source)
 					{
-						if (source)
+						boost::property_tree::ptree entry;
+						entry.put ("", key.hash.to_string ());
+						peers_l.push_back (std::make_pair ("", entry));
+					}
+					else
+					{
+						badem::pending_info info (i->second);
+						if (info.amount.number () >= threshold.number ())
 						{
-							boost::property_tree::ptree pending_tree;
-							pending_tree.put ("amount", info.amount.number ().convert_to<std::string> ());
-							pending_tree.put ("source", info.source.to_account ());
-							peers_l.add_child (key.hash.to_string (), pending_tree);
-						}
-						else
-						{
-							peers_l.put (key.hash.to_string (), info.amount.number ().convert_to<std::string> ());
+							if (source)
+							{
+								boost::property_tree::ptree pending_tree;
+								pending_tree.put ("amount", info.amount.number ().convert_to<std::string> ());
+								pending_tree.put ("source", info.source.to_account ());
+								peers_l.add_child (key.hash.to_string (), pending_tree);
+							}
+							else
+							{
+								peers_l.put (key.hash.to_string (), info.amount.number ().convert_to<std::string> ());
+							}
 						}
 					}
 				}
 			}
 			pending.add_child (account.to_account (), peers_l);
 		}
-		else
-		{
-			error_response (response, "Bad account number");
-		}
 	}
 	response_l.add_child ("blocks", pending);
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::available_supply ()
+void badem::rpc_handler::available_supply ()
 {
-	auto genesis_balance (node.balance (rai::genesis_account)); // Cold storage genesis
-	auto landing_balance (node.balance (rai::account ("059F68AAB29DE0D3A27443625C7EA9CDDB6517A8B76FE37727EF6A4D76832AD5"))); // Active unavailable account
-	auto faucet_balance (node.balance (rai::account ("8E319CE6F3025E5B2DF66DA7AB1467FE48F1679C13DD43BFDB29FA2E9FC40D3B"))); // Faucet account
-	auto burned_balance ((node.balance_pending (rai::account (0))).second); // Burning 0 account
-	auto available (rai::genesis_amount - genesis_balance - landing_balance - faucet_balance - burned_balance);
-	boost::property_tree::ptree response_l;
+	auto genesis_balance (node.balance (badem::genesis_account)); // Cold storage genesis
+	auto landing_balance (node.balance (badem::account ("059F68AAB29DE0D3A27443625C7EA9CDDB6517A8B76FE37727EF6A4D76832AD5"))); // Active unavailable account
+	auto faucet_balance (node.balance (badem::account ("8E319CE6F3025E5B2DF66DA7AB1467FE48F1679C13DD43BFDB29FA2E9FC40D3B"))); // Faucet account
+	auto burned_balance ((node.balance_pending (badem::account (0))).second); // Burning 0 account
+	auto available (badem::genesis_amount - genesis_balance - landing_balance - faucet_balance - burned_balance);
 	response_l.put ("available", available.convert_to<std::string> ());
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::block ()
+void badem::rpc_handler::block_info ()
 {
-	std::string hash_text (request.get<std::string> ("hash"));
-	rai::uint256_union hash;
-	auto error (hash.decode_hex (hash_text));
-	if (!error)
+	auto hash (hash_impl ());
+	if (!ec)
 	{
-		rai::transaction transaction (node.store.environment, nullptr, false);
-		auto block (node.store.block_get (transaction, hash));
+		badem::block_sideband sideband;
+		auto transaction (node.store.tx_begin_read ());
+		auto block (node.store.block_get (transaction, hash, &sideband));
 		if (block != nullptr)
 		{
-			boost::property_tree::ptree response_l;
+			badem::account account (block->account ().is_zero () ? sideband.account : block->account ());
+			response_l.put ("block_account", account.to_account ());
+			auto amount (node.ledger.amount (transaction, hash));
+			response_l.put ("amount", amount.convert_to<std::string> ());
+			auto balance (node.ledger.balance (transaction, hash));
+			response_l.put ("balance", balance.convert_to<std::string> ());
+			response_l.put ("height", std::to_string (sideband.height));
+			response_l.put ("local_timestamp", std::to_string (sideband.timestamp));
 			std::string contents;
 			block->serialize_json (contents);
 			response_l.put ("contents", contents);
-			response (response_l);
 		}
 		else
 		{
-			error_response (response, "Block not found");
+			ec = badem::error_blocks::not_found;
 		}
 	}
-	else
-	{
-		error_response (response, "Bad hash number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::block_confirm ()
+void badem::rpc_handler::block_confirm ()
 {
-	std::string hash_text (request.get<std::string> ("hash"));
-	rai::block_hash hash_l;
-	if (!hash_l.decode_hex (hash_text))
+	auto hash (hash_impl ());
+	if (!ec)
 	{
-		rai::transaction transaction (node.store.environment, nullptr, false);
-		auto block_l (node.store.block_get (transaction, hash_l));
+		auto transaction (node.store.tx_begin_read ());
+		auto block_l (node.store.block_get (transaction, hash));
 		if (block_l != nullptr)
 		{
 			node.block_confirm (std::move (block_l));
-			boost::property_tree::ptree response_l;
 			response_l.put ("started", "1");
-			response (response_l);
 		}
 		else
 		{
-			error_response (response, "Block not found");
+			ec = badem::error_blocks::not_found;
 		}
 	}
-	else
-	{
-		error_response (response, "Invalid block hash");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::blocks ()
+void badem::rpc_handler::blocks ()
 {
 	std::vector<std::string> hashes;
-	boost::property_tree::ptree response_l;
 	boost::property_tree::ptree blocks;
-	rai::transaction transaction (node.store.environment, nullptr, false);
+	auto transaction (node.store.tx_begin_read ());
 	for (boost::property_tree::ptree::value_type & hashes : request.get_child ("hashes"))
 	{
-		std::string hash_text = hashes.second.data ();
-		rai::uint256_union hash;
-		auto error (hash.decode_hex (hash_text));
-		if (!error)
+		if (!ec)
 		{
-			auto block (node.store.block_get (transaction, hash));
-			if (block != nullptr)
+			std::string hash_text = hashes.second.data ();
+			badem::uint256_union hash;
+			if (!hash.decode_hex (hash_text))
 			{
-				std::string contents;
-				block->serialize_json (contents);
-				blocks.put (hash_text, contents);
+				auto block (node.store.block_get (transaction, hash));
+				if (block != nullptr)
+				{
+					std::string contents;
+					block->serialize_json (contents);
+					blocks.put (hash_text, contents);
+				}
+				else
+				{
+					ec = badem::error_blocks::not_found;
+				}
 			}
 			else
 			{
-				error_response (response, "Block not found");
+				ec = badem::error_blocks::bad_hash_number;
 			}
-		}
-		else
-		{
-			error_response (response, "Bad hash number");
 		}
 	}
 	response_l.add_child ("blocks", blocks);
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::blocks_info ()
+void badem::rpc_handler::blocks_info ()
 {
 	const bool pending = request.get<bool> ("pending", false);
 	const bool source = request.get<bool> ("source", false);
-	const bool balance = request.get<bool> ("balance", false);
 	std::vector<std::string> hashes;
-	boost::property_tree::ptree response_l;
 	boost::property_tree::ptree blocks;
-	rai::transaction transaction (node.store.environment, nullptr, false);
+	auto transaction (node.store.tx_begin_read ());
 	for (boost::property_tree::ptree::value_type & hashes : request.get_child ("hashes"))
 	{
-		std::string hash_text = hashes.second.data ();
-		rai::uint256_union hash;
-		auto error (hash.decode_hex (hash_text));
-		if (!error)
+		if (!ec)
 		{
-			auto block (node.store.block_get (transaction, hash));
-			if (block != nullptr)
+			std::string hash_text = hashes.second.data ();
+			badem::uint256_union hash;
+			if (!hash.decode_hex (hash_text))
 			{
-				boost::property_tree::ptree entry;
-				auto account (node.ledger.account (transaction, hash));
-				entry.put ("block_account", account.to_account ());
-				auto amount (node.ledger.amount (transaction, hash));
-				entry.put ("amount", amount.convert_to<std::string> ());
-				std::string contents;
-				block->serialize_json (contents);
-				entry.put ("contents", contents);
-				if (pending)
+				badem::block_sideband sideband;
+				auto block (node.store.block_get (transaction, hash, &sideband));
+				if (block != nullptr)
 				{
-					bool exists (false);
-					auto destination (node.ledger.block_destination (transaction, *block));
-					if (!destination.is_zero ())
-					{
-						exists = node.store.pending_exists (transaction, rai::pending_key (destination, hash));
-					}
-					entry.put ("pending", exists ? "1" : "0");
-				}
-				if (source)
-				{
-					rai::block_hash source_hash (node.ledger.block_source (transaction, *block));
-					std::unique_ptr<rai::block> block_a (node.store.block_get (transaction, source_hash));
-					if (block_a != nullptr)
-					{
-						auto source_account (node.ledger.account (transaction, source_hash));
-						entry.put ("source_account", source_account.to_account ());
-					}
-					else
-					{
-						entry.put ("source_account", "0");
-					}
-				}
-				if (balance)
-				{
+					boost::property_tree::ptree entry;
+					badem::account account (block->account ().is_zero () ? sideband.account : block->account ());
+					entry.put ("block_account", account.to_account ());
+					auto amount (node.ledger.amount (transaction, hash));
+					entry.put ("amount", amount.convert_to<std::string> ());
 					auto balance (node.ledger.balance (transaction, hash));
 					entry.put ("balance", balance.convert_to<std::string> ());
+					entry.put ("height", std::to_string (sideband.height));
+					entry.put ("local_timestamp", std::to_string (sideband.timestamp));
+					std::string contents;
+					block->serialize_json (contents);
+					entry.put ("contents", contents);
+					if (pending)
+					{
+						bool exists (false);
+						auto destination (node.ledger.block_destination (transaction, *block));
+						if (!destination.is_zero ())
+						{
+							exists = node.store.pending_exists (transaction, badem::pending_key (destination, hash));
+						}
+						entry.put ("pending", exists ? "1" : "0");
+					}
+					if (source)
+					{
+						badem::block_hash source_hash (node.ledger.block_source (transaction, *block));
+						auto block_a (node.store.block_get (transaction, source_hash));
+						if (block_a != nullptr)
+						{
+							auto source_account (node.ledger.account (transaction, source_hash));
+							entry.put ("source_account", source_account.to_account ());
+						}
+						else
+						{
+							entry.put ("source_account", "0");
+						}
+					}
+					blocks.push_back (std::make_pair (hash_text, entry));
 				}
-				blocks.push_back (std::make_pair (hash_text, entry));
+				else
+				{
+					ec = badem::error_blocks::not_found;
+				}
 			}
 			else
 			{
-				error_response (response, "Block not found");
+				ec = badem::error_blocks::bad_hash_number;
 			}
-		}
-		else
-		{
-			error_response (response, "Bad hash number");
 		}
 	}
 	response_l.add_child ("blocks", blocks);
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::block_account ()
+void badem::rpc_handler::block_account ()
 {
-	std::string hash_text (request.get<std::string> ("hash"));
-	rai::block_hash hash;
-	if (!hash.decode_hex (hash_text))
+	auto hash (hash_impl ());
+	if (!ec)
 	{
-		rai::transaction transaction (node.store.environment, nullptr, false);
+		auto transaction (node.store.tx_begin_read ());
 		if (node.store.block_exists (transaction, hash))
 		{
-			boost::property_tree::ptree response_l;
 			auto account (node.ledger.account (transaction, hash));
 			response_l.put ("account", account.to_account ());
-			response (response_l);
 		}
 		else
 		{
-			error_response (response, "Block not found");
+			ec = badem::error_blocks::not_found;
 		}
 	}
-	else
-	{
-		error_response (response, "Invalid block hash");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::block_count ()
+void badem::rpc_handler::block_count ()
 {
-	rai::transaction transaction (node.store.environment, nullptr, false);
-	boost::property_tree::ptree response_l;
+	auto transaction (node.store.tx_begin_read ());
 	response_l.put ("count", std::to_string (node.store.block_count (transaction).sum ()));
 	response_l.put ("unchecked", std::to_string (node.store.unchecked_count (transaction)));
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::block_count_type ()
+void badem::rpc_handler::block_count_type ()
 {
-	rai::transaction transaction (node.store.environment, nullptr, false);
-	rai::block_counts count (node.store.block_count (transaction));
-	boost::property_tree::ptree response_l;
+	auto transaction (node.store.tx_begin_read ());
+	badem::block_counts count (node.store.block_count (transaction));
 	response_l.put ("send", std::to_string (count.send));
 	response_l.put ("receive", std::to_string (count.receive));
 	response_l.put ("open", std::to_string (count.open));
 	response_l.put ("change", std::to_string (count.change));
-	response_l.put ("state", std::to_string (count.state));
-	response (response_l);
+	response_l.put ("state_v0", std::to_string (count.state_v0));
+	response_l.put ("state_v1", std::to_string (count.state_v1));
+	response_l.put ("state", std::to_string (count.state_v0 + count.state_v1));
+	response_errors ();
 }
 
-void rai::rpc_handler::block_create ()
+void badem::rpc_handler::block_create ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	if (!ec)
 	{
 		std::string type (request.get<std::string> ("type"));
-		rai::uint256_union wallet (0);
+		badem::uint256_union wallet (0);
 		boost::optional<std::string> wallet_text (request.get_optional<std::string> ("wallet"));
 		if (wallet_text.is_initialized ())
 		{
-			auto error (wallet.decode_hex (wallet_text.get ()));
-			if (error)
+			if (wallet.decode_hex (wallet_text.get ()))
 			{
-				error_response (response, "Bad wallet number");
+				ec = badem::error_common::bad_wallet_number;
 			}
 		}
-		rai::uint256_union account (0);
+		badem::uint256_union account (0);
 		boost::optional<std::string> account_text (request.get_optional<std::string> ("account"));
-		if (account_text.is_initialized ())
+		if (!ec && account_text.is_initialized ())
 		{
-			auto error_account (account.decode_account (account_text.get ()));
-			if (error_account)
+			if (account.decode_account (account_text.get ()))
 			{
-				error_response (response, "Bad account number");
+				ec = badem::error_common::bad_account_number;
 			}
 		}
-		rai::uint256_union representative (0);
+		badem::uint256_union representative (0);
 		boost::optional<std::string> representative_text (request.get_optional<std::string> ("representative"));
-		if (representative_text.is_initialized ())
+		if (!ec && representative_text.is_initialized ())
 		{
-			auto error_representative (representative.decode_account (representative_text.get ()));
-			if (error_representative)
+			if (representative.decode_account (representative_text.get ()))
 			{
-				error_response (response, "Bad representative account");
+				ec = badem::error_rpc::bad_representative_number;
 			}
 		}
-		rai::uint256_union destination (0);
+		badem::uint256_union destination (0);
 		boost::optional<std::string> destination_text (request.get_optional<std::string> ("destination"));
-		if (destination_text.is_initialized ())
+		if (!ec && destination_text.is_initialized ())
 		{
-			auto error_destination (destination.decode_account (destination_text.get ()));
-			if (error_destination)
+			if (destination.decode_account (destination_text.get ()))
 			{
-				error_response (response, "Bad destination account");
+				ec = badem::error_rpc::bad_destination;
 			}
 		}
-		rai::block_hash source (0);
+		badem::block_hash source (0);
 		boost::optional<std::string> source_text (request.get_optional<std::string> ("source"));
-		if (source_text.is_initialized ())
+		if (!ec && source_text.is_initialized ())
 		{
-			auto error_source (source.decode_hex (source_text.get ()));
-			if (error_source)
+			if (source.decode_hex (source_text.get ()))
 			{
-				error_response (response, "Invalid source hash");
+				ec = badem::error_rpc::bad_source;
 			}
 		}
-		rai::uint128_union amount (0);
+		badem::uint128_union amount (0);
 		boost::optional<std::string> amount_text (request.get_optional<std::string> ("amount"));
-		if (amount_text.is_initialized ())
+		if (!ec && amount_text.is_initialized ())
 		{
-			auto error_amount (amount.decode_dec (amount_text.get ()));
-			if (error_amount)
+			if (amount.decode_dec (amount_text.get ()))
 			{
-				error_response (response, "Bad amount number");
+				ec = badem::error_common::invalid_amount;
 			}
 		}
-		uint64_t work (0);
-		boost::optional<std::string> work_text (request.get_optional<std::string> ("work"));
-		if (work_text.is_initialized ())
-		{
-			auto work_error (rai::from_string_hex (work_text.get (), work));
-			if (work_error)
-			{
-				error_response (response, "Bad work");
-			}
-		}
-		rai::raw_key prv;
+		auto work (work_optional_impl ());
+		badem::raw_key prv;
 		prv.data.clear ();
-		rai::uint256_union previous (0);
-		rai::uint128_union balance (0);
-		if (wallet != 0 && account != 0)
+		badem::uint256_union previous (0);
+		badem::uint128_union balance (0);
+		if (!ec && wallet != 0 && account != 0)
 		{
 			auto existing (node.wallets.items.find (wallet));
 			if (existing != node.wallets.items.end ())
 			{
-				rai::transaction transaction (node.store.environment, nullptr, false);
-				auto unlock_check (existing->second->store.valid_password (transaction));
-				if (unlock_check)
+				auto transaction (node.wallets.tx_begin_read ());
+				auto block_transaction (node.store.tx_begin_read ());
+				wallet_locked_impl (transaction, existing->second);
+				wallet_account_impl (transaction, existing->second, account);
+				if (!ec)
 				{
-					auto account_check (existing->second->store.find (transaction, account));
-					if (account_check != existing->second->store.end ())
-					{
-						existing->second->store.fetch (transaction, account, prv);
-						previous = node.ledger.latest (transaction, account);
-						balance = node.ledger.account_balance (transaction, account);
-					}
-					else
-					{
-						error_response (response, "Account not found in wallet");
-					}
-				}
-				else
-				{
-					error_response (response, "Wallet is locked");
+					existing->second->store.fetch (transaction, account, prv);
+					previous = node.ledger.latest (block_transaction, account);
+					balance = node.ledger.account_balance (block_transaction, account);
 				}
 			}
 			else
 			{
-				error_response (response, "Wallet not found");
+				ec = badem::error_common::wallet_not_found;
 			}
 		}
 		boost::optional<std::string> key_text (request.get_optional<std::string> ("key"));
-		if (key_text.is_initialized ())
+		if (!ec && key_text.is_initialized ())
 		{
-			auto error_key (prv.data.decode_hex (key_text.get ()));
-			if (error_key)
+			if (prv.data.decode_hex (key_text.get ()))
 			{
-				error_response (response, "Bad private key");
+				ec = badem::error_common::bad_private_key;
 			}
 		}
 		boost::optional<std::string> previous_text (request.get_optional<std::string> ("previous"));
-		if (previous_text.is_initialized ())
+		if (!ec && previous_text.is_initialized ())
 		{
-			auto error_previous (previous.decode_hex (previous_text.get ()));
-			if (error_previous)
+			if (previous.decode_hex (previous_text.get ()))
 			{
-				error_response (response, "Invalid previous hash");
+				ec = badem::error_rpc::bad_previous;
 			}
 		}
 		boost::optional<std::string> balance_text (request.get_optional<std::string> ("balance"));
-		if (balance_text.is_initialized ())
+		if (!ec && balance_text.is_initialized ())
 		{
-			auto error_balance (balance.decode_dec (balance_text.get ()));
-			if (error_balance)
+			if (balance.decode_dec (balance_text.get ()))
 			{
-				error_response (response, "Bad balance number");
+				ec = badem::error_rpc::invalid_balance;
 			}
 		}
-		rai::uint256_union link (0);
+		badem::uint256_union link (0);
 		boost::optional<std::string> link_text (request.get_optional<std::string> ("link"));
-		if (link_text.is_initialized ())
+		if (!ec && link_text.is_initialized ())
 		{
-			auto error_link (link.decode_account (link_text.get ()));
-			if (error_link)
+			if (link.decode_account (link_text.get ()))
 			{
-				auto error_link (link.decode_hex (link_text.get ()));
-				if (error_link)
+				if (link.decode_hex (link_text.get ()))
 				{
-					error_response (response, "Bad link number");
+					ec = badem::error_rpc::bad_link;
 				}
 			}
 		}
@@ -1236,30 +1200,29 @@ void rai::rpc_handler::block_create ()
 		}
 		if (prv.data != 0)
 		{
-			rai::uint256_union pub;
-			ed25519_publickey (prv.data.bytes.data (), pub.bytes.data ());
+			badem::uint256_union pub (badem::pub_key (prv.data));
 			// Fetching account balance & previous for send blocks (if aren't given directly)
 			if (!previous_text.is_initialized () && !balance_text.is_initialized ())
 			{
-				rai::transaction transaction (node.store.environment, nullptr, false);
+				auto transaction (node.store.tx_begin_read ());
 				previous = node.ledger.latest (transaction, pub);
 				balance = node.ledger.account_balance (transaction, pub);
 			}
 			// Double check current balance if previous block is specified
 			else if (previous_text.is_initialized () && balance_text.is_initialized () && type == "send")
 			{
-				rai::transaction transaction (node.store.environment, nullptr, false);
+				auto transaction (node.store.tx_begin_read ());
 				if (node.store.block_exists (transaction, previous) && node.store.block_balance (transaction, previous) != balance.number ())
 				{
-					error_response (response, "Balance mismatch for previous block");
+					ec = badem::error_rpc::block_create_balance_mismatch;
 				}
 			}
 			// Check for incorrect account key
-			if (account_text.is_initialized ())
+			if (!ec && account_text.is_initialized ())
 			{
 				if (account != pub)
 				{
-					error_response (response, "Incorrect key for given account");
+					ec = badem::error_rpc::block_create_public_key_mismatch;
 				}
 			}
 			if (type == "state")
@@ -1270,17 +1233,15 @@ void rai::rpc_handler::block_create ()
 					{
 						work = node.work_generate_blocking (previous.is_zero () ? pub : previous);
 					}
-					rai::state_block state (pub, previous, representative, balance, link, prv, pub, work);
-					boost::property_tree::ptree response_l;
+					badem::state_block state (pub, previous, representative, balance, link, prv, pub, work);
 					response_l.put ("hash", state.hash ().to_string ());
 					std::string contents;
 					state.serialize_json (contents);
 					response_l.put ("block", contents);
-					response (response_l);
 				}
 				else
 				{
-					error_response (response, "Previous, representative, final balance and link (source or destination) are required");
+					ec = badem::error_rpc::block_create_requirements_state;
 				}
 			}
 			else if (type == "open")
@@ -1291,17 +1252,15 @@ void rai::rpc_handler::block_create ()
 					{
 						work = node.work_generate_blocking (pub);
 					}
-					rai::open_block open (source, representative, pub, prv, pub, work);
-					boost::property_tree::ptree response_l;
+					badem::open_block open (source, representative, pub, prv, pub, work);
 					response_l.put ("hash", open.hash ().to_string ());
 					std::string contents;
 					open.serialize_json (contents);
 					response_l.put ("block", contents);
-					response (response_l);
 				}
 				else
 				{
-					error_response (response, "Representative account and source hash required");
+					ec = badem::error_rpc::block_create_requirements_open;
 				}
 			}
 			else if (type == "receive")
@@ -1312,17 +1271,15 @@ void rai::rpc_handler::block_create ()
 					{
 						work = node.work_generate_blocking (previous);
 					}
-					rai::receive_block receive (previous, source, prv, pub, work);
-					boost::property_tree::ptree response_l;
+					badem::receive_block receive (previous, source, prv, pub, work);
 					response_l.put ("hash", receive.hash ().to_string ());
 					std::string contents;
 					receive.serialize_json (contents);
 					response_l.put ("block", contents);
-					response (response_l);
 				}
 				else
 				{
-					error_response (response, "Previous hash and source hash required");
+					ec = badem::error_rpc::block_create_requirements_receive;
 				}
 			}
 			else if (type == "change")
@@ -1333,17 +1290,15 @@ void rai::rpc_handler::block_create ()
 					{
 						work = node.work_generate_blocking (previous);
 					}
-					rai::change_block change (previous, representative, prv, pub, work);
-					boost::property_tree::ptree response_l;
+					badem::change_block change (previous, representative, prv, pub, work);
 					response_l.put ("hash", change.hash ().to_string ());
 					std::string contents;
 					change.serialize_json (contents);
 					response_l.put ("block", contents);
-					response (response_l);
 				}
 				else
 				{
-					error_response (response, "Representative account and previous hash required");
+					ec = badem::error_rpc::block_create_requirements_change;
 				}
 			}
 			else if (type == "send")
@@ -1356,241 +1311,363 @@ void rai::rpc_handler::block_create ()
 						{
 							work = node.work_generate_blocking (previous);
 						}
-						rai::send_block send (previous, destination, balance.number () - amount.number (), prv, pub, work);
-						boost::property_tree::ptree response_l;
+						badem::send_block send (previous, destination, balance.number () - amount.number (), prv, pub, work);
 						response_l.put ("hash", send.hash ().to_string ());
 						std::string contents;
 						send.serialize_json (contents);
 						response_l.put ("block", contents);
-						response (response_l);
 					}
 					else
 					{
-						error_response (response, "Insufficient balance");
+						ec = badem::error_common::insufficient_balance;
 					}
 				}
 				else
 				{
-					error_response (response, "Destination account, previous hash, current balance and amount required");
+					ec = badem::error_rpc::block_create_requirements_send;
 				}
 			}
 			else
 			{
-				error_response (response, "Invalid block type");
+				ec = badem::error_blocks::invalid_type;
 			}
 		}
 		else
 		{
-			error_response (response, "Private key or local wallet and account required");
+			ec = badem::error_rpc::block_create_key_required;
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::block_hash ()
+void badem::rpc_handler::block_hash ()
 {
-	std::string block_text (request.get<std::string> ("block"));
-	boost::property_tree::ptree block_l;
-	std::stringstream block_stream (block_text);
-	boost::property_tree::read_json (block_stream, block_l);
-	block_l.put ("signature", "0");
-	block_l.put ("work", "0");
-	auto block (rai::deserialize_block_json (block_l));
-	if (block != nullptr)
+	auto block (block_impl (false));
+	if (!ec)
 	{
-		boost::property_tree::ptree response_l;
 		response_l.put ("hash", block->hash ().to_string ());
-		response (response_l);
 	}
-	else
-	{
-		error_response (response, "Block is invalid");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::successors ()
-{
-	std::string block_text (request.get<std::string> ("block"));
-	std::string count_text (request.get<std::string> ("count"));
-	rai::block_hash block;
-	if (!block.decode_hex (block_text))
-	{
-		uint64_t count;
-		if (!decode_unsigned (count_text, count))
-		{
-			boost::property_tree::ptree response_l;
-			boost::property_tree::ptree blocks;
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			while (!block.is_zero () && blocks.size () < count)
-			{
-				auto block_l (node.store.block_get (transaction, block));
-				if (block_l != nullptr)
-				{
-					boost::property_tree::ptree entry;
-					entry.put ("", block.to_string ());
-					blocks.push_back (std::make_pair ("", entry));
-					block = node.store.block_successor (transaction, block);
-				}
-				else
-				{
-					block.clear ();
-				}
-			}
-			response_l.add_child ("blocks", blocks);
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Invalid count limit");
-		}
-	}
-	else
-	{
-		error_response (response, "Invalid block hash");
-	}
-}
-
-void rai::rpc_handler::bootstrap ()
+void badem::rpc_handler::bootstrap ()
 {
 	std::string address_text = request.get<std::string> ("address");
 	std::string port_text = request.get<std::string> ("port");
-	boost::system::error_code ec;
-	auto address (boost::asio::ip::address_v6::from_string (address_text, ec));
-	if (!ec)
+	boost::system::error_code address_ec;
+	auto address (boost::asio::ip::address_v6::from_string (address_text, address_ec));
+	if (!address_ec)
 	{
 		uint16_t port;
-		if (!rai::parse_port (port_text, port))
+		if (!badem::parse_port (port_text, port))
 		{
-			node.bootstrap_initiator.bootstrap (rai::endpoint (address, port));
-			boost::property_tree::ptree response_l;
+			node.bootstrap_initiator.bootstrap (badem::endpoint (address, port));
 			response_l.put ("success", "");
-			response (response_l);
 		}
 		else
 		{
-			error_response (response, "Invalid port");
+			ec = badem::error_common::invalid_port;
 		}
 	}
 	else
 	{
-		error_response (response, "Invalid address");
+		ec = badem::error_common::invalid_ip_address;
 	}
+	response_errors ();
 }
 
-void rai::rpc_handler::bootstrap_any ()
+void badem::rpc_handler::bootstrap_any ()
 {
 	node.bootstrap_initiator.bootstrap ();
-	boost::property_tree::ptree response_l;
 	response_l.put ("success", "");
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::chain ()
+void badem::rpc_handler::bootstrap_lazy ()
 {
-	std::string block_text (request.get<std::string> ("block"));
-	std::string count_text (request.get<std::string> ("count"));
-	rai::block_hash block;
-	if (!block.decode_hex (block_text))
+	rpc_control_impl ();
+	auto hash (hash_impl ());
+	const bool force = request.get<bool> ("force", false);
+	if (!ec)
 	{
-		uint64_t count;
-		if (!decode_unsigned (count_text, count))
+		node.bootstrap_initiator.bootstrap_lazy (hash, force);
+		response_l.put ("started", "1");
+	}
+	response_errors ();
+}
+
+/*
+ * @warning This is an internal/diagnostic RPC, do not rely on its interface being stable
+ */
+void badem::rpc_handler::bootstrap_status ()
+{
+	auto attempt (node.bootstrap_initiator.current_attempt ());
+	if (attempt != nullptr)
+	{
+		response_l.put ("clients", std::to_string (attempt->clients.size ()));
+		response_l.put ("pulls", std::to_string (attempt->pulls.size ()));
+		response_l.put ("pulling", std::to_string (attempt->pulling));
+		response_l.put ("connections", std::to_string (attempt->connections));
+		response_l.put ("idle", std::to_string (attempt->idle.size ()));
+		response_l.put ("target_connections", std::to_string (attempt->target_connections (attempt->pulls.size ())));
+		response_l.put ("total_blocks", std::to_string (attempt->total_blocks));
+		response_l.put ("runs_count", std::to_string (attempt->runs_count));
+		std::string mode_text;
+		if (attempt->mode == badem::bootstrap_mode::legacy)
 		{
-			boost::property_tree::ptree response_l;
-			boost::property_tree::ptree blocks;
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			while (!block.is_zero () && blocks.size () < count)
+			mode_text = "legacy";
+		}
+		else if (attempt->mode == badem::bootstrap_mode::lazy)
+		{
+			mode_text = "lazy";
+		}
+		else if (attempt->mode == badem::bootstrap_mode::wallet_lazy)
+		{
+			mode_text = "wallet_lazy";
+		}
+		response_l.put ("mode", mode_text);
+		response_l.put ("lazy_blocks", std::to_string (attempt->lazy_blocks.size ()));
+		response_l.put ("lazy_state_unknown", std::to_string (attempt->lazy_state_unknown.size ()));
+		response_l.put ("lazy_balances", std::to_string (attempt->lazy_balances.size ()));
+		response_l.put ("lazy_pulls", std::to_string (attempt->lazy_pulls.size ()));
+		response_l.put ("lazy_stopped", std::to_string (attempt->lazy_stopped));
+		response_l.put ("lazy_keys", std::to_string (attempt->lazy_keys.size ()));
+		if (!attempt->lazy_keys.empty ())
+		{
+			response_l.put ("lazy_key_1", (*(attempt->lazy_keys.begin ())).to_string ());
+		}
+	}
+	else
+	{
+		response_l.put ("active", "0");
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::chain (bool successors)
+{
+	successors = successors != request.get<bool> ("reverse", false);
+	auto hash (hash_impl ("block"));
+	auto count (count_impl ());
+	auto offset (offset_optional_impl (0));
+	if (!ec)
+	{
+		boost::property_tree::ptree blocks;
+		auto transaction (node.store.tx_begin_read ());
+		while (!hash.is_zero () && blocks.size () < count)
+		{
+			auto block_l (node.store.block_get (transaction, hash));
+			if (block_l != nullptr)
 			{
-				auto block_l (node.store.block_get (transaction, block));
-				if (block_l != nullptr)
+				if (offset > 0)
 				{
-					boost::property_tree::ptree entry;
-					entry.put ("", block.to_string ());
-					blocks.push_back (std::make_pair ("", entry));
-					block = block_l->previous ();
+					--offset;
 				}
 				else
 				{
-					block.clear ();
+					boost::property_tree::ptree entry;
+					entry.put ("", hash.to_string ());
+					blocks.push_back (std::make_pair ("", entry));
 				}
+				hash = successors ? node.store.block_successor (transaction, hash) : block_l->previous ();
 			}
+			else
+			{
+				hash.clear ();
+			}
+		}
+		response_l.add_child ("blocks", blocks);
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::confirmation_active ()
+{
+	uint64_t announcements (0);
+	boost::optional<std::string> announcements_text (request.get_optional<std::string> ("announcements"));
+	if (announcements_text.is_initialized ())
+	{
+		announcements = strtoul (announcements_text.get ().c_str (), NULL, 10);
+	}
+	boost::property_tree::ptree elections;
+	{
+		std::lock_guard<std::mutex> lock (node.active.mutex);
+		for (auto i (node.active.roots.begin ()), n (node.active.roots.end ()); i != n; ++i)
+		{
+			if (i->election->announcements >= announcements && !i->election->confirmed && !i->election->stopped)
+			{
+				boost::property_tree::ptree entry;
+				entry.put ("", i->root.to_string ());
+				elections.push_back (std::make_pair ("", entry));
+			}
+		}
+	}
+	response_l.add_child ("confirmations", elections);
+	response_errors ();
+}
+
+void badem::rpc_handler::confirmation_history ()
+{
+	boost::property_tree::ptree elections;
+	boost::property_tree::ptree confirmation_stats;
+	std::chrono::milliseconds running_total (0);
+	badem::block_hash hash (0);
+	boost::optional<std::string> hash_text (request.get_optional<std::string> ("hash"));
+	if (hash_text.is_initialized ())
+	{
+		hash = hash_impl ();
+	}
+	if (!ec)
+	{
+		auto confirmed (node.active.list_confirmed ());
+		for (auto i (confirmed.begin ()), n (confirmed.end ()); i != n; ++i)
+		{
+			if (hash.is_zero () || i->winner->hash () == hash)
+			{
+				boost::property_tree::ptree election;
+				election.put ("hash", i->winner->hash ().to_string ());
+				election.put ("duration", i->election_duration.count ());
+				election.put ("time", i->election_end.count ());
+				election.put ("tally", i->tally.to_string_dec ());
+				elections.push_back (std::make_pair ("", election));
+			}
+			running_total += i->election_duration;
+		}
+	}
+	confirmation_stats.put ("count", elections.size ());
+	if (elections.size () >= 1)
+	{
+		confirmation_stats.put ("average", (running_total.count ()) / elections.size ());
+	}
+	response_l.add_child ("confirmation_stats", confirmation_stats);
+	response_l.add_child ("confirmations", elections);
+	response_errors ();
+}
+
+void badem::rpc_handler::confirmation_info ()
+{
+	const bool representatives = request.get<bool> ("representatives", false);
+	const bool contents = request.get<bool> ("contents", true);
+	std::string root_text (request.get<std::string> ("root"));
+	badem::uint512_union root;
+	if (!root.decode_hex (root_text))
+	{
+		std::lock_guard<std::mutex> lock (node.active.mutex);
+		auto conflict_info (node.active.roots.find (root));
+		if (conflict_info != node.active.roots.end ())
+		{
+			response_l.put ("announcements", std::to_string (conflict_info->election->announcements));
+			auto election (conflict_info->election);
+			badem::uint128_t total (0);
+			response_l.put ("last_winner", election->status.winner->hash ().to_string ());
+			auto transaction (node.store.tx_begin_read ());
+			auto tally_l (election->tally (transaction));
+			boost::property_tree::ptree blocks;
+			for (auto i (tally_l.begin ()), n (tally_l.end ()); i != n; ++i)
+			{
+				boost::property_tree::ptree entry;
+				auto tally (i->first);
+				entry.put ("tally", tally.convert_to<std::string> ());
+				total += tally;
+				if (contents)
+				{
+					std::string contents;
+					i->second->serialize_json (contents);
+					entry.put ("contents", contents);
+				}
+				if (representatives)
+				{
+					std::multimap<badem::uint128_t, badem::account, std::greater<badem::uint128_t>> representatives;
+					for (auto ii (election->last_votes.begin ()), nn (election->last_votes.end ()); ii != nn; ++ii)
+					{
+						if (i->second->hash () == ii->second.hash)
+						{
+							badem::account representative (ii->first);
+							auto amount (node.store.representation_get (transaction, representative));
+							representatives.insert (std::make_pair (amount, representative));
+						}
+					}
+					boost::property_tree::ptree representatives_list;
+					for (auto ii (representatives.begin ()), nn (representatives.end ()); ii != nn; ++ii)
+					{
+						representatives_list.put (ii->second.to_account (), ii->first.convert_to<std::string> ());
+					}
+					entry.add_child ("representatives", representatives_list);
+				}
+				blocks.add_child ((i->second->hash ()).to_string (), entry);
+			}
+			response_l.put ("total_tally", total.convert_to<std::string> ());
 			response_l.add_child ("blocks", blocks);
-			response (response_l);
 		}
 		else
 		{
-			error_response (response, "Invalid count limit");
+			ec = badem::error_rpc::confirmation_not_found;
 		}
 	}
 	else
 	{
-		error_response (response, "Invalid block hash");
+		ec = badem::error_rpc::invalid_root;
 	}
+	response_errors ();
 }
 
-void rai::rpc_handler::confirmation_history ()
+void badem::rpc_handler::confirmation_quorum ()
 {
-	boost::property_tree::ptree response_l;
-	boost::property_tree::ptree elections;
+	response_l.put ("quorum_delta", node.delta ().convert_to<std::string> ());
+	response_l.put ("online_weight_quorum_percent", std::to_string (node.config.online_weight_quorum));
+	response_l.put ("online_weight_minimum", node.config.online_weight_minimum.to_string_dec ());
+	response_l.put ("online_stake_total", node.online_reps.online_stake ().convert_to<std::string> ());
+	response_l.put ("peers_stake_total", node.peers.total_weight ().convert_to<std::string> ());
+	if (request.get<bool> ("peer_details", false))
 	{
-		std::lock_guard<std::mutex> lock (node.active.mutex);
-		for (auto i (node.active.confirmed.begin ()), n (node.active.confirmed.end ()); i != n; ++i)
+		boost::property_tree::ptree peers;
+		for (auto & peer : node.peers.list_probable_rep_weights ())
 		{
-			boost::property_tree::ptree election;
-			election.put ("hash", i->winner->hash ().to_string ());
-			election.put ("tally", i->tally.to_string_dec ());
-			elections.push_back (std::make_pair ("", election));
+			boost::property_tree::ptree peer_node;
+			peer_node.put ("account", peer.probable_rep_account.to_account ());
+			peer_node.put ("ip", peer.ip_address.to_string ());
+			peer_node.put ("weight", peer.rep_weight.to_string_dec ());
+			peers.push_back (std::make_pair ("", peer_node));
 		}
+		response_l.add_child ("peers", peers);
 	}
-	response_l.add_child ("confirmations", elections);
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::delegators ()
+void badem::rpc_handler::delegators ()
 {
-	std::string account_text (request.get<std::string> ("account"));
-	rai::account account;
-	auto error (account.decode_account (account_text));
-	if (!error)
+	auto account (account_impl ());
+	if (!ec)
 	{
-		boost::property_tree::ptree response_l;
 		boost::property_tree::ptree delegators;
-		rai::transaction transaction (node.store.environment, nullptr, false);
+		auto transaction (node.store.tx_begin_read ());
 		for (auto i (node.store.latest_begin (transaction)), n (node.store.latest_end ()); i != n; ++i)
 		{
-			rai::account_info info (i->second);
+			badem::account_info info (i->second);
 			auto block (node.store.block_get (transaction, info.rep_block));
 			assert (block != nullptr);
 			if (block->representative () == account)
 			{
 				std::string balance;
-				rai::uint128_union (info.balance).encode_dec (balance);
-				delegators.put (rai::account (i->first.uint256 ()).to_account (), balance);
+				badem::uint128_union (info.balance).encode_dec (balance);
+				delegators.put (badem::account (i->first).to_account (), balance);
 			}
 		}
 		response_l.add_child ("delegators", delegators);
-		response (response_l);
 	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::delegators_count ()
+void badem::rpc_handler::delegators_count ()
 {
-	std::string account_text (request.get<std::string> ("account"));
-	rai::account account;
-	auto error (account.decode_account (account_text));
-	if (!error)
+	auto account (account_impl ());
+	if (!ec)
 	{
 		uint64_t count (0);
-		rai::transaction transaction (node.store.environment, nullptr, false);
+		auto transaction (node.store.tx_begin_read ());
 		for (auto i (node.store.latest_begin (transaction)), n (node.store.latest_end ()); i != n; ++i)
 		{
-			rai::account_info info (i->second);
+			badem::account_info info (i->second);
 			auto block (node.store.block_get (transaction, info.rep_block));
 			assert (block != nullptr);
 			if (block->representative () == account)
@@ -1598,99 +1675,71 @@ void rai::rpc_handler::delegators_count ()
 				++count;
 			}
 		}
-		boost::property_tree::ptree response_l;
 		response_l.put ("count", std::to_string (count));
-		response (response_l);
 	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::deterministic_key ()
+void badem::rpc_handler::deterministic_key ()
 {
 	std::string seed_text (request.get<std::string> ("seed"));
 	std::string index_text (request.get<std::string> ("index"));
-	rai::raw_key seed;
-	auto error (seed.data.decode_hex (seed_text));
-	if (!error)
+	badem::raw_key seed;
+	if (!seed.data.decode_hex (seed_text))
 	{
-		uint64_t index_a;
-		if (!decode_unsigned (index_text, index_a))
+		try
 		{
-			rai::uint256_union index (index_a);
-			rai::uint256_union prv;
-			blake2b_state hash;
-			blake2b_init (&hash, prv.bytes.size ());
-			blake2b_update (&hash, seed.data.bytes.data (), seed.data.bytes.size ());
-			blake2b_update (&hash, reinterpret_cast<uint8_t *> (&index.dwords[7]), sizeof (uint32_t));
-			blake2b_final (&hash, prv.bytes.data (), prv.bytes.size ());
-			boost::property_tree::ptree response_l;
-			rai::uint256_union pub;
-			ed25519_publickey (prv.bytes.data (), pub.bytes.data ());
+			uint32_t index (std::stoul (index_text));
+			badem::uint256_union prv;
+			badem::deterministic_key (seed.data, index, prv);
+			badem::uint256_union pub (badem::pub_key (prv));
 			response_l.put ("private", prv.to_string ());
 			response_l.put ("public", pub.to_string ());
 			response_l.put ("account", pub.to_account ());
-			response (response_l);
 		}
-		else
+		catch (std::logic_error const &)
 		{
-			error_response (response, "Invalid index");
+			ec = badem::error_common::invalid_index;
 		}
 	}
 	else
 	{
-		error_response (response, "Bad seed");
+		ec = badem::error_common::bad_seed;
 	}
+	response_errors ();
 }
 
-void rai::rpc_handler::frontiers ()
+void badem::rpc_handler::frontiers ()
 {
-	std::string account_text (request.get<std::string> ("account"));
-	std::string count_text (request.get<std::string> ("count"));
-	rai::account start;
-	if (!start.decode_account (account_text))
+	auto start (account_impl ());
+	auto count (count_impl ());
+	if (!ec)
 	{
-		uint64_t count;
-		if (!decode_unsigned (count_text, count))
+		boost::property_tree::ptree frontiers;
+		auto transaction (node.store.tx_begin_read ());
+		for (auto i (node.store.latest_begin (transaction, start)), n (node.store.latest_end ()); i != n && frontiers.size () < count; ++i)
 		{
-			boost::property_tree::ptree response_l;
-			boost::property_tree::ptree frontiers;
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			for (auto i (node.store.latest_begin (transaction, start)), n (node.store.latest_end ()); i != n && frontiers.size () < count; ++i)
-			{
-				frontiers.put (rai::account (i->first.uint256 ()).to_account (), rai::account_info (i->second).head.to_string ());
-			}
-			response_l.add_child ("frontiers", frontiers);
-			response (response_l);
+			frontiers.put (badem::account (i->first).to_account (), badem::account_info (i->second).head.to_string ());
 		}
-		else
-		{
-			error_response (response, "Invalid count limit");
-		}
+		response_l.add_child ("frontiers", frontiers);
 	}
-	else
-	{
-		error_response (response, "Invalid starting account");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::account_count ()
+void badem::rpc_handler::account_count ()
 {
-	rai::transaction transaction (node.store.environment, nullptr, false);
+	auto transaction (node.store.tx_begin_read ());
 	auto size (node.store.account_count (transaction));
-	boost::property_tree::ptree response_l;
 	response_l.put ("count", std::to_string (size));
-	response (response_l);
+	response_errors ();
 }
 
 namespace
 {
-class history_visitor : public rai::block_visitor
+class history_visitor : public badem::block_visitor
 {
 public:
-	history_visitor (rai::rpc_handler & handler_a, bool raw_a, rai::transaction & transaction_a, boost::property_tree::ptree & tree_a, rai::block_hash const & hash_a) :
+	history_visitor (badem::rpc_handler & handler_a, bool raw_a, badem::transaction & transaction_a, boost::property_tree::ptree & tree_a, badem::block_hash const & hash_a) :
 	handler (handler_a),
 	raw (raw_a),
 	transaction (transaction_a),
@@ -1699,7 +1748,7 @@ public:
 	{
 	}
 	virtual ~history_visitor () = default;
-	void send_block (rai::send_block const & block_a)
+	void send_block (badem::send_block const & block_a)
 	{
 		tree.put ("type", "send");
 		auto account (block_a.hashables.destination.to_account ());
@@ -1710,9 +1759,10 @@ public:
 		{
 			tree.put ("destination", account);
 			tree.put ("balance", block_a.hashables.balance.to_string_dec ());
+			tree.put ("previous", block_a.hashables.previous.to_string ());
 		}
 	}
-	void receive_block (rai::receive_block const & block_a)
+	void receive_block (badem::receive_block const & block_a)
 	{
 		tree.put ("type", "receive");
 		auto account (handler.node.ledger.account (transaction, block_a.hashables.source).to_account ());
@@ -1722,9 +1772,10 @@ public:
 		if (raw)
 		{
 			tree.put ("source", block_a.hashables.source.to_string ());
+			tree.put ("previous", block_a.hashables.previous.to_string ());
 		}
 	}
-	void open_block (rai::open_block const & block_a)
+	void open_block (badem::open_block const & block_a)
 	{
 		if (raw)
 		{
@@ -1738,32 +1789,35 @@ public:
 			// Report opens as a receive
 			tree.put ("type", "receive");
 		}
-		if (block_a.hashables.source != rai::genesis_account)
+		if (block_a.hashables.source != badem::genesis_account)
 		{
 			tree.put ("account", handler.node.ledger.account (transaction, block_a.hashables.source).to_account ());
 			tree.put ("amount", handler.node.ledger.amount (transaction, hash).convert_to<std::string> ());
 		}
 		else
 		{
-			tree.put ("account", rai::genesis_account.to_account ());
-			tree.put ("amount", rai::genesis_amount.convert_to<std::string> ());
+			tree.put ("account", badem::genesis_account.to_account ());
+			tree.put ("amount", badem::genesis_amount.convert_to<std::string> ());
 		}
 	}
-	void change_block (rai::change_block const & block_a)
+	void change_block (badem::change_block const & block_a)
 	{
 		if (raw)
 		{
 			tree.put ("type", "change");
 			tree.put ("representative", block_a.hashables.representative.to_account ());
+			tree.put ("previous", block_a.hashables.previous.to_string ());
 		}
 	}
-	void state_block (rai::state_block const & block_a)
+	void state_block (badem::state_block const & block_a)
 	{
 		if (raw)
 		{
 			tree.put ("type", "state");
 			tree.put ("representative", block_a.hashables.representative.to_account ());
 			tree.put ("link", block_a.hashables.link.to_string ());
+			tree.put ("balance", block_a.hashables.balance.to_string_dec ());
+			tree.put ("previous", block_a.hashables.previous.to_string ());
 		}
 		auto balance (block_a.hashables.balance.number ());
 		auto previous_balance (handler.node.ledger.balance (transaction, block_a.hashables.previous));
@@ -1789,6 +1843,14 @@ public:
 					tree.put ("subtype", "change");
 				}
 			}
+			else if (balance == previous_balance && !handler.node.ledger.epoch_link.is_zero () && handler.node.ledger.is_epoch_link (block_a.hashables.link))
+			{
+				if (raw)
+				{
+					tree.put ("subtype", "epoch");
+					tree.put ("account", handler.node.ledger.epoch_signer.to_account ());
+				}
+			}
 			else
 			{
 				if (raw)
@@ -1804,528 +1866,415 @@ public:
 			}
 		}
 	}
-	rai::rpc_handler & handler;
+	badem::rpc_handler & handler;
 	bool raw;
-	rai::transaction & transaction;
+	badem::transaction & transaction;
 	boost::property_tree::ptree & tree;
-	rai::block_hash const & hash;
+	badem::block_hash const & hash;
 };
 }
 
-void rai::rpc_handler::account_history ()
+void badem::rpc_handler::account_history ()
 {
-	std::string account_text;
-	std::string count_text (request.get<std::string> ("count"));
+	badem::account account;
 	bool output_raw (request.get_optional<bool> ("raw") == true);
-	auto error (false);
-	rai::block_hash hash;
+	badem::block_hash hash;
 	auto head_str (request.get_optional<std::string> ("head"));
-	rai::transaction transaction (node.store.environment, nullptr, false);
+	auto transaction (node.store.tx_begin_read ());
 	if (head_str)
 	{
-		error = hash.decode_hex (*head_str);
-		if (!error)
+		if (!hash.decode_hex (*head_str))
 		{
-			account_text = node.ledger.account (transaction, hash).to_account ();
+			if (node.store.block_exists (transaction, hash))
+			{
+				account = node.ledger.account (transaction, hash);
+			}
+			else
+			{
+				ec = badem::error_blocks::not_found;
+			}
 		}
 		else
 		{
-			error_response (response, "Invalid block hash");
+			ec = badem::error_blocks::bad_hash_number;
 		}
 	}
 	else
 	{
-		account_text = request.get<std::string> ("account");
-		rai::uint256_union account;
-		error = account.decode_account (account_text);
-		if (!error)
+		account = account_impl ();
+		if (!ec)
 		{
 			hash = node.ledger.latest (transaction, account);
 		}
-		else
-		{
-			error_response (response, "Bad account number");
-		}
 	}
-	if (!error)
+	auto count (count_impl ());
+	auto offset (offset_optional_impl (0));
+	if (!ec)
 	{
-		uint64_t count;
-		if (!decode_unsigned (count_text, count))
+		boost::property_tree::ptree history;
+		response_l.put ("account", account.to_account ());
+		badem::block_sideband sideband;
+		auto block (node.store.block_get (transaction, hash, &sideband));
+		while (block != nullptr && count > 0)
 		{
-			uint64_t offset = 0;
-			auto offset_text (request.get_optional<std::string> ("offset"));
-			if (!offset_text || !decode_unsigned (*offset_text, offset))
+			if (offset > 0)
 			{
-				boost::property_tree::ptree response_l;
-				boost::property_tree::ptree history;
-				if (!error)
-				{
-					response_l.put ("account", account_text);
-					auto block (node.store.block_get (transaction, hash));
-					while (block != nullptr && count > 0)
-					{
-						if (offset > 0)
-						{
-							--offset;
-						}
-						else
-						{
-							boost::property_tree::ptree entry;
-							history_visitor visitor (*this, output_raw, transaction, entry, hash);
-							block->visit (visitor);
-							if (!entry.empty ())
-							{
-								entry.put ("hash", hash.to_string ());
-								if (output_raw)
-								{
-									entry.put ("work", rai::to_string_hex (block->block_work ()));
-									entry.put ("signature", block->block_signature ().to_string ());
-								}
-								history.push_back (std::make_pair ("", entry));
-							}
-							--count;
-						}
-						hash = block->previous ();
-						block = node.store.block_get (transaction, hash);
-					}
-					response_l.add_child ("history", history);
-					if (!hash.is_zero ())
-					{
-						response_l.put ("previous", hash.to_string ());
-					}
-					response (response_l);
-				}
-				else
-				{
-					error_response (response, "Failed to decode head block hash");
-				}
+				--offset;
 			}
 			else
 			{
-				error_response (response, "Invalid offset");
+				boost::property_tree::ptree entry;
+				history_visitor visitor (*this, output_raw, transaction, entry, hash);
+				block->visit (visitor);
+				if (!entry.empty ())
+				{
+					entry.put ("local_timestamp", std::to_string (sideband.timestamp));
+					entry.put ("hash", hash.to_string ());
+					if (output_raw)
+					{
+						entry.put ("work", badem::to_string_hex (block->block_work ()));
+						entry.put ("signature", block->block_signature ().to_string ());
+					}
+					history.push_back (std::make_pair ("", entry));
+					--count;
+				}
 			}
+			hash = block->previous ();
+			block = node.store.block_get (transaction, hash, &sideband);
 		}
-		else
+		response_l.add_child ("history", history);
+		if (!hash.is_zero ())
 		{
-			error_response (response, "Invalid count limit");
+			response_l.put ("previous", hash.to_string ());
 		}
 	}
+	response_errors ();
 }
 
-void rai::rpc_handler::keepalive ()
+void badem::rpc_handler::keepalive ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	if (!ec)
 	{
 		std::string address_text (request.get<std::string> ("address"));
 		std::string port_text (request.get<std::string> ("port"));
 		uint16_t port;
-		if (!rai::parse_port (port_text, port))
+		if (!badem::parse_port (port_text, port))
 		{
 			node.keepalive (address_text, port);
-			boost::property_tree::ptree response_l;
-			response (response_l);
+			response_l.put ("started", "1");
 		}
 		else
 		{
-			error_response (response, "Invalid port");
+			ec = badem::error_common::invalid_port;
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::key_create ()
+void badem::rpc_handler::key_create ()
 {
-	boost::property_tree::ptree response_l;
-	rai::keypair pair;
+	badem::keypair pair;
 	response_l.put ("private", pair.prv.data.to_string ());
 	response_l.put ("public", pair.pub.to_string ());
 	response_l.put ("account", pair.pub.to_account ());
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::key_expand ()
+void badem::rpc_handler::key_expand ()
 {
 	std::string key_text (request.get<std::string> ("key"));
-	rai::uint256_union prv;
-	auto error (prv.decode_hex (key_text));
-	if (!error)
+	badem::uint256_union prv;
+	if (!prv.decode_hex (key_text))
 	{
-		boost::property_tree::ptree response_l;
-		rai::uint256_union pub;
-		ed25519_publickey (prv.bytes.data (), pub.bytes.data ());
+		badem::uint256_union pub (badem::pub_key (prv));
 		response_l.put ("private", prv.to_string ());
 		response_l.put ("public", pub.to_string ());
 		response_l.put ("account", pub.to_account ());
-		response (response_l);
 	}
 	else
 	{
-		error_response (response, "Bad private key");
+		ec = badem::error_common::bad_private_key;
 	}
+	response_errors ();
 }
 
-void rai::rpc_handler::ledger ()
+void badem::rpc_handler::ledger ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto count (count_optional_impl ());
+	if (!ec)
 	{
-		rai::account start (0);
-		uint64_t count (std::numeric_limits<uint64_t>::max ());
+		badem::account start (0);
 		boost::optional<std::string> account_text (request.get_optional<std::string> ("account"));
 		if (account_text.is_initialized ())
 		{
-			auto error (start.decode_account (account_text.get ()));
-			if (error)
+			if (start.decode_account (account_text.get ()))
 			{
-				error_response (response, "Invalid starting account");
-			}
-		}
-		boost::optional<std::string> count_text (request.get_optional<std::string> ("count"));
-		if (count_text.is_initialized ())
-		{
-			auto error_count (decode_unsigned (count_text.get (), count));
-			if (error_count)
-			{
-				error_response (response, "Invalid count limit");
+				ec = badem::error_common::bad_account_number;
 			}
 		}
 		uint64_t modified_since (0);
 		boost::optional<std::string> modified_since_text (request.get_optional<std::string> ("modified_since"));
 		if (modified_since_text.is_initialized ())
 		{
-			modified_since = strtoul (modified_since_text.get ().c_str (), NULL, 10);
+			if (decode_unsigned (modified_since_text.get (), modified_since))
+			{
+				ec = badem::error_rpc::invalid_timestamp;
+			}
 		}
 		const bool sorting = request.get<bool> ("sorting", false);
 		const bool representative = request.get<bool> ("representative", false);
 		const bool weight = request.get<bool> ("weight", false);
 		const bool pending = request.get<bool> ("pending", false);
-		boost::property_tree::ptree response_a;
-		boost::property_tree::ptree response_l;
 		boost::property_tree::ptree accounts;
-		rai::transaction transaction (node.store.environment, nullptr, false);
-		if (!sorting) // Simple
+		auto transaction (node.store.tx_begin_read ());
+		if (!ec && !sorting) // Simple
 		{
 			for (auto i (node.store.latest_begin (transaction, start)), n (node.store.latest_end ()); i != n && accounts.size () < count; ++i)
 			{
-				rai::account_info info (i->second);
+				badem::account_info info (i->second);
 				if (info.modified >= modified_since)
 				{
-					rai::account account (i->first.uint256 ());
-					boost::property_tree::ptree response_l;
-					response_l.put ("frontier", info.head.to_string ());
-					response_l.put ("open_block", info.open_block.to_string ());
-					response_l.put ("representative_block", info.rep_block.to_string ());
+					badem::account account (i->first);
+					boost::property_tree::ptree response_a;
+					response_a.put ("frontier", info.head.to_string ());
+					response_a.put ("open_block", info.open_block.to_string ());
+					response_a.put ("representative_block", info.rep_block.to_string ());
 					std::string balance;
-					rai::uint128_union (info.balance).encode_dec (balance);
-					response_l.put ("balance", balance);
-					response_l.put ("modified_timestamp", std::to_string (info.modified));
-					response_l.put ("block_count", std::to_string (info.block_count));
+					badem::uint128_union (info.balance).encode_dec (balance);
+					response_a.put ("balance", balance);
+					response_a.put ("modified_timestamp", std::to_string (info.modified));
+					response_a.put ("block_count", std::to_string (info.block_count));
 					if (representative)
 					{
 						auto block (node.store.block_get (transaction, info.rep_block));
 						assert (block != nullptr);
-						response_l.put ("representative", block->representative ().to_account ());
+						response_a.put ("representative", block->representative ().to_account ());
 					}
 					if (weight)
 					{
 						auto account_weight (node.ledger.weight (transaction, account));
-						response_l.put ("weight", account_weight.convert_to<std::string> ());
+						response_a.put ("weight", account_weight.convert_to<std::string> ());
 					}
 					if (pending)
 					{
 						auto account_pending (node.ledger.account_pending (transaction, account));
-						response_l.put ("pending", account_pending.convert_to<std::string> ());
+						response_a.put ("pending", account_pending.convert_to<std::string> ());
 					}
-					accounts.push_back (std::make_pair (account.to_account (), response_l));
+					accounts.push_back (std::make_pair (account.to_account (), response_a));
 				}
 			}
 		}
-		else // Sorting
+		else if (!ec) // Sorting
 		{
-			std::vector<std::pair<rai::uint128_union, rai::account>> ledger_l;
+			std::vector<std::pair<badem::uint128_union, badem::account>> ledger_l;
 			for (auto i (node.store.latest_begin (transaction, start)), n (node.store.latest_end ()); i != n; ++i)
 			{
-				rai::account_info info (i->second);
-				rai::uint128_union balance (info.balance);
+				badem::account_info info (i->second);
+				badem::uint128_union balance (info.balance);
 				if (info.modified >= modified_since)
 				{
-					ledger_l.push_back (std::make_pair (balance, rai::account (i->first.uint256 ())));
+					ledger_l.push_back (std::make_pair (balance, badem::account (i->first)));
 				}
 			}
 			std::sort (ledger_l.begin (), ledger_l.end ());
 			std::reverse (ledger_l.begin (), ledger_l.end ());
-			rai::account_info info;
+			badem::account_info info;
 			for (auto i (ledger_l.begin ()), n (ledger_l.end ()); i != n && accounts.size () < count; ++i)
 			{
 				node.store.account_get (transaction, i->second, info);
-				rai::account account (i->second);
-				response_l.put ("frontier", info.head.to_string ());
-				response_l.put ("open_block", info.open_block.to_string ());
-				response_l.put ("representative_block", info.rep_block.to_string ());
+				badem::account account (i->second);
+				boost::property_tree::ptree response_a;
+				response_a.put ("frontier", info.head.to_string ());
+				response_a.put ("open_block", info.open_block.to_string ());
+				response_a.put ("representative_block", info.rep_block.to_string ());
 				std::string balance;
 				(i->first).encode_dec (balance);
-				response_l.put ("balance", balance);
-				response_l.put ("modified_timestamp", std::to_string (info.modified));
-				response_l.put ("block_count", std::to_string (info.block_count));
+				response_a.put ("balance", balance);
+				response_a.put ("modified_timestamp", std::to_string (info.modified));
+				response_a.put ("block_count", std::to_string (info.block_count));
 				if (representative)
 				{
 					auto block (node.store.block_get (transaction, info.rep_block));
 					assert (block != nullptr);
-					response_l.put ("representative", block->representative ().to_account ());
+					response_a.put ("representative", block->representative ().to_account ());
 				}
 				if (weight)
 				{
 					auto account_weight (node.ledger.weight (transaction, account));
-					response_l.put ("weight", account_weight.convert_to<std::string> ());
+					response_a.put ("weight", account_weight.convert_to<std::string> ());
 				}
 				if (pending)
 				{
 					auto account_pending (node.ledger.account_pending (transaction, account));
-					response_l.put ("pending", account_pending.convert_to<std::string> ());
+					response_a.put ("pending", account_pending.convert_to<std::string> ());
 				}
-				accounts.push_back (std::make_pair (account.to_account (), response_l));
+				accounts.push_back (std::make_pair (account.to_account (), response_a));
 			}
 		}
-		response_a.add_child ("accounts", accounts);
-		response (response_a);
+		response_l.add_child ("accounts", accounts);
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::bdm_from_raw ()
+void badem::rpc_handler::mbadem_from_raw (badem::uint128_t ratio)
 {
-	std::string amount_text (request.get<std::string> ("amount"));
-	rai::uint128_union amount;
-	if (!amount.decode_dec (amount_text))
+	auto amount (amount_impl ());
+	if (!ec)
 	{
-		auto result (amount.number () / rai::BDM_ratio);
-		boost::property_tree::ptree response_l;
+		auto result (amount.number () / ratio);
 		response_l.put ("amount", result.convert_to<std::string> ());
-		response (response_l);
 	}
-	else
-	{
-		error_response (response, "Bad amount number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::bdm_to_raw ()
+void badem::rpc_handler::mbadem_to_raw (badem::uint128_t ratio)
 {
-	std::string amount_text (request.get<std::string> ("amount"));
-	rai::uint128_union amount;
-	if (!amount.decode_dec (amount_text))
+	auto amount (amount_impl ());
+	if (!ec)
 	{
-		auto result (amount.number () * rai::BDM_ratio);
+		auto result (amount.number () * ratio);
 		if (result > amount.number ())
 		{
-			boost::property_tree::ptree response_l;
 			response_l.put ("amount", result.convert_to<std::string> ());
-			response (response_l);
 		}
 		else
 		{
-			error_response (response, "Amount too big");
+			ec = badem::error_common::invalid_amount_big;
 		}
 	}
-	else
-	{
-		error_response (response, "Bad amount number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::bademcik_from_raw ()
+/*
+ * @warning This is an internal/diagnostic RPC, do not rely on its interface being stable
+ */
+void badem::rpc_handler::node_id ()
 {
-	std::string amount_text (request.get<std::string> ("amount"));
-	rai::uint128_union amount;
-	if (!amount.decode_dec (amount_text))
+	rpc_control_impl ();
+	if (!ec)
 	{
-		auto result (amount.number () / rai::bademcik_ratio);
-		boost::property_tree::ptree response_l;
-		response_l.put ("amount", result.convert_to<std::string> ());
-		response (response_l);
+		response_l.put ("private", node.node_id.prv.data.to_string ());
+		response_l.put ("public", node.node_id.pub.to_string ());
+		response_l.put ("as_account", node.node_id.pub.to_account ());
 	}
-	else
-	{
-		error_response (response, "Bad amount number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::bademcik_to_raw ()
+/*
+ * @warning This is an internal/diagnostic RPC, do not rely on its interface being stable
+ */
+void badem::rpc_handler::node_id_delete ()
 {
-	std::string amount_text (request.get<std::string> ("amount"));
-	rai::uint128_union amount;
-	if (!amount.decode_dec (amount_text))
+	rpc_control_impl ();
+	if (!ec)
 	{
-		auto result (amount.number () * rai::bademcik_ratio);
-		if (result > amount.number ())
+		auto transaction (node.store.tx_begin_write ());
+		node.store.delete_node_id (transaction);
+		response_l.put ("deleted", "1");
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::password_change ()
+{
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	if (!ec)
+	{
+		auto transaction (node.wallets.tx_begin_write ());
+		std::string password_text (request.get<std::string> ("password"));
+		auto error (wallet->store.rekey (transaction, password_text));
+		response_l.put ("changed", error ? "0" : "1");
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::password_enter ()
+{
+	auto wallet (wallet_impl ());
+	if (!ec)
+	{
+		std::string password_text (request.get<std::string> ("password"));
+		auto transaction (wallet->wallets.tx_begin_write ());
+		auto error (wallet->enter_password (transaction, password_text));
+		response_l.put ("valid", error ? "0" : "1");
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::password_valid (bool wallet_locked)
+{
+	auto wallet (wallet_impl ());
+	if (!ec)
+	{
+		auto transaction (node.wallets.tx_begin_read ());
+		auto valid (wallet->store.valid_password (transaction));
+		if (!wallet_locked)
 		{
-			boost::property_tree::ptree response_l;
-			response_l.put ("amount", result.convert_to<std::string> ());
-			response (response_l);
+			response_l.put ("valid", valid ? "1" : "0");
 		}
 		else
 		{
-			error_response (response, "Amount too big");
+			response_l.put ("locked", valid ? "0" : "1");
 		}
 	}
-	else
-	{
-		error_response (response, "Bad amount number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::password_change ()
+void badem::rpc_handler::peers ()
 {
-	if (rpc.config.enable_control)
-	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
-		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
-			{
-				rai::transaction transaction (node.store.environment, nullptr, true);
-				boost::property_tree::ptree response_l;
-				std::string password_text (request.get<std::string> ("password"));
-				auto error (existing->second->store.rekey (transaction, password_text));
-				response_l.put ("changed", error ? "0" : "1");
-				response (response_l);
-			}
-			else
-			{
-				error_response (response, "Wallet not found");
-			}
-		}
-		else
-		{
-			error_response (response, "Bad wallet number");
-		}
-	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
-}
-
-void rai::rpc_handler::password_enter ()
-{
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union wallet;
-	auto error (wallet.decode_hex (wallet_text));
-	if (!error)
-	{
-		auto existing (node.wallets.items.find (wallet));
-		if (existing != node.wallets.items.end ())
-		{
-			boost::property_tree::ptree response_l;
-			std::string password_text (request.get<std::string> ("password"));
-			auto error (existing->second->enter_password (password_text));
-			response_l.put ("valid", error ? "0" : "1");
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Wallet not found");
-		}
-	}
-	else
-	{
-		error_response (response, "Bad wallet number");
-	}
-}
-
-void rai::rpc_handler::password_valid (bool wallet_locked = false)
-{
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union wallet;
-	auto error (wallet.decode_hex (wallet_text));
-	if (!error)
-	{
-		auto existing (node.wallets.items.find (wallet));
-		if (existing != node.wallets.items.end ())
-		{
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			boost::property_tree::ptree response_l;
-			auto valid (existing->second->store.valid_password (transaction));
-			if (!wallet_locked)
-			{
-				response_l.put ("valid", valid ? "1" : "0");
-			}
-			else
-			{
-				response_l.put ("locked", valid ? "0" : "1");
-			}
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Wallet not found");
-		}
-	}
-	else
-	{
-		error_response (response, "Bad wallet number");
-	}
-}
-
-void rai::rpc_handler::peers ()
-{
-	boost::property_tree::ptree response_l;
 	boost::property_tree::ptree peers_l;
-	auto peers_list (node.peers.list_version ());
+	const bool peer_details = request.get<bool> ("peer_details", false);
+	auto peers_list (node.peers.list_vector (std::numeric_limits<size_t>::max ()));
+	std::sort (peers_list.begin (), peers_list.end ());
 	for (auto i (peers_list.begin ()), n (peers_list.end ()); i != n; ++i)
 	{
 		std::stringstream text;
-		text << i->first;
-		peers_l.push_back (boost::property_tree::ptree::value_type (text.str (), boost::property_tree::ptree (std::to_string (i->second))));
+		text << i->endpoint;
+		if (peer_details)
+		{
+			boost::property_tree::ptree pending_tree;
+			pending_tree.put ("protocol_version", std::to_string (i->network_version));
+			if (i->node_id.is_initialized ())
+			{
+				pending_tree.put ("node_id", i->node_id.get ().to_account ());
+			}
+			else
+			{
+				pending_tree.put ("node_id", "");
+			}
+			peers_l.push_back (boost::property_tree::ptree::value_type (text.str (), pending_tree));
+		}
+		else
+		{
+			peers_l.push_back (boost::property_tree::ptree::value_type (text.str (), boost::property_tree::ptree (std::to_string (i->network_version))));
+		}
 	}
 	response_l.add_child ("peers", peers_l);
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::pending ()
+void badem::rpc_handler::pending ()
 {
-	std::string account_text (request.get<std::string> ("account"));
-	rai::account account;
-	if (!account.decode_account (account_text))
+	auto account (account_impl ());
+	auto count (count_optional_impl ());
+	auto threshold (threshold_optional_impl ());
+	const bool source = request.get<bool> ("source", false);
+	const bool min_version = request.get<bool> ("min_version", false);
+	const bool include_active = request.get<bool> ("include_active", false);
+	if (!ec)
 	{
-		uint64_t count (std::numeric_limits<uint64_t>::max ());
-		rai::uint128_union threshold (0);
-		boost::optional<std::string> count_text (request.get_optional<std::string> ("count"));
-		if (count_text.is_initialized ())
-		{
-			auto error (decode_unsigned (count_text.get (), count));
-			if (error)
-			{
-				error_response (response, "Invalid count limit");
-			}
-		}
-		boost::optional<std::string> threshold_text (request.get_optional<std::string> ("threshold"));
-		if (threshold_text.is_initialized ())
-		{
-			auto error_threshold (threshold.decode_dec (threshold_text.get ()));
-			if (error_threshold)
-			{
-				error_response (response, "Bad threshold number");
-			}
-		}
-		const bool source = request.get<bool> ("source", false);
-		boost::property_tree::ptree response_l;
 		boost::property_tree::ptree peers_l;
+		auto transaction (node.store.tx_begin_read ());
+		for (auto i (node.store.pending_begin (transaction, badem::pending_key (account, 0))); badem::pending_key (i->first).account == account && peers_l.size () < count; ++i)
 		{
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			rai::account end (account.number () + 1);
-			for (auto i (node.store.pending_begin (transaction, rai::pending_key (account, 0))), n (node.store.pending_begin (transaction, rai::pending_key (end, 0))); i != n && peers_l.size () < count; ++i)
+			badem::pending_key key (i->first);
+			std::shared_ptr<badem::block> block (include_active ? nullptr : node.store.block_get (transaction, key.hash));
+			if (include_active || (block && !node.active.active (*block)))
 			{
-				rai::pending_key key (i->first);
-				if (threshold.is_zero () && !source)
+				if (threshold.is_zero () && !source && !min_version)
 				{
 					boost::property_tree::ptree entry;
 					entry.put ("", key.hash.to_string ());
@@ -2333,14 +2282,21 @@ void rai::rpc_handler::pending ()
 				}
 				else
 				{
-					rai::pending_info info (i->second);
+					badem::pending_info info (i->second);
 					if (info.amount.number () >= threshold.number ())
 					{
-						if (source)
+						if (source || min_version)
 						{
 							boost::property_tree::ptree pending_tree;
 							pending_tree.put ("amount", info.amount.number ().convert_to<std::string> ());
-							pending_tree.put ("source", info.source.to_account ());
+							if (source)
+							{
+								pending_tree.put ("source", info.source.to_account ());
+							}
+							if (min_version)
+							{
+								pending_tree.put ("min_version", info.epoch == badem::epoch::epoch_1 ? "1" : "0");
+							}
 							peers_l.add_child (key.hash.to_string (), pending_tree);
 						}
 						else
@@ -2352,22 +2308,17 @@ void rai::rpc_handler::pending ()
 			}
 		}
 		response_l.add_child ("blocks", peers_l);
-		response (response_l);
 	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::pending_exists ()
+void badem::rpc_handler::pending_exists ()
 {
-	std::string hash_text (request.get<std::string> ("hash"));
-	rai::uint256_union hash;
-	auto error (hash.decode_hex (hash_text));
-	if (!error)
+	auto hash (hash_impl ());
+	const bool include_active = request.get<bool> ("include_active", false);
+	if (!ec)
 	{
-		rai::transaction transaction (node.store.environment, nullptr, false);
+		auto transaction (node.store.tx_begin_read ());
 		auto block (node.store.block_get (transaction, hash));
 		if (block != nullptr)
 		{
@@ -2375,37 +2326,33 @@ void rai::rpc_handler::pending_exists ()
 			auto destination (node.ledger.block_destination (transaction, *block));
 			if (!destination.is_zero ())
 			{
-				exists = node.store.pending_exists (transaction, rai::pending_key (destination, hash));
+				exists = node.store.pending_exists (transaction, badem::pending_key (destination, hash));
 			}
-			boost::property_tree::ptree response_l;
+			exists = exists && (include_active || !node.active.active (*block));
 			response_l.put ("exists", exists ? "1" : "0");
-			response (response_l);
 		}
 		else
 		{
-			error_response (response, "Block not found");
+			ec = badem::error_blocks::not_found;
 		}
 	}
-	else
-	{
-		error_response (response, "Bad hash number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::payment_begin ()
+void badem::rpc_handler::payment_begin ()
 {
 	std::string id_text (request.get<std::string> ("wallet"));
-	rai::uint256_union id;
+	badem::uint256_union id;
 	if (!id.decode_hex (id_text))
 	{
 		auto existing (node.wallets.items.find (id));
 		if (existing != node.wallets.items.end ())
 		{
-			rai::transaction transaction (node.store.environment, nullptr, true);
-			std::shared_ptr<rai::wallet> wallet (existing->second);
+			auto transaction (node.wallets.tx_begin_write ());
+			std::shared_ptr<badem::wallet> wallet (existing->second);
 			if (wallet->store.valid_password (transaction))
 			{
-				rai::account account (0);
+				badem::account account (0);
 				do
 				{
 					auto existing (wallet->free_accounts.begin ());
@@ -2420,7 +2367,8 @@ void rai::rpc_handler::payment_begin ()
 						}
 						else
 						{
-							if (!node.ledger.account_balance (transaction, account).is_zero ())
+							auto block_transaction (node.store.tx_begin_read ());
+							if (!node.ledger.account_balance (block_transaction, account).is_zero ())
 							{
 								BOOST_LOG (node.log) << boost::str (boost::format ("Skipping account %1% for use as a transaction account: non-zero balance") % account.to_account ());
 								account.clear ();
@@ -2435,561 +2383,501 @@ void rai::rpc_handler::payment_begin ()
 				} while (account.is_zero ());
 				if (!account.is_zero ())
 				{
-					boost::property_tree::ptree response_l;
 					response_l.put ("account", account.to_account ());
-					response (response_l);
 				}
 				else
 				{
-					error_response (response, "Unable to create transaction account");
+					ec = badem::error_rpc::payment_unable_create_account;
 				}
 			}
 			else
 			{
-				error_response (response, "Wallet locked");
+				ec = badem::error_common::wallet_locked;
 			}
 		}
 		else
 		{
-			error_response (response, "Unable to find wallets");
+			ec = badem::error_common::wallet_not_found;
 		}
 	}
 	else
 	{
-		error_response (response, "Bad wallet number");
+		ec = badem::error_common::bad_wallet_number;
 	}
+	response_errors ();
 }
 
-void rai::rpc_handler::payment_init ()
+void badem::rpc_handler::payment_init ()
 {
-	std::string id_text (request.get<std::string> ("wallet"));
-	rai::uint256_union id;
-	if (!id.decode_hex (id_text))
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		rai::transaction transaction (node.store.environment, nullptr, true);
-		auto existing (node.wallets.items.find (id));
-		if (existing != node.wallets.items.end ())
+		auto transaction (node.wallets.tx_begin_write ());
+		if (wallet->store.valid_password (transaction))
 		{
-			auto wallet (existing->second);
-			if (wallet->store.valid_password (transaction))
+			wallet->init_free_accounts (transaction);
+			response_l.put ("status", "Ready");
+		}
+		else
+		{
+			ec = badem::error_common::wallet_locked;
+		}
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::payment_end ()
+{
+	auto account (account_impl ());
+	auto wallet (wallet_impl ());
+	if (!ec)
+	{
+		auto transaction (node.wallets.tx_begin_read ());
+		auto block_transaction (node.store.tx_begin_read ());
+		wallet_account_impl (transaction, wallet, account);
+		if (!ec)
+		{
+			if (node.ledger.account_balance (block_transaction, account).is_zero ())
 			{
-				wallet->init_free_accounts (transaction);
-				boost::property_tree::ptree response_l;
-				response_l.put ("status", "Ready");
-				response (response_l);
+				wallet->free_accounts.insert (account);
+				response_l.put ("ended", "1");
 			}
 			else
 			{
-				boost::property_tree::ptree response_l;
-				response_l.put ("status", "Transaction wallet locked");
-				response (response_l);
+				ec = badem::error_rpc::payment_account_balance;
 			}
 		}
-		else
-		{
-			boost::property_tree::ptree response_l;
-			response_l.put ("status", "Unable to find transaction wallet");
-			response (response_l);
-		}
 	}
-	else
-	{
-		error_response (response, "Bad transaction wallet number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::payment_end ()
+void badem::rpc_handler::payment_wait ()
 {
-	std::string id_text (request.get<std::string> ("wallet"));
-	std::string account_text (request.get<std::string> ("account"));
-	rai::uint256_union id;
-	if (!id.decode_hex (id_text))
-	{
-		rai::transaction transaction (node.store.environment, nullptr, false);
-		auto existing (node.wallets.items.find (id));
-		if (existing != node.wallets.items.end ())
-		{
-			auto wallet (existing->second);
-			rai::account account;
-			if (!account.decode_account (account_text))
-			{
-				auto existing (wallet->store.find (transaction, account));
-				if (existing != wallet->store.end ())
-				{
-					if (node.ledger.account_balance (transaction, account).is_zero ())
-					{
-						wallet->free_accounts.insert (account);
-						boost::property_tree::ptree response_l;
-						response (response_l);
-					}
-					else
-					{
-						error_response (response, "Account has non-zero balance");
-					}
-				}
-				else
-				{
-					error_response (response, "Account not in wallet");
-				}
-			}
-			else
-			{
-				error_response (response, "Invalid account number");
-			}
-		}
-		else
-		{
-			error_response (response, "Unable to find wallet");
-		}
-	}
-	else
-	{
-		error_response (response, "Bad wallet number");
-	}
-}
-
-void rai::rpc_handler::payment_wait ()
-{
-	std::string account_text (request.get<std::string> ("account"));
-	std::string amount_text (request.get<std::string> ("amount"));
 	std::string timeout_text (request.get<std::string> ("timeout"));
-	rai::uint256_union account;
-	if (!account.decode_account (account_text))
+	auto account (account_impl ());
+	auto amount (amount_impl ());
+	if (!ec)
 	{
-		rai::uint128_union amount;
-		if (!amount.decode_dec (amount_text))
+		uint64_t timeout;
+		if (!decode_unsigned (timeout_text, timeout))
 		{
-			uint64_t timeout;
-			if (!decode_unsigned (timeout_text, timeout))
 			{
-				{
-					auto observer (std::make_shared<rai::payment_observer> (response, rpc, account, amount));
-					observer->start (timeout);
-					std::lock_guard<std::mutex> lock (rpc.mutex);
-					assert (rpc.payment_observers.find (account) == rpc.payment_observers.end ());
-					rpc.payment_observers[account] = observer;
-				}
-				rpc.observer_action (account);
+				auto observer (std::make_shared<badem::payment_observer> (response, rpc, account, amount));
+				observer->start (timeout);
+				std::lock_guard<std::mutex> lock (rpc.mutex);
+				assert (rpc.payment_observers.find (account) == rpc.payment_observers.end ());
+				rpc.payment_observers[account] = observer;
 			}
-			else
-			{
-				error_response (response, "Bad timeout number");
-			}
+			rpc.observer_action (account);
 		}
 		else
 		{
-			error_response (response, "Bad amount number");
+			ec = badem::error_rpc::bad_timeout;
 		}
 	}
-	else
+	if (ec)
 	{
-		error_response (response, "Bad account number");
+		response_errors ();
 	}
 }
 
-void rai::rpc_handler::process ()
+void badem::rpc_handler::process ()
 {
-	std::string block_text (request.get<std::string> ("block"));
-	boost::property_tree::ptree block_l;
-	std::stringstream block_stream (block_text);
-	boost::property_tree::read_json (block_stream, block_l);
-	std::shared_ptr<rai::block> block (rai::deserialize_block_json (block_l));
-	if (block != nullptr)
+	auto block (block_impl (true));
+	// State blocks subtype check
+	if (!ec && block->type () == badem::block_type::state)
 	{
-		if (!rai::work_validate (*block))
+		std::string subtype_text (request.get<std::string> ("subtype", ""));
+		if (!subtype_text.empty ())
+		{
+			std::shared_ptr<badem::state_block> block_state (std::static_pointer_cast<badem::state_block> (block));
+			auto transaction (node.store.tx_begin_read ());
+			if (!block_state->hashables.previous.is_zero () && !node.store.block_exists (transaction, block_state->hashables.previous))
+			{
+				ec = badem::error_process::gap_previous;
+			}
+			else
+			{
+				auto balance (node.ledger.account_balance (transaction, block_state->hashables.account));
+				if (subtype_text == "send")
+				{
+					if (balance <= block_state->hashables.balance.number ())
+					{
+						ec = badem::error_rpc::invalid_subtype_balance;
+					}
+					// Send with previous == 0 fails balance check. No previous != 0 check required
+				}
+				else if (subtype_text == "receive")
+				{
+					if (balance > block_state->hashables.balance.number ())
+					{
+						ec = badem::error_rpc::invalid_subtype_balance;
+					}
+					// Receive can be point to open block. No previous != 0 check required
+				}
+				else if (subtype_text == "open")
+				{
+					if (!block_state->hashables.previous.is_zero ())
+					{
+						ec = badem::error_rpc::invalid_subtype_previous;
+					}
+				}
+				else if (subtype_text == "change")
+				{
+					if (balance != block_state->hashables.balance.number ())
+					{
+						ec = badem::error_rpc::invalid_subtype_balance;
+					}
+					else if (block_state->hashables.previous.is_zero ())
+					{
+						ec = badem::error_rpc::invalid_subtype_previous;
+					}
+				}
+				else if (subtype_text == "epoch")
+				{
+					if (balance != block_state->hashables.balance.number ())
+					{
+						ec = badem::error_rpc::invalid_subtype_balance;
+					}
+					else if (!node.ledger.is_epoch_link (block_state->hashables.link))
+					{
+						ec = ec = badem::error_rpc::invalid_subtype_epoch_link;
+					}
+				}
+				else
+				{
+					ec = badem::error_rpc::invalid_subtype;
+				}
+			}
+		}
+	}
+	if (!ec)
+	{
+		if (!badem::work_validate (*block))
 		{
 			auto hash (block->hash ());
 			node.block_arrival.add (hash);
-			rai::process_return result;
+			badem::process_return result;
 			{
-				rai::transaction transaction (node.store.environment, nullptr, true);
-				result = node.block_processor.process_receive_one (transaction, block);
+				auto transaction (node.store.tx_begin_write ());
+				// Set current time to trigger automatic rebroadcast and election
+				badem::unchecked_info info (block, block->account (), badem::seconds_since_epoch (), badem::signature_verification::unknown);
+				result = node.block_processor.process_one (transaction, info);
 			}
 			switch (result.code)
 			{
-				case rai::process_result::progress:
+				case badem::process_result::progress:
 				{
-					boost::property_tree::ptree response_l;
 					response_l.put ("hash", hash.to_string ());
-					response (response_l);
 					break;
 				}
-				case rai::process_result::gap_previous:
+				case badem::process_result::gap_previous:
 				{
-					error_response (response, "Gap previous block");
+					ec = badem::error_process::gap_previous;
 					break;
 				}
-				case rai::process_result::gap_source:
+				case badem::process_result::gap_source:
 				{
-					error_response (response, "Gap source block");
+					ec = badem::error_process::gap_source;
 					break;
 				}
-				case rai::process_result::old:
+				case badem::process_result::old:
 				{
-					error_response (response, "Old block");
+					ec = badem::error_process::old;
 					break;
 				}
-				case rai::process_result::bad_signature:
+				case badem::process_result::bad_signature:
 				{
-					error_response (response, "Bad signature");
+					ec = badem::error_process::bad_signature;
 					break;
 				}
-				case rai::process_result::negative_spend:
+				case badem::process_result::negative_spend:
 				{
 					// TODO once we get RPC versioning, this should be changed to "negative spend"
-					error_response (response, "Overspend");
+					ec = badem::error_process::negative_spend;
 					break;
 				}
-				case rai::process_result::unreceivable:
+				case badem::process_result::balance_mismatch:
 				{
-					error_response (response, "Unreceivable");
+					ec = badem::error_process::balance_mismatch;
 					break;
 				}
-				case rai::process_result::fork:
+				case badem::process_result::unreceivable:
+				{
+					ec = badem::error_process::unreceivable;
+					break;
+				}
+				case badem::process_result::block_position:
+				{
+					ec = badem::error_process::block_position;
+					break;
+				}
+				case badem::process_result::fork:
 				{
 					const bool force = request.get<bool> ("force", false);
 					if (force && rpc.config.enable_control)
 					{
 						node.active.erase (*block);
 						node.block_processor.force (block);
-						boost::property_tree::ptree response_l;
 						response_l.put ("hash", hash.to_string ());
-						response (response_l);
 					}
 					else
 					{
-						error_response (response, "Fork");
+						ec = badem::error_process::fork;
 					}
 					break;
 				}
 				default:
 				{
-					error_response (response, "Error processing block");
+					ec = badem::error_process::other;
 					break;
 				}
 			}
 		}
 		else
 		{
-			error_response (response, "Block work is invalid");
+			ec = badem::error_blocks::work_low;
 		}
 	}
-	else
-	{
-		error_response (response, "Block is invalid");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::raw_from_raw ()
+void badem::rpc_handler::receive ()
 {
-	std::string amount_text (request.get<std::string> ("amount"));
-	rai::uint128_union amount;
-	if (!amount.decode_dec (amount_text))
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	auto account (account_impl ());
+	auto hash (hash_impl ("block"));
+	if (!ec)
 	{
-		auto result (amount.number () / rai::RAW_ratio);
-		boost::property_tree::ptree response_l;
-		response_l.put ("amount", result.convert_to<std::string> ());
-		response (response_l);
-	}
-	else
-	{
-		error_response (response, "Bad amount number");
-	}
-}
-
-void rai::rpc_handler::raw_to_raw ()
-{
-	std::string amount_text (request.get<std::string> ("amount"));
-	rai::uint128_union amount;
-	if (!amount.decode_dec (amount_text))
-	{
-		auto result (amount.number () * rai::RAW_ratio);
-		if (result > amount.number ())
+		auto transaction (node.wallets.tx_begin_read ());
+		wallet_locked_impl (transaction, wallet);
+		wallet_account_impl (transaction, wallet, account);
+		if (!ec)
 		{
-			boost::property_tree::ptree response_l;
-			response_l.put ("amount", result.convert_to<std::string> ());
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Amount too big");
-		}
-	}
-	else
-	{
-		error_response (response, "Bad amount number");
-	}
-}
-
-void rai::rpc_handler::receive ()
-{
-	if (rpc.config.enable_control)
-	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
-		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
+			auto block_transaction (node.store.tx_begin_read ());
+			auto block (node.store.block_get (block_transaction, hash));
+			if (block != nullptr)
 			{
-				std::string account_text (request.get<std::string> ("account"));
-				rai::account account;
-				auto error (account.decode_account (account_text));
-				if (!error)
+				if (node.store.pending_exists (block_transaction, badem::pending_key (account, hash)))
 				{
-					rai::transaction transaction (node.store.environment, nullptr, false);
-					auto account_check (existing->second->store.find (transaction, account));
-					if (account_check != existing->second->store.end ())
+					auto work (work_optional_impl ());
+					if (!ec && work)
 					{
-						std::string hash_text (request.get<std::string> ("block"));
-						rai::uint256_union hash;
-						auto error (hash.decode_hex (hash_text));
-						if (!error)
+						badem::account_info info;
+						badem::uint256_union head;
+						if (!node.store.account_get (block_transaction, account, info))
 						{
-							auto block (node.store.block_get (transaction, hash));
-							if (block != nullptr)
-							{
-								if (node.store.pending_exists (transaction, rai::pending_key (account, hash)))
-								{
-									uint64_t work (0);
-									boost::optional<std::string> work_text (request.get_optional<std::string> ("work"));
-									auto error (false);
-									if (work_text.is_initialized ())
-									{
-										error = rai::from_string_hex (work_text.get (), work);
-										if (error)
-										{
-											error_response (response, "Bad work");
-										}
-									}
-									if (work)
-									{
-										rai::account_info info;
-										rai::uint256_union head;
-										if (!node.store.account_get (transaction, account, info))
-										{
-											head = info.head;
-										}
-										else
-										{
-											head = account;
-										}
-										if (!rai::work_validate (head, work))
-										{
-											rai::transaction transaction_a (node.store.environment, nullptr, true);
-											existing->second->store.work_put (transaction_a, account, work);
-										}
-										else
-										{
-											error = true;
-											error_response (response, "Invalid work");
-										}
-									}
-									if (!error)
-									{
-										auto response_a (response);
-										existing->second->receive_async (std::move (block), account, rai::genesis_amount, [response_a](std::shared_ptr<rai::block> block_a) {
-											rai::uint256_union hash_a (0);
-											if (block_a != nullptr)
-											{
-												hash_a = block_a->hash ();
-											}
-											boost::property_tree::ptree response_l;
-											response_l.put ("block", hash_a.to_string ());
-											response_a (response_l);
-										},
-										work == 0);
-									}
-								}
-								else
-								{
-									error_response (response, "Block is not available to receive");
-								}
-							}
-							else
-							{
-								error_response (response, "Block not found");
-							}
+							head = info.head;
 						}
 						else
 						{
-							error_response (response, "Bad block number");
+							head = account;
+						}
+						if (badem::work_validate (head, work))
+						{
+							ec = badem::error_common::invalid_work;
 						}
 					}
-					else
+					if (!ec)
 					{
-						error_response (response, "Account not found in wallet");
+						bool generate_work (work == 0); // Disable work generation if "work" option is provided
+						auto response_a (response);
+						// clang-format off
+						wallet->receive_async (std::move (block), account, badem::genesis_amount, [response_a](std::shared_ptr<badem::block> block_a) {
+							badem::uint256_union hash_a (0);
+							if (block_a != nullptr)
+							{
+								hash_a = block_a->hash ();
+							}
+							boost::property_tree::ptree response_l;
+							response_l.put ("block", hash_a.to_string ());
+							response_a (response_l);
+						},
+						work, generate_work);
+						// clang-format on
 					}
 				}
 				else
 				{
-					error_response (response, "Bad account number");
+					ec = badem::error_process::unreceivable;
 				}
 			}
 			else
 			{
-				error_response (response, "Wallet not found");
+				ec = badem::error_blocks::not_found;
 			}
 		}
-		else
-		{
-			error_response (response, "Bad wallet number");
-		}
 	}
-	else
+	// Because of receive_async
+	if (ec)
 	{
-		error_response (response, "RPC control is disabled");
+		response_errors ();
 	}
 }
 
-void rai::rpc_handler::receive_minimum ()
+void badem::rpc_handler::receive_minimum ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	if (!ec)
 	{
-		boost::property_tree::ptree response_l;
 		response_l.put ("amount", node.config.receive_minimum.to_string_dec ());
-		response (response_l);
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::receive_minimum_set ()
+void badem::rpc_handler::receive_minimum_set ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto amount (amount_impl ());
+	if (!ec)
 	{
-		std::string amount_text (request.get<std::string> ("amount"));
-		rai::uint128_union amount;
-		if (!amount.decode_dec (amount_text))
-		{
-			node.config.receive_minimum = amount;
-			boost::property_tree::ptree response_l;
-			response_l.put ("success", "");
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Bad amount number");
-		}
+		node.config.receive_minimum = amount;
+		response_l.put ("success", "");
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::representatives ()
+void badem::rpc_handler::representatives ()
 {
-	uint64_t count (std::numeric_limits<uint64_t>::max ());
-	boost::optional<std::string> count_text (request.get_optional<std::string> ("count"));
-	if (count_text.is_initialized ())
+	auto count (count_optional_impl ());
+	if (!ec)
 	{
-		auto error (decode_unsigned (count_text.get (), count));
-		if (error)
+		const bool sorting = request.get<bool> ("sorting", false);
+		boost::property_tree::ptree representatives;
+		auto transaction (node.store.tx_begin_read ());
+		if (!sorting) // Simple
 		{
-			error_response (response, "Invalid count limit");
+			for (auto i (node.store.representation_begin (transaction)), n (node.store.representation_end ()); i != n && representatives.size () < count; ++i)
+			{
+				badem::account account (i->first);
+				auto amount (node.store.representation_get (transaction, account));
+				representatives.put (account.to_account (), amount.convert_to<std::string> ());
+			}
 		}
+		else // Sorting
+		{
+			std::vector<std::pair<badem::uint128_union, std::string>> representation;
+			for (auto i (node.store.representation_begin (transaction)), n (node.store.representation_end ()); i != n; ++i)
+			{
+				badem::account account (i->first);
+				auto amount (node.store.representation_get (transaction, account));
+				representation.push_back (std::make_pair (amount, account.to_account ()));
+			}
+			std::sort (representation.begin (), representation.end ());
+			std::reverse (representation.begin (), representation.end ());
+			for (auto i (representation.begin ()), n (representation.end ()); i != n && representatives.size () < count; ++i)
+			{
+				representatives.put (i->second, (i->first).number ().convert_to<std::string> ());
+			}
+		}
+		response_l.add_child ("representatives", representatives);
 	}
-	const bool sorting = request.get<bool> ("sorting", false);
-	boost::property_tree::ptree response_l;
-	boost::property_tree::ptree representatives;
-	rai::transaction transaction (node.store.environment, nullptr, false);
-	if (!sorting) // Simple
-	{
-		for (auto i (node.store.representation_begin (transaction)), n (node.store.representation_end ()); i != n && representatives.size () < count; ++i)
-		{
-			rai::account account (i->first.uint256 ());
-			auto amount (node.store.representation_get (transaction, account));
-			representatives.put (account.to_account (), amount.convert_to<std::string> ());
-		}
-	}
-	else // Sorting
-	{
-		std::vector<std::pair<rai::uint128_union, std::string>> representation;
-		for (auto i (node.store.representation_begin (transaction)), n (node.store.representation_end ()); i != n; ++i)
-		{
-			rai::account account (i->first.uint256 ());
-			auto amount (node.store.representation_get (transaction, account));
-			representation.push_back (std::make_pair (amount, account.to_account ()));
-		}
-		std::sort (representation.begin (), representation.end ());
-		std::reverse (representation.begin (), representation.end ());
-		for (auto i (representation.begin ()), n (representation.end ()); i != n && representatives.size () < count; ++i)
-		{
-			representatives.put (i->second, (i->first).number ().convert_to<std::string> ());
-		}
-	}
-	response_l.add_child ("representatives", representatives);
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::representatives_online ()
+void badem::rpc_handler::representatives_online ()
 {
-	boost::property_tree::ptree response_l;
-	boost::property_tree::ptree representatives;
-	auto reps (node.online_reps.list ());
-	for (auto & i : reps)
+	const auto accounts_node = request.get_child_optional ("accounts");
+	const bool weight = request.get<bool> ("weight", false);
+	std::vector<badem::public_key> accounts_to_filter;
+	if (accounts_node.is_initialized ())
 	{
-		representatives.put (i.to_account (), "");
+		for (auto & a : (*accounts_node))
+		{
+			badem::public_key account;
+			auto error (account.decode_account (a.second.get<std::string> ("")));
+			if (!error)
+			{
+				accounts_to_filter.push_back (account);
+			}
+			else
+			{
+				ec = badem::error_common::bad_account_number;
+				break;
+			}
+		}
 	}
-	response_l.add_child ("representatives", representatives);
-	response (response_l);
+	if (!ec)
+	{
+		boost::property_tree::ptree representatives;
+		auto transaction (node.store.tx_begin_read ());
+		auto reps (node.online_reps.list ());
+		for (auto & i : reps)
+		{
+			if (accounts_node.is_initialized ())
+			{
+				if (accounts_to_filter.empty ())
+				{
+					break;
+				}
+				auto found_acc = std::find (accounts_to_filter.begin (), accounts_to_filter.end (), i);
+				if (found_acc == accounts_to_filter.end ())
+				{
+					continue;
+				}
+				else
+				{
+					accounts_to_filter.erase (found_acc);
+				}
+			}
+			if (weight)
+			{
+				boost::property_tree::ptree weight_node;
+				auto account_weight (node.ledger.weight (transaction, i));
+				weight_node.put ("weight", account_weight.convert_to<std::string> ());
+				representatives.add_child (i.to_account (), weight_node);
+			}
+			else
+			{
+				boost::property_tree::ptree entry;
+				entry.put ("", i.to_account ());
+				representatives.push_back (std::make_pair ("", entry));
+			}
+		}
+		response_l.add_child ("representatives", representatives);
+	}
+	response_errors ();
 }
 
-void rai::rpc_handler::republish ()
+void badem::rpc_handler::republish ()
 {
-	uint64_t count (1024U);
+	auto count (count_optional_impl (1024U));
 	uint64_t sources (0);
 	uint64_t destinations (0);
-	boost::optional<std::string> count_text (request.get_optional<std::string> ("count"));
-	if (count_text.is_initialized ())
-	{
-		auto error (decode_unsigned (count_text.get (), count));
-		if (error)
-		{
-			error_response (response, "Invalid count limit");
-		}
-	}
 	boost::optional<std::string> sources_text (request.get_optional<std::string> ("sources"));
-	if (sources_text.is_initialized ())
+	if (!ec && sources_text.is_initialized ())
 	{
-		auto sources_error (decode_unsigned (sources_text.get (), sources));
-		if (sources_error)
+		if (decode_unsigned (sources_text.get (), sources))
 		{
-			error_response (response, "Invalid sources number");
+			ec = badem::error_rpc::invalid_sources;
 		}
 	}
 	boost::optional<std::string> destinations_text (request.get_optional<std::string> ("destinations"));
-	if (destinations_text.is_initialized ())
+	if (!ec && destinations_text.is_initialized ())
 	{
-		auto destinations_error (decode_unsigned (destinations_text.get (), destinations));
-		if (destinations_error)
+		if (decode_unsigned (destinations_text.get (), destinations))
 		{
-			error_response (response, "Invalid destinations number");
+			ec = badem::error_rpc::invalid_destinations;
 		}
 	}
-	std::string hash_text (request.get<std::string> ("hash"));
-	rai::uint256_union hash;
-	auto error (hash.decode_hex (hash_text));
-	if (!error)
+	auto hash (hash_impl ());
+	if (!ec)
 	{
-		boost::property_tree::ptree response_l;
 		boost::property_tree::ptree blocks;
-		rai::transaction transaction (node.store.environment, nullptr, false);
+		auto transaction (node.store.tx_begin_read ());
 		auto block (node.store.block_get (transaction, hash));
 		if (block != nullptr)
 		{
+			std::deque<std::shared_ptr<badem::block>> republish_bundle;
 			for (auto i (0); !hash.is_zero () && i < count; ++i)
 			{
 				block = node.store.block_get (transaction, hash);
 				if (sources != 0) // Republish source chain
 				{
-					rai::block_hash source (node.ledger.block_source (transaction, *block));
-					std::unique_ptr<rai::block> block_a (node.store.block_get (transaction, source));
-					std::vector<rai::block_hash> hashes;
+					badem::block_hash source (node.ledger.block_source (transaction, *block));
+					auto block_a (node.store.block_get (transaction, source));
+					std::vector<badem::block_hash> hashes;
 					while (block_a != nullptr && hashes.size () < sources)
 					{
 						hashes.push_back (source);
@@ -3000,13 +2888,13 @@ void rai::rpc_handler::republish ()
 					for (auto & hash_l : hashes)
 					{
 						block_a = node.store.block_get (transaction, hash_l);
-						node.network.republish_block (transaction, std::move (block_a));
+						republish_bundle.push_back (std::move (block_a));
 						boost::property_tree::ptree entry_l;
 						entry_l.put ("", hash_l.to_string ());
 						blocks.push_back (std::make_pair ("", entry_l));
 					}
 				}
-				node.network.republish_block (transaction, std::move (block)); // Republish block
+				republish_bundle.push_back (std::move (block)); // Republish block
 				boost::property_tree::ptree entry;
 				entry.put ("", hash.to_string ());
 				blocks.push_back (std::make_pair ("", entry));
@@ -3016,13 +2904,12 @@ void rai::rpc_handler::republish ()
 					auto destination (node.ledger.block_destination (transaction, *block_b));
 					if (!destination.is_zero ())
 					{
-						auto exists (node.store.pending_exists (transaction, rai::pending_key (destination, hash)));
-						if (!exists)
+						if (!node.store.pending_exists (transaction, badem::pending_key (destination, hash)))
 						{
-							rai::block_hash previous (node.ledger.latest (transaction, destination));
-							std::unique_ptr<rai::block> block_d (node.store.block_get (transaction, previous));
-							rai::block_hash source;
-							std::vector<rai::block_hash> hashes;
+							badem::block_hash previous (node.ledger.latest (transaction, destination));
+							auto block_d (node.store.block_get (transaction, previous));
+							badem::block_hash source;
+							std::vector<badem::block_hash> hashes;
 							while (block_d != nullptr && hash != source)
 							{
 								hashes.push_back (previous);
@@ -3038,7 +2925,7 @@ void rai::rpc_handler::republish ()
 							for (auto & hash_l : hashes)
 							{
 								block_d = node.store.block_get (transaction, hash_l);
-								node.network.republish_block (transaction, std::move (block_d));
+								republish_bundle.push_back (std::move (block_d));
 								boost::property_tree::ptree entry_l;
 								entry_l.put ("", hash_l.to_string ());
 								blocks.push_back (std::make_pair ("", entry_l));
@@ -3048,806 +2935,754 @@ void rai::rpc_handler::republish ()
 				}
 				hash = node.store.block_successor (transaction, hash);
 			}
+			node.network.republish_block_batch (republish_bundle, 25);
 			response_l.put ("success", ""); // obsolete
 			response_l.add_child ("blocks", blocks);
-			response (response_l);
 		}
 		else
 		{
-			error_response (response, "Block not found");
+			ec = badem::error_blocks::not_found;
 		}
 	}
-	else
-	{
-		error_response (response, "Bad hash number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::search_pending ()
+void badem::rpc_handler::search_pending ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
-		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
-			{
-				auto error (existing->second->search_pending ());
-				boost::property_tree::ptree response_l;
-				response_l.put ("started", !error);
-				response (response_l);
-			}
-			else
-			{
-				error_response (response, "Wallet not found");
-			}
-		}
+		auto error (wallet->search_pending ());
+		response_l.put ("started", !error);
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::search_pending_all ()
+void badem::rpc_handler::search_pending_all ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	if (!ec)
 	{
 		node.wallets.search_pending_all ();
-		boost::property_tree::ptree response_l;
 		response_l.put ("success", "");
-		response (response_l);
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::send ()
+void badem::rpc_handler::send ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	auto amount (amount_impl ());
+	// Sending 0 amount is invalid with state blocks
+	if (!ec && amount.is_zero ())
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
+		ec = badem::error_common::invalid_amount;
+	}
+	if (!ec)
+	{
+		std::string source_text (request.get<std::string> ("source"));
+		badem::account source;
+		if (!source.decode_account (source_text))
 		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
+			std::string destination_text (request.get<std::string> ("destination"));
+			badem::account destination;
+			if (!destination.decode_account (destination_text))
 			{
-				std::string source_text (request.get<std::string> ("source"));
-				rai::account source;
-				auto error (source.decode_account (source_text));
-				if (!error)
+				auto work (work_optional_impl ());
+				badem::uint128_t balance (0);
+				if (!ec)
 				{
-					std::string destination_text (request.get<std::string> ("destination"));
-					rai::account destination;
-					auto error (destination.decode_account (destination_text));
-					if (!error)
+					auto transaction (node.wallets.tx_begin_read ());
+					auto block_transaction (node.store.tx_begin_read ());
+					if (wallet->store.valid_password (transaction))
 					{
-						std::string amount_text (request.get<std::string> ("amount"));
-						rai::amount amount;
-						auto error (amount.decode_dec (amount_text));
-						if (!error)
+						if (wallet->store.find (transaction, source) != wallet->store.end ())
 						{
-							uint64_t work (0);
-							boost::optional<std::string> work_text (request.get_optional<std::string> ("work"));
-							if (work_text.is_initialized ())
+							badem::account_info info;
+							if (!node.store.account_get (block_transaction, source, info))
 							{
-								error = rai::from_string_hex (work_text.get (), work);
-								if (error)
-								{
-									error_response (response, "Bad work");
-								}
+								balance = (info.balance).number ();
 							}
-							rai::uint128_t balance (0);
-							if (!error)
+							else
 							{
-								rai::transaction transaction (node.store.environment, nullptr, work != 0); // false if no "work" in request, true if work > 0
-								rai::account_info info;
-								if (!node.store.account_get (transaction, source, info))
-								{
-									balance = (info.balance).number ();
-								}
-								else
-								{
-									error = true;
-									error_response (response, "Account not found");
-								}
-								if (!error && work)
-								{
-									if (!rai::work_validate (info.head, work))
-									{
-										existing->second->store.work_put (transaction, source, work);
-									}
-									else
-									{
-										error = true;
-										error_response (response, "Invalid work");
-									}
-								}
+								ec = badem::error_common::account_not_found;
 							}
-							if (!error)
+							if (!ec && work)
 							{
-								boost::optional<std::string> send_id (request.get_optional<std::string> ("id"));
-								if (balance >= amount.number ())
+								if (badem::work_validate (info.head, work))
 								{
-									auto rpc_l (shared_from_this ());
-									auto response_a (response);
-									existing->second->send_async (source, destination, amount.number (), [response_a](std::shared_ptr<rai::block> block_a) {
-										if (block_a != nullptr)
-										{
-											rai::uint256_union hash (block_a->hash ());
-											boost::property_tree::ptree response_l;
-											response_l.put ("block", hash.to_string ());
-											response_a (response_l);
-										}
-										else
-										{
-											error_response (response_a, "Error generating block");
-										}
-									},
-									work == 0, send_id);
-								}
-								else
-								{
-									error_response (response, "Insufficient balance");
+									ec = badem::error_common::invalid_work;
 								}
 							}
 						}
 						else
 						{
-							error_response (response, "Bad amount format");
+							ec = badem::error_common::account_not_found_wallet;
 						}
 					}
 					else
 					{
-						error_response (response, "Bad destination account");
+						ec = badem::error_common::wallet_locked;
 					}
 				}
-				else
+				if (!ec)
 				{
-					error_response (response, "Bad source account");
+					bool generate_work (work == 0); // Disable work generation if "work" option is provided
+					boost::optional<std::string> send_id (request.get_optional<std::string> ("id"));
+					auto rpc_l (shared_from_this ());
+					auto response_a (response);
+					// clang-format off
+					wallet->send_async (source, destination, amount.number (), [balance, amount, response_a](std::shared_ptr<badem::block> block_a) {
+						if (block_a != nullptr)
+						{
+							badem::uint256_union hash (block_a->hash ());
+							boost::property_tree::ptree response_l;
+							response_l.put ("block", hash.to_string ());
+							response_a (response_l);
+						}
+						else
+						{
+							if (balance >= amount.number ())
+							{
+								error_response (response_a, "Error generating block");
+							}
+							else
+							{
+								std::error_code ec (badem::error_common::insufficient_balance);
+								error_response (response_a, ec.message ());
+							}
+						}
+					},
+					work, generate_work, send_id);
+					// clang-format on
 				}
 			}
 			else
 			{
-				error_response (response, "Wallet not found");
+				ec = badem::error_rpc::bad_destination;
 			}
 		}
 		else
 		{
-			error_response (response, "Bad wallet number");
+			ec = badem::error_rpc::bad_source;
 		}
 	}
-	else
+	// Because of send_async
+	if (ec)
 	{
-		error_response (response, "RPC control is disabled");
+		response_errors ();
 	}
 }
 
-void rai::rpc_handler::stats ()
+void badem::rpc_handler::sign ()
 {
-	bool error = false;
+	// Retrieving hash
+	badem::block_hash hash (0);
+	boost::optional<std::string> hash_text (request.get_optional<std::string> ("hash"));
+	if (hash_text.is_initialized ())
+	{
+		hash = hash_impl ();
+	}
+	// Retrieving block
+	std::shared_ptr<badem::block> block;
+	boost::optional<std::string> block_text (request.get_optional<std::string> ("block"));
+	if (!ec && block_text.is_initialized ())
+	{
+		block = block_impl (true);
+		if (block != nullptr)
+		{
+			hash = block->hash ();
+		}
+	}
+	// Hash or block are not initialized
+	if (!ec && hash.is_zero ())
+	{
+		ec = badem::error_blocks::invalid_block;
+	}
+	// Hash is initialized without config permission
+	else if (!ec && !hash.is_zero () && block == nullptr && !rpc.config.enable_sign_hash)
+	{
+		ec = badem::error_rpc::sign_hash_disabled;
+	}
+	if (!ec)
+	{
+		badem::raw_key prv;
+		prv.data.clear ();
+		// Retrieving private key from request
+		boost::optional<std::string> key_text (request.get_optional<std::string> ("key"));
+		if (key_text.is_initialized ())
+		{
+			if (prv.data.decode_hex (key_text.get ()))
+			{
+				ec = badem::error_common::bad_private_key;
+			}
+		}
+		else
+		{
+			// Retrieving private key from wallet
+			boost::optional<std::string> account_text (request.get_optional<std::string> ("account"));
+			boost::optional<std::string> wallet_text (request.get_optional<std::string> ("wallet"));
+			if (wallet_text.is_initialized () && account_text.is_initialized ())
+			{
+				auto account (account_impl ());
+				auto wallet (wallet_impl ());
+				if (!ec)
+				{
+					auto transaction (node.wallets.tx_begin_read ());
+					wallet_locked_impl (transaction, wallet);
+					wallet_account_impl (transaction, wallet, account);
+					if (!ec)
+					{
+						wallet->store.fetch (transaction, account, prv);
+					}
+				}
+			}
+		}
+		// Signing
+		if (prv.data != 0)
+		{
+			badem::public_key pub (badem::pub_key (prv.data));
+			badem::signature signature (badem::sign_message (prv, pub, hash));
+			response_l.put ("signature", signature.to_string ());
+			if (block != nullptr)
+			{
+				block->signature_set (signature);
+				std::string contents;
+				block->serialize_json (contents);
+				response_l.put ("block", contents);
+			}
+		}
+		else
+		{
+			ec = badem::error_rpc::block_create_key_required;
+		}
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::stats ()
+{
 	auto sink = node.stats.log_sink_json ();
 	std::string type (request.get<std::string> ("type", ""));
+	bool use_sink = false;
 	if (type == "counters")
 	{
 		node.stats.log_counters (*sink);
+		use_sink = true;
+	}
+	else if (type == "objects")
+	{
+		rpc_control_impl ();
+		if (!ec)
+		{
+			construct_json (collect_seq_con_info (node, "node").get (), response_l);
+		}
 	}
 	else if (type == "samples")
 	{
 		node.stats.log_samples (*sink);
+		use_sink = true;
 	}
 	else
 	{
-		error = true;
-		error_response (response, "Invalid or missing type argument");
+		ec = badem::error_rpc::invalid_missing_type;
 	}
-
-	if (!error)
+	if (!ec && use_sink)
 	{
-		response (*static_cast<boost::property_tree::ptree *> (sink->to_object ()));
-	}
-}
-
-void rai::rpc_handler::stop ()
-{
-	if (rpc.config.enable_control)
-	{
-		boost::property_tree::ptree response_l;
-		response_l.put ("success", "");
-		response (response_l);
-		rpc.stop ();
-		node.stop ();
+		auto stat_tree_l (*static_cast<boost::property_tree::ptree *> (sink->to_object ()));
+		stat_tree_l.put ("stat_duration_seconds", node.stats.last_reset ().count ());
+		response (stat_tree_l);
 	}
 	else
 	{
-		error_response (response, "RPC control is disabled");
+		response_errors ();
 	}
 }
 
-void rai::rpc_handler::unchecked ()
+void badem::rpc_handler::stats_clear ()
 {
-	uint64_t count (std::numeric_limits<uint64_t>::max ());
-	boost::optional<std::string> count_text (request.get_optional<std::string> ("count"));
-	if (count_text.is_initialized ())
-	{
-		auto error (decode_unsigned (count_text.get (), count));
-		if (error)
-		{
-			error_response (response, "Invalid count limit");
-		}
-	}
-	boost::property_tree::ptree response_l;
-	boost::property_tree::ptree unchecked;
-	rai::transaction transaction (node.store.environment, nullptr, false);
-	for (auto i (node.store.unchecked_begin (transaction)), n (node.store.unchecked_end ()); i != n && unchecked.size () < count; ++i)
-	{
-		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (i->second.data ()), i->second.size ());
-		auto block (rai::deserialize_block (stream));
-		std::string contents;
-		block->serialize_json (contents);
-		unchecked.put (block->hash ().to_string (), contents);
-	}
-	response_l.add_child ("blocks", unchecked);
+	node.stats.clear ();
+	response_l.put ("success", "");
 	response (response_l);
 }
 
-void rai::rpc_handler::unchecked_clear ()
+void badem::rpc_handler::stop ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	if (!ec)
 	{
-		rai::transaction transaction (node.store.environment, nullptr, true);
-		node.store.unchecked_clear (transaction);
-		boost::property_tree::ptree response_l;
 		response_l.put ("success", "");
-		response (response_l);
 	}
-	else
+	response_errors ();
+	if (!ec)
 	{
-		error_response (response, "RPC control is disabled");
+		rpc.stop ();
+		node.stop ();
 	}
 }
 
-void rai::rpc_handler::unchecked_get ()
+void badem::rpc_handler::unchecked ()
 {
-	std::string hash_text (request.get<std::string> ("hash"));
-	rai::uint256_union hash;
-	auto error (hash.decode_hex (hash_text));
-	if (!error)
+	auto count (count_optional_impl ());
+	if (!ec)
 	{
-		boost::property_tree::ptree response_l;
-		rai::transaction transaction (node.store.environment, nullptr, false);
+		boost::property_tree::ptree unchecked;
+		auto transaction (node.store.tx_begin_read ());
+		for (auto i (node.store.unchecked_begin (transaction)), n (node.store.unchecked_end ()); i != n && unchecked.size () < count; ++i)
+		{
+			badem::unchecked_info info (i->second);
+			std::string contents;
+			info.block->serialize_json (contents);
+			unchecked.put (info.block->hash ().to_string (), contents);
+		}
+		response_l.add_child ("blocks", unchecked);
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::unchecked_clear ()
+{
+	rpc_control_impl ();
+	if (!ec)
+	{
+		auto transaction (node.store.tx_begin_write ());
+		node.store.unchecked_clear (transaction);
+		response_l.put ("success", "");
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::unchecked_get ()
+{
+	auto hash (hash_impl ());
+	if (!ec)
+	{
+		auto transaction (node.store.tx_begin_read ());
 		for (auto i (node.store.unchecked_begin (transaction)), n (node.store.unchecked_end ()); i != n; ++i)
 		{
-			rai::bufferstream stream (reinterpret_cast<uint8_t const *> (i->second.data ()), i->second.size ());
-			auto block (rai::deserialize_block (stream));
-			if (block->hash () == hash)
+			badem::unchecked_key key (i->first);
+			if (key.hash == hash)
 			{
+				badem::unchecked_info info (i->second);
+				response_l.put ("modified_timestamp", std::to_string (info.modified));
 				std::string contents;
-				block->serialize_json (contents);
+				info.block->serialize_json (contents);
 				response_l.put ("contents", contents);
 				break;
 			}
 		}
-		if (!response_l.empty ())
+		if (response_l.empty ())
 		{
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Unchecked block not found");
+			ec = badem::error_blocks::not_found;
 		}
 	}
-	else
-	{
-		error_response (response, "Bad hash number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::unchecked_keys ()
+void badem::rpc_handler::unchecked_keys ()
 {
-	uint64_t count (std::numeric_limits<uint64_t>::max ());
-	rai::uint256_union key (0);
-	boost::optional<std::string> count_text (request.get_optional<std::string> ("count"));
-	if (count_text.is_initialized ())
-	{
-		auto error (decode_unsigned (count_text.get (), count));
-		if (error)
-		{
-			error_response (response, "Invalid count limit");
-		}
-	}
+	auto count (count_optional_impl ());
+	badem::uint256_union key (0);
 	boost::optional<std::string> hash_text (request.get_optional<std::string> ("key"));
-	if (hash_text.is_initialized ())
+	if (!ec && hash_text.is_initialized ())
 	{
-		auto error_hash (key.decode_hex (hash_text.get ()));
-		if (error_hash)
+		if (key.decode_hex (hash_text.get ()))
 		{
-			error_response (response, "Bad key hash number");
+			ec = badem::error_rpc::bad_key;
 		}
 	}
-	boost::property_tree::ptree response_l;
-	boost::property_tree::ptree unchecked;
-	rai::transaction transaction (node.store.environment, nullptr, false);
-	for (auto i (node.store.unchecked_begin (transaction, key)), n (node.store.unchecked_end ()); i != n && unchecked.size () < count; ++i)
+	if (!ec)
 	{
-		boost::property_tree::ptree entry;
-		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (i->second.data ()), i->second.size ());
-		auto block (rai::deserialize_block (stream));
-		std::string contents;
-		block->serialize_json (contents);
-		entry.put ("key", rai::block_hash (i->first.uint256 ()).to_string ());
-		entry.put ("hash", block->hash ().to_string ());
-		entry.put ("contents", contents);
-		unchecked.push_back (std::make_pair ("", entry));
+		boost::property_tree::ptree unchecked;
+		auto transaction (node.store.tx_begin_read ());
+		for (auto i (node.store.unchecked_begin (transaction, badem::unchecked_key (key, 0))), n (node.store.unchecked_end ()); i != n && unchecked.size () < count; ++i)
+		{
+			boost::property_tree::ptree entry;
+			badem::unchecked_info info (i->second);
+			std::string contents;
+			info.block->serialize_json (contents);
+			entry.put ("key", badem::block_hash (i->first.key ()).to_string ());
+			entry.put ("hash", info.block->hash ().to_string ());
+			entry.put ("modified_timestamp", std::to_string (info.modified));
+			entry.put ("contents", contents);
+			unchecked.push_back (std::make_pair ("", entry));
+		}
+		response_l.add_child ("unchecked", unchecked);
 	}
-	response_l.add_child ("unchecked", unchecked);
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::version ()
+void badem::rpc_handler::uptime ()
 {
-	boost::property_tree::ptree response_l;
+	response_l.put ("seconds", std::chrono::duration_cast<std::chrono::seconds> (std::chrono::steady_clock::now () - node.startup_time).count ());
+	response_errors ();
+}
+
+void badem::rpc_handler::version ()
+{
 	response_l.put ("rpc_version", "1");
 	response_l.put ("store_version", std::to_string (node.store_version ()));
-	response_l.put ("node_vendor", boost::str (boost::format ("Badem %1%.%2%") % BADEM_VERSION_MAJOR % BADEM_VERSION_MINOR));
-	response (response_l);
+	response_l.put ("protocol_version", std::to_string (badem::protocol_version));
+	if (BADEM_VERSION_PATCH == 0)
+	{
+		response_l.put ("node_vendor", boost::str (boost::format ("Badem %1%") % BADEM_MAJOR_MINOR_VERSION));
+	}
+	else
+	{
+		response_l.put ("node_vendor", boost::str (boost::format ("Badem %1%") % BADEM_MAJOR_MINOR_RC_VERSION));
+	}
+	response_errors ();
 }
 
-void rai::rpc_handler::validate_account_number ()
+void badem::rpc_handler::validate_account_number ()
 {
 	std::string account_text (request.get<std::string> ("account"));
-	rai::uint256_union account;
+	badem::uint256_union account;
 	auto error (account.decode_account (account_text));
-	boost::property_tree::ptree response_l;
 	response_l.put ("valid", error ? "0" : "1");
-	response (response_l);
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_add ()
+void badem::rpc_handler::wallet_add ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
 		std::string key_text (request.get<std::string> ("key"));
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::raw_key key;
-		auto error (key.data.decode_hex (key_text));
-		if (!error)
+		badem::raw_key key;
+		if (!key.data.decode_hex (key_text))
 		{
-			rai::uint256_union wallet;
-			auto error (wallet.decode_hex (wallet_text));
-			if (!error)
+			const bool generate_work = request.get<bool> ("work", true);
+			auto pub (wallet->insert_adhoc (key, generate_work));
+			if (!pub.is_zero ())
 			{
-				auto existing (node.wallets.items.find (wallet));
-				if (existing != node.wallets.items.end ())
-				{
-					const bool generate_work = request.get<bool> ("work", true);
-					auto pub (existing->second->insert_adhoc (key, generate_work));
-					if (!pub.is_zero ())
-					{
-						boost::property_tree::ptree response_l;
-						response_l.put ("account", pub.to_account ());
-						response (response_l);
-					}
-					else
-					{
-						error_response (response, "Wallet locked");
-					}
-				}
-				else
-				{
-					error_response (response, "Wallet not found");
-				}
+				response_l.put ("account", pub.to_account ());
 			}
 			else
 			{
-				error_response (response, "Bad wallet number");
+				ec = badem::error_common::wallet_locked;
 			}
 		}
 		else
 		{
-			error_response (response, "Bad private key");
+			ec = badem::error_common::bad_private_key;
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_add_watch ()
+void badem::rpc_handler::wallet_add_watch ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
+		auto transaction (node.wallets.tx_begin_write ());
+		if (wallet->store.valid_password (transaction))
 		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
+			for (auto & accounts : request.get_child ("accounts"))
 			{
-				rai::transaction transaction (node.store.environment, nullptr, true);
-				if (existing->second->store.valid_password (transaction))
+				auto account (account_impl (accounts.second.data ()));
+				if (!ec)
 				{
-					for (auto & accounts : request.get_child ("accounts"))
-					{
-						std::string account_text = accounts.second.data ();
-						rai::uint256_union account;
-						auto error (account.decode_account (account_text));
-						if (!error)
-						{
-							existing->second->insert_watch (transaction, account);
-						}
-						else
-						{
-							error_response (response, "Bad account number");
-						}
-					}
-					boost::property_tree::ptree response_l;
-					response_l.put ("success", "");
-					response (response_l);
-				}
-				else
-				{
-					error_response (response, "Wallet locked");
+					wallet->insert_watch (transaction, account);
 				}
 			}
-			else
-			{
-				error_response (response, "Wallet not found");
-			}
+			response_l.put ("success", "");
 		}
 		else
 		{
-			error_response (response, "Bad wallet number");
+			ec = badem::error_common::wallet_locked;
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_balance_total ()
+void badem::rpc_handler::wallet_info ()
 {
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union wallet;
-	auto error (wallet.decode_hex (wallet_text));
-	if (!error)
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		auto existing (node.wallets.items.find (wallet));
-		if (existing != node.wallets.items.end ())
+		badem::uint128_t balance (0);
+		badem::uint128_t pending (0);
+		uint64_t count (0);
+		uint64_t deterministic_count (0);
+		uint64_t adhoc_count (0);
+		auto transaction (node.wallets.tx_begin_read ());
+		auto block_transaction (node.store.tx_begin_read ());
+		for (auto i (wallet->store.begin (transaction)), n (wallet->store.end ()); i != n; ++i)
 		{
-			rai::uint128_t balance (0);
-			rai::uint128_t pending (0);
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			for (auto i (existing->second->store.begin (transaction)), n (existing->second->store.end ()); i != n; ++i)
+			badem::account account (i->first);
+			balance = balance + node.ledger.account_balance (block_transaction, account);
+			pending = pending + node.ledger.account_pending (block_transaction, account);
+			badem::key_type key_type (wallet->store.key_type (i->second));
+			if (key_type == badem::key_type::deterministic)
 			{
-				rai::account account (i->first.uint256 ());
-				balance = balance + node.ledger.account_balance (transaction, account);
-				pending = pending + node.ledger.account_pending (transaction, account);
+				deterministic_count++;
 			}
-			boost::property_tree::ptree response_l;
-			response_l.put ("balance", balance.convert_to<std::string> ());
-			response_l.put ("pending", pending.convert_to<std::string> ());
-			response (response_l);
+			else if (key_type == badem::key_type::adhoc)
+			{
+				adhoc_count++;
+			}
+			count++;
 		}
-		else
-		{
-			error_response (response, "Wallet not found");
-		}
+		uint32_t deterministic_index (wallet->store.deterministic_index_get (transaction));
+		response_l.put ("balance", balance.convert_to<std::string> ());
+		response_l.put ("pending", pending.convert_to<std::string> ());
+		response_l.put ("accounts_count", std::to_string (count));
+		response_l.put ("deterministic_count", std::to_string (deterministic_count));
+		response_l.put ("adhoc_count", std::to_string (adhoc_count));
+		response_l.put ("deterministic_index", std::to_string (deterministic_index));
 	}
-	else
-	{
-		error_response (response, "Bad wallet number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_balances ()
+void badem::rpc_handler::wallet_balances ()
 {
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union wallet;
-	auto error (wallet.decode_hex (wallet_text));
-	if (!error)
+	auto wallet (wallet_impl ());
+	auto threshold (threshold_optional_impl ());
+	if (!ec)
 	{
-		rai::uint128_union threshold (0);
-		boost::optional<std::string> threshold_text (request.get_optional<std::string> ("threshold"));
-		if (threshold_text.is_initialized ())
+		boost::property_tree::ptree balances;
+		auto transaction (node.wallets.tx_begin_read ());
+		auto block_transaction (node.store.tx_begin_read ());
+		for (auto i (wallet->store.begin (transaction)), n (wallet->store.end ()); i != n; ++i)
 		{
-			auto error_threshold (threshold.decode_dec (threshold_text.get ()));
-			if (error_threshold)
+			badem::account account (i->first);
+			badem::uint128_t balance = node.ledger.account_balance (block_transaction, account);
+			if (balance >= threshold.number ())
 			{
-				error_response (response, "Bad threshold number");
+				boost::property_tree::ptree entry;
+				badem::uint128_t pending = node.ledger.account_pending (block_transaction, account);
+				entry.put ("balance", balance.convert_to<std::string> ());
+				entry.put ("pending", pending.convert_to<std::string> ());
+				balances.push_back (std::make_pair (account.to_account (), entry));
 			}
 		}
-		auto existing (node.wallets.items.find (wallet));
-		if (existing != node.wallets.items.end ())
-		{
-			boost::property_tree::ptree response_l;
-			boost::property_tree::ptree balances;
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			for (auto i (existing->second->store.begin (transaction)), n (existing->second->store.end ()); i != n; ++i)
-			{
-				rai::account account (i->first.uint256 ());
-				rai::uint128_t balance = node.ledger.account_balance (transaction, account);
-				if (threshold.is_zero ())
-				{
-					boost::property_tree::ptree entry;
-					rai::uint128_t pending = node.ledger.account_pending (transaction, account);
-					entry.put ("balance", balance.convert_to<std::string> ());
-					entry.put ("pending", pending.convert_to<std::string> ());
-					balances.push_back (std::make_pair (account.to_account (), entry));
-				}
-				else
-				{
-					if (balance >= threshold.number ())
-					{
-						boost::property_tree::ptree entry;
-						rai::uint128_t pending = node.ledger.account_pending (transaction, account);
-						entry.put ("balance", balance.convert_to<std::string> ());
-						entry.put ("pending", pending.convert_to<std::string> ());
-						balances.push_back (std::make_pair (account.to_account (), entry));
-					}
-				}
-			}
-			response_l.add_child ("balances", balances);
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Wallet not found");
-		}
+		response_l.add_child ("balances", balances);
 	}
-	else
-	{
-		error_response (response, "Bad wallet number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_change_seed ()
+void badem::rpc_handler::wallet_change_seed ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
 		std::string seed_text (request.get<std::string> ("seed"));
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::raw_key seed;
-		auto error (seed.data.decode_hex (seed_text));
-		if (!error)
+		badem::raw_key seed;
+		if (!seed.data.decode_hex (seed_text))
 		{
-			rai::uint256_union wallet;
-			auto error (wallet.decode_hex (wallet_text));
-			if (!error)
+			auto count (static_cast<uint32_t> (count_optional_impl (0)));
+			auto transaction (node.wallets.tx_begin_write ());
+			if (wallet->store.valid_password (transaction))
 			{
-				auto existing (node.wallets.items.find (wallet));
-				if (existing != node.wallets.items.end ())
-				{
-					rai::transaction transaction (node.store.environment, nullptr, true);
-					if (existing->second->store.valid_password (transaction))
-					{
-						existing->second->store.seed_set (transaction, seed);
-						boost::property_tree::ptree response_l;
-						response_l.put ("success", "");
-						response (response_l);
-					}
-					else
-					{
-						error_response (response, "Wallet locked");
-					}
-				}
-				else
-				{
-					error_response (response, "Wallet not found");
-				}
+				wallet->change_seed (transaction, seed, count);
+				response_l.put ("success", "");
 			}
 			else
 			{
-				error_response (response, "Bad wallet number");
+				ec = badem::error_common::wallet_locked;
 			}
 		}
 		else
 		{
-			error_response (response, "Bad seed");
+			ec = badem::error_common::bad_seed;
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_contains ()
+void badem::rpc_handler::wallet_contains ()
 {
-	std::string account_text (request.get<std::string> ("account"));
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union account;
-	auto error (account.decode_account (account_text));
-	if (!error)
+	auto account (account_impl ());
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
+		auto transaction (node.wallets.tx_begin_read ());
+		auto exists (wallet->store.find (transaction, account) != wallet->store.end ());
+		response_l.put ("exists", exists ? "1" : "0");
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::wallet_create ()
+{
+	rpc_control_impl ();
+	if (!ec)
+	{
+		badem::raw_key seed;
+		auto seed_text (request.get_optional<std::string> ("seed"));
+		if (seed_text.is_initialized () && seed.data.decode_hex (seed_text.get ()))
 		{
-			auto existing (node.wallets.items.find (wallet));
+			ec = badem::error_common::bad_seed;
+		}
+		if (!ec)
+		{
+			badem::keypair wallet_id;
+			auto wallet (node.wallets.create (wallet_id.pub));
+			auto existing (node.wallets.items.find (wallet_id.pub));
 			if (existing != node.wallets.items.end ())
 			{
-				rai::transaction transaction (node.store.environment, nullptr, false);
-				auto exists (existing->second->store.find (transaction, account) != existing->second->store.end ());
-				boost::property_tree::ptree response_l;
-				response_l.put ("exists", exists ? "1" : "0");
-				response (response_l);
+				response_l.put ("wallet", wallet_id.pub.to_string ());
 			}
 			else
 			{
-				error_response (response, "Wallet not found");
+				ec = badem::error_common::wallet_lmdb_max_dbs;
+			}
+			if (!ec && seed_text.is_initialized ())
+			{
+				auto transaction (node.wallets.tx_begin_write ());
+				badem::public_key account (wallet->change_seed (transaction, seed));
+				response_l.put ("account", account.to_account ());
 			}
 		}
-		else
-		{
-			error_response (response, "Bad wallet number");
-		}
 	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_create ()
+void badem::rpc_handler::wallet_destroy ()
 {
-	if (rpc.config.enable_control)
-	{
-		rai::keypair wallet_id;
-		node.wallets.create (wallet_id.pub);
-		rai::transaction transaction (node.store.environment, nullptr, false);
-		auto existing (node.wallets.items.find (wallet_id.pub));
-		if (existing != node.wallets.items.end ())
-		{
-			boost::property_tree::ptree response_l;
-			response_l.put ("wallet", wallet_id.pub.to_string ());
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Failed to create wallet. Increase lmdb_max_dbs in node config.");
-		}
-	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
-}
-
-void rai::rpc_handler::wallet_destroy ()
-{
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	if (!ec)
 	{
 		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
+		badem::uint256_union wallet;
+		if (!wallet.decode_hex (wallet_text))
 		{
 			auto existing (node.wallets.items.find (wallet));
 			if (existing != node.wallets.items.end ())
 			{
 				node.wallets.destroy (wallet);
-				boost::property_tree::ptree response_l;
-				response (response_l);
+				bool destroyed (node.wallets.items.find (wallet) == node.wallets.items.end ());
+				response_l.put ("destroyed", destroyed ? "1" : "0");
 			}
 			else
 			{
-				error_response (response, "Wallet not found");
+				ec = badem::error_common::wallet_not_found;
 			}
 		}
 		else
 		{
-			error_response (response, "Bad wallet number");
+			ec = badem::error_common::bad_wallet_number;
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_export ()
+void badem::rpc_handler::wallet_export ()
 {
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union wallet;
-	auto error (wallet.decode_hex (wallet_text));
-	if (!error)
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		auto existing (node.wallets.items.find (wallet));
-		if (existing != node.wallets.items.end ())
-		{
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			std::string json;
-			existing->second->store.serialize_json (transaction, json);
-			boost::property_tree::ptree response_l;
-			response_l.put ("json", json);
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Wallet not found");
-		}
+		auto transaction (node.wallets.tx_begin_read ());
+		std::string json;
+		wallet->store.serialize_json (transaction, json);
+		response_l.put ("json", json);
 	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_frontiers ()
+void badem::rpc_handler::wallet_frontiers ()
 {
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union wallet;
-	auto error (wallet.decode_hex (wallet_text));
-	if (!error)
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		auto existing (node.wallets.items.find (wallet));
-		if (existing != node.wallets.items.end ())
+		boost::property_tree::ptree frontiers;
+		auto transaction (node.wallets.tx_begin_read ());
+		auto block_transaction (node.store.tx_begin_read ());
+		for (auto i (wallet->store.begin (transaction)), n (wallet->store.end ()); i != n; ++i)
 		{
-			boost::property_tree::ptree response_l;
-			boost::property_tree::ptree frontiers;
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			for (auto i (existing->second->store.begin (transaction)), n (existing->second->store.end ()); i != n; ++i)
+			badem::account account (i->first);
+			auto latest (node.ledger.latest (block_transaction, account));
+			if (!latest.is_zero ())
 			{
-				rai::account account (i->first.uint256 ());
-				auto latest (node.ledger.latest (transaction, account));
-				if (!latest.is_zero ())
+				frontiers.put (account.to_account (), latest.to_string ());
+			}
+		}
+		response_l.add_child ("frontiers", frontiers);
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::wallet_history ()
+{
+	uint64_t modified_since (1);
+	boost::optional<std::string> modified_since_text (request.get_optional<std::string> ("modified_since"));
+	if (modified_since_text.is_initialized ())
+	{
+		if (decode_unsigned (modified_since_text.get (), modified_since))
+		{
+			ec = badem::error_rpc::invalid_timestamp;
+		}
+	}
+	auto wallet (wallet_impl ());
+	if (!ec)
+	{
+		std::multimap<uint64_t, boost::property_tree::ptree, std::greater<uint64_t>> entries;
+		auto transaction (node.wallets.tx_begin_read ());
+		auto block_transaction (node.store.tx_begin_read ());
+		for (auto i (wallet->store.begin (transaction)), n (wallet->store.end ()); i != n; ++i)
+		{
+			badem::account account (i->first);
+			badem::account_info info;
+			if (!node.store.account_get (block_transaction, account, info))
+			{
+				auto timestamp (info.modified);
+				auto hash (info.head);
+				while (timestamp >= modified_since && !hash.is_zero ())
 				{
-					frontiers.put (account.to_account (), latest.to_string ());
+					badem::block_sideband sideband;
+					auto block (node.store.block_get (block_transaction, hash, &sideband));
+					timestamp = sideband.timestamp;
+					if (block != nullptr && timestamp >= modified_since)
+					{
+						boost::property_tree::ptree entry;
+						history_visitor visitor (*this, false, block_transaction, entry, hash);
+						block->visit (visitor);
+						if (!entry.empty ())
+						{
+							entry.put ("block_account", account.to_account ());
+							entry.put ("hash", hash.to_string ());
+							entry.put ("local_timestamp", std::to_string (timestamp));
+							entries.insert (std::make_pair (timestamp, entry));
+						}
+						hash = block->previous ();
+					}
+					else
+					{
+						hash.clear ();
+					}
 				}
 			}
-			response_l.add_child ("frontiers", frontiers);
-			response (response_l);
 		}
-		else
+		boost::property_tree::ptree history;
+		for (auto i (entries.begin ()), n (entries.end ()); i != n; ++i)
 		{
-			error_response (response, "Wallet not found");
+			history.push_back (std::make_pair ("", i->second));
 		}
+		response_l.add_child ("history", history);
 	}
-	else
-	{
-		error_response (response, "Bad wallet number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_key_valid ()
+void badem::rpc_handler::wallet_key_valid ()
 {
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union wallet;
-	auto error (wallet.decode_hex (wallet_text));
-	if (!error)
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		auto existing (node.wallets.items.find (wallet));
-		if (existing != node.wallets.items.end ())
-		{
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			auto valid (existing->second->store.valid_password (transaction));
-			boost::property_tree::ptree response_l;
-			response_l.put ("valid", valid ? "1" : "0");
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Wallet not found");
-		}
+		auto transaction (node.wallets.tx_begin_read ());
+		auto valid (wallet->store.valid_password (transaction));
+		response_l.put ("valid", valid ? "1" : "0");
 	}
-	else
-	{
-		error_response (response, "Bad wallet number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_ledger ()
+void badem::rpc_handler::wallet_ledger ()
 {
 	const bool representative = request.get<bool> ("representative", false);
 	const bool weight = request.get<bool> ("weight", false);
@@ -3858,145 +3693,91 @@ void rai::rpc_handler::wallet_ledger ()
 	{
 		modified_since = strtoul (modified_since_text.get ().c_str (), NULL, 10);
 	}
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union wallet;
-	auto error (wallet.decode_hex (wallet_text));
-	if (!error)
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		auto existing (node.wallets.items.find (wallet));
-		if (existing != node.wallets.items.end ())
+		boost::property_tree::ptree accounts;
+		auto transaction (node.wallets.tx_begin_read ());
+		auto block_transaction (node.store.tx_begin_read ());
+		for (auto i (wallet->store.begin (transaction)), n (wallet->store.end ()); i != n; ++i)
 		{
-			boost::property_tree::ptree response_l;
-			boost::property_tree::ptree accounts;
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			for (auto i (existing->second->store.begin (transaction)), n (existing->second->store.end ()); i != n; ++i)
+			badem::account account (i->first);
+			badem::account_info info;
+			if (!node.store.account_get (block_transaction, account, info))
 			{
-				rai::account account (i->first.uint256 ());
-				rai::account_info info;
-				if (!node.store.account_get (transaction, account, info))
+				if (info.modified >= modified_since)
 				{
-					if (info.modified >= modified_since)
+					boost::property_tree::ptree entry;
+					entry.put ("frontier", info.head.to_string ());
+					entry.put ("open_block", info.open_block.to_string ());
+					entry.put ("representative_block", info.rep_block.to_string ());
+					std::string balance;
+					badem::uint128_union (info.balance).encode_dec (balance);
+					entry.put ("balance", balance);
+					entry.put ("modified_timestamp", std::to_string (info.modified));
+					entry.put ("block_count", std::to_string (info.block_count));
+					if (representative)
 					{
-						boost::property_tree::ptree entry;
-						entry.put ("frontier", info.head.to_string ());
-						entry.put ("open_block", info.open_block.to_string ());
-						entry.put ("representative_block", info.rep_block.to_string ());
-						std::string balance;
-						rai::uint128_union (info.balance).encode_dec (balance);
-						entry.put ("balance", balance);
-						entry.put ("modified_timestamp", std::to_string (info.modified));
-						entry.put ("block_count", std::to_string (info.block_count));
-						if (representative)
-						{
-							auto block (node.store.block_get (transaction, info.rep_block));
-							assert (block != nullptr);
-							entry.put ("representative", block->representative ().to_account ());
-						}
-						if (weight)
-						{
-							auto account_weight (node.ledger.weight (transaction, account));
-							entry.put ("weight", account_weight.convert_to<std::string> ());
-						}
-						if (pending)
-						{
-							auto account_pending (node.ledger.account_pending (transaction, account));
-							entry.put ("pending", account_pending.convert_to<std::string> ());
-						}
-						accounts.push_back (std::make_pair (account.to_account (), entry));
+						auto block (node.store.block_get (block_transaction, info.rep_block));
+						assert (block != nullptr);
+						entry.put ("representative", block->representative ().to_account ());
 					}
+					if (weight)
+					{
+						auto account_weight (node.ledger.weight (block_transaction, account));
+						entry.put ("weight", account_weight.convert_to<std::string> ());
+					}
+					if (pending)
+					{
+						auto account_pending (node.ledger.account_pending (block_transaction, account));
+						entry.put ("pending", account_pending.convert_to<std::string> ());
+					}
+					accounts.push_back (std::make_pair (account.to_account (), entry));
 				}
 			}
-			response_l.add_child ("accounts", accounts);
-			response (response_l);
 		}
-		else
-		{
-			error_response (response, "Wallet not found");
-		}
+		response_l.add_child ("accounts", accounts);
 	}
-	else
-	{
-		error_response (response, "Bad wallet number");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_lock ()
+void badem::rpc_handler::wallet_lock ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	if (!ec)
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
-		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
-			{
-				boost::property_tree::ptree response_l;
-				rai::raw_key empty;
-				empty.data.clear ();
-				existing->second->store.password.value_set (empty);
-				response_l.put ("locked", "1");
-				response (response_l);
-			}
-			else
-			{
-				error_response (response, "Wallet not found");
-			}
-		}
-		else
-		{
-			error_response (response, "Bad wallet number");
-		}
+		badem::raw_key empty;
+		empty.data.clear ();
+		wallet->store.password.value_set (empty);
+		response_l.put ("locked", "1");
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_pending ()
+void badem::rpc_handler::wallet_pending ()
 {
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union wallet;
-	auto error (wallet.decode_hex (wallet_text));
-	if (!error)
+	auto wallet (wallet_impl ());
+	auto count (count_optional_impl ());
+	auto threshold (threshold_optional_impl ());
+	const bool source = request.get<bool> ("source", false);
+	const bool min_version = request.get<bool> ("min_version", false);
+	const bool include_active = request.get<bool> ("include_active", false);
+	if (!ec)
 	{
-		auto existing (node.wallets.items.find (wallet));
-		if (existing != node.wallets.items.end ())
+		boost::property_tree::ptree pending;
+		auto transaction (node.wallets.tx_begin_read ());
+		auto block_transaction (node.store.tx_begin_read ());
+		for (auto i (wallet->store.begin (transaction)), n (wallet->store.end ()); i != n; ++i)
 		{
-			uint64_t count (std::numeric_limits<uint64_t>::max ());
-			rai::uint128_union threshold (0);
-			boost::optional<std::string> count_text (request.get_optional<std::string> ("count"));
-			if (count_text.is_initialized ())
+			badem::account account (i->first);
+			boost::property_tree::ptree peers_l;
+			for (auto ii (node.store.pending_begin (block_transaction, badem::pending_key (account, 0))); badem::pending_key (ii->first).account == account && peers_l.size () < count; ++ii)
 			{
-				auto error (decode_unsigned (count_text.get (), count));
-				if (error)
+				badem::pending_key key (ii->first);
+				std::shared_ptr<badem::block> block (include_active ? nullptr : node.store.block_get (block_transaction, key.hash));
+				if (include_active || (block && !node.active.active (*block)))
 				{
-					error_response (response, "Invalid count limit");
-				}
-			}
-			boost::optional<std::string> threshold_text (request.get_optional<std::string> ("threshold"));
-			if (threshold_text.is_initialized ())
-			{
-				auto error_threshold (threshold.decode_dec (threshold_text.get ()));
-				if (error_threshold)
-				{
-					error_response (response, "Bad threshold number");
-				}
-			}
-			const bool source = request.get<bool> ("source", false);
-			boost::property_tree::ptree response_l;
-			boost::property_tree::ptree pending;
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			for (auto i (existing->second->store.begin (transaction)), n (existing->second->store.end ()); i != n; ++i)
-			{
-				rai::account account (i->first.uint256 ());
-				boost::property_tree::ptree peers_l;
-				rai::account end (account.number () + 1);
-				for (auto ii (node.store.pending_begin (transaction, rai::pending_key (account, 0))), nn (node.store.pending_begin (transaction, rai::pending_key (end, 0))); ii != nn && peers_l.size () < count; ++ii)
-				{
-					rai::pending_key key (ii->first);
 					if (threshold.is_zero () && !source)
 					{
 						boost::property_tree::ptree entry;
@@ -4005,14 +3786,21 @@ void rai::rpc_handler::wallet_pending ()
 					}
 					else
 					{
-						rai::pending_info info (ii->second);
+						badem::pending_info info (ii->second);
 						if (info.amount.number () >= threshold.number ())
 						{
-							if (source)
+							if (source || min_version)
 							{
 								boost::property_tree::ptree pending_tree;
 								pending_tree.put ("amount", info.amount.number ().convert_to<std::string> ());
-								pending_tree.put ("source", info.source.to_account ());
+								if (source)
+								{
+									pending_tree.put ("source", info.source.to_account ());
+								}
+								if (min_version)
+								{
+									pending_tree.put ("min_version", info.epoch == badem::epoch::epoch_1 ? "1" : "0");
+								}
 								peers_l.add_child (key.hash.to_string (), pending_tree);
 							}
 							else
@@ -4022,441 +3810,272 @@ void rai::rpc_handler::wallet_pending ()
 						}
 					}
 				}
-				if (!peers_l.empty ())
-				{
-					pending.add_child (account.to_account (), peers_l);
-				}
 			}
-			response_l.add_child ("blocks", pending);
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Wallet not found");
-		}
-	}
-	else
-	{
-		error_response (response, "Bad wallet number");
-	}
-}
-
-void rai::rpc_handler::wallet_representative ()
-{
-	std::string wallet_text (request.get<std::string> ("wallet"));
-	rai::uint256_union wallet;
-	auto error (wallet.decode_hex (wallet_text));
-	if (!error)
-	{
-		auto existing (node.wallets.items.find (wallet));
-		if (existing != node.wallets.items.end ())
-		{
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			boost::property_tree::ptree response_l;
-			response_l.put ("representative", existing->second->store.representative (transaction).to_account ());
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Wallet not found");
-		}
-	}
-	else
-	{
-		error_response (response, "Bad account number");
-	}
-}
-
-void rai::rpc_handler::wallet_representative_set ()
-{
-	if (rpc.config.enable_control)
-	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
-		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
+			if (!peers_l.empty ())
 			{
-				std::string representative_text (request.get<std::string> ("representative"));
-				rai::account representative;
-				auto error (representative.decode_account (representative_text));
-				if (!error)
+				pending.add_child (account.to_account (), peers_l);
+			}
+		}
+		response_l.add_child ("blocks", pending);
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::wallet_representative ()
+{
+	auto wallet (wallet_impl ());
+	if (!ec)
+	{
+		auto transaction (node.wallets.tx_begin_read ());
+		response_l.put ("representative", wallet->store.representative (transaction).to_account ());
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::wallet_representative_set ()
+{
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	if (!ec)
+	{
+		std::string representative_text (request.get<std::string> ("representative"));
+		badem::account representative;
+		if (!representative.decode_account (representative_text))
+		{
+			bool update_existing_accounts (request.get<bool> ("update_existing_accounts", false));
+			{
+				auto transaction (node.wallets.tx_begin_write ());
+				if (wallet->store.valid_password (transaction) || !update_existing_accounts)
 				{
-					rai::transaction transaction (node.store.environment, nullptr, true);
-					existing->second->store.representative_set (transaction, representative);
-					boost::property_tree::ptree response_l;
+					wallet->store.representative_set (transaction, representative);
 					response_l.put ("set", "1");
-					response (response_l);
 				}
 				else
 				{
-					error_response (response, "Invalid account number");
+					ec = badem::error_common::wallet_locked;
 				}
 			}
-			else
+			// Change representative for all wallet accounts
+			if (!ec && update_existing_accounts)
 			{
-				error_response (response, "Wallet not found");
-			}
-		}
-		else
-		{
-			error_response (response, "Bad account number");
-		}
-	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
-}
-
-void rai::rpc_handler::wallet_republish ()
-{
-	if (rpc.config.enable_control)
-	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
-		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
-			{
-				uint64_t count;
-				std::string count_text (request.get<std::string> ("count"));
-				auto error (decode_unsigned (count_text, count));
-				if (!error)
+				std::vector<badem::account> accounts;
 				{
-					boost::property_tree::ptree response_l;
-					boost::property_tree::ptree blocks;
-					rai::transaction transaction (node.store.environment, nullptr, false);
-					for (auto i (existing->second->store.begin (transaction)), n (existing->second->store.end ()); i != n; ++i)
+					auto transaction (node.wallets.tx_begin_read ());
+					auto block_transaction (node.store.tx_begin_read ());
+					for (auto i (wallet->store.begin (transaction)), n (wallet->store.end ()); i != n; ++i)
 					{
-						rai::account account (i->first.uint256 ());
-						auto latest (node.ledger.latest (transaction, account));
-						std::unique_ptr<rai::block> block;
-						std::vector<rai::block_hash> hashes;
-						while (!latest.is_zero () && hashes.size () < count)
+						badem::account account (i->first);
+						badem::account_info info;
+						if (!node.store.account_get (block_transaction, account, info))
 						{
-							hashes.push_back (latest);
-							block = node.store.block_get (transaction, latest);
-							latest = block->previous ();
-						}
-						std::reverse (hashes.begin (), hashes.end ());
-						for (auto & hash : hashes)
-						{
-							block = node.store.block_get (transaction, hash);
-							node.network.republish_block (transaction, std::move (block));
-							;
-							boost::property_tree::ptree entry;
-							entry.put ("", hash.to_string ());
-							blocks.push_back (std::make_pair ("", entry));
+							auto block (node.store.block_get (block_transaction, info.rep_block));
+							assert (block != nullptr);
+							if (block->representative () != representative)
+							{
+								accounts.push_back (account);
+							}
 						}
 					}
-					response_l.add_child ("blocks", blocks);
-					response (response_l);
 				}
-				else
+				for (auto & account : accounts)
 				{
-					error_response (response, "Invalid count limit");
+					// clang-format off
+					wallet->change_async (account, representative, [](std::shared_ptr<badem::block>) {}, 0, false);
+					// clang-format on
 				}
-			}
-			else
-			{
-				error_response (response, "Wallet not found");
 			}
 		}
 		else
 		{
-			error_response (response, "Bad wallet number");
+			ec = badem::error_rpc::bad_representative_number;
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::wallet_work_get ()
+void badem::rpc_handler::wallet_republish ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	auto count (count_impl ());
+	if (!ec)
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
+		boost::property_tree::ptree blocks;
+		std::deque<std::shared_ptr<badem::block>> republish_bundle;
+		auto transaction (node.wallets.tx_begin_read ());
+		auto block_transaction (node.store.tx_begin_read ());
+		for (auto i (wallet->store.begin (transaction)), n (wallet->store.end ()); i != n; ++i)
 		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
+			badem::account account (i->first);
+			auto latest (node.ledger.latest (block_transaction, account));
+			std::shared_ptr<badem::block> block;
+			std::vector<badem::block_hash> hashes;
+			while (!latest.is_zero () && hashes.size () < count)
+			{
+				hashes.push_back (latest);
+				block = node.store.block_get (block_transaction, latest);
+				latest = block->previous ();
+			}
+			std::reverse (hashes.begin (), hashes.end ());
+			for (auto & hash : hashes)
+			{
+				block = node.store.block_get (block_transaction, hash);
+				republish_bundle.push_back (std::move (block));
+				boost::property_tree::ptree entry;
+				entry.put ("", hash.to_string ());
+				blocks.push_back (std::make_pair ("", entry));
+			}
+		}
+		node.network.republish_block_batch (republish_bundle, 25);
+		response_l.add_child ("blocks", blocks);
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::wallet_work_get ()
+{
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	if (!ec)
+	{
+		boost::property_tree::ptree works;
+		auto transaction (node.wallets.tx_begin_read ());
+		for (auto i (wallet->store.begin (transaction)), n (wallet->store.end ()); i != n; ++i)
+		{
+			badem::account account (i->first);
+			uint64_t work (0);
+			auto error_work (wallet->store.work_get (transaction, account, work));
+			(void)error_work;
+			works.put (account.to_account (), badem::to_string_hex (work));
+		}
+		response_l.add_child ("works", works);
+	}
+	response_errors ();
+}
+
+void badem::rpc_handler::work_generate ()
+{
+	rpc_control_impl ();
+	auto hash (hash_impl ());
+	if (!ec)
+	{
+		bool use_peers (request.get_optional<bool> ("use_peers") == true);
+		auto rpc_l (shared_from_this ());
+		auto callback = [rpc_l](boost::optional<uint64_t> const & work_a) {
+			if (work_a)
 			{
 				boost::property_tree::ptree response_l;
-				boost::property_tree::ptree works;
-				rai::transaction transaction (node.store.environment, nullptr, false);
-				for (auto i (existing->second->store.begin (transaction)), n (existing->second->store.end ()); i != n; ++i)
-				{
-					rai::account account (i->first.uint256 ());
-					uint64_t work (0);
-					auto error_work (existing->second->store.work_get (transaction, account, work));
-					works.put (account.to_account (), rai::to_string_hex (work));
-				}
-				response_l.add_child ("works", works);
-				response (response_l);
+				response_l.put ("work", badem::to_string_hex (work_a.value ()));
+				rpc_l->response (response_l);
 			}
 			else
 			{
-				error_response (response, "Wallet not found");
+				error_response (rpc_l->response, "Cancelled");
 			}
+		};
+		if (!use_peers)
+		{
+			node.work.generate (hash, callback);
 		}
 		else
 		{
-			error_response (response, "Bad wallet number");
+			node.work_generate (hash, callback);
 		}
 	}
-	else
+	// Because of callback
+	if (ec)
 	{
-		error_response (response, "RPC control is disabled");
+		response_errors ();
 	}
 }
 
-void rai::rpc_handler::work_generate ()
+void badem::rpc_handler::work_cancel ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto hash (hash_impl ());
+	if (!ec)
 	{
-		std::string hash_text (request.get<std::string> ("hash"));
-		bool use_peers (request.get_optional<bool> ("use_peers") == true);
-		rai::block_hash hash;
-		auto error (hash.decode_hex (hash_text));
-		if (!error)
-		{
-			auto rpc_l (shared_from_this ());
-			auto callback = [rpc_l](boost::optional<uint64_t> const & work_a) {
-				if (work_a)
-				{
-					boost::property_tree::ptree response_l;
-					response_l.put ("work", rai::to_string_hex (work_a.value ()));
-					rpc_l->response (response_l);
-				}
-				else
-				{
-					error_response (rpc_l->response, "Cancelled");
-				}
-			};
-			if (!use_peers)
-			{
-				node.work.generate (hash, callback);
-			}
-			else
-			{
-				node.work_generate (hash, callback);
-			}
-		}
-		else
-		{
-			error_response (response, "Bad block hash");
-		}
+		node.work.cancel (hash);
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::work_cancel ()
+void badem::rpc_handler::work_get ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	auto account (account_impl ());
+	if (!ec)
 	{
-		std::string hash_text (request.get<std::string> ("hash"));
-		rai::block_hash hash;
-		auto error (hash.decode_hex (hash_text));
-		if (!error)
+		auto transaction (node.wallets.tx_begin_read ());
+		wallet_account_impl (transaction, wallet, account);
+		if (!ec)
 		{
-			node.work.cancel (hash);
-			boost::property_tree::ptree response_l;
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Bad block hash");
+			uint64_t work (0);
+			auto error_work (wallet->store.work_get (transaction, account, work));
+			(void)error_work;
+			response_l.put ("work", badem::to_string_hex (work));
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::work_get ()
+void badem::rpc_handler::work_set ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	auto wallet (wallet_impl ());
+	auto account (account_impl ());
+	auto work (work_optional_impl ());
+	if (!ec)
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
+		auto transaction (node.wallets.tx_begin_write ());
+		wallet_account_impl (transaction, wallet, account);
+		if (!ec)
 		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
-			{
-				std::string account_text (request.get<std::string> ("account"));
-				rai::account account;
-				auto error (account.decode_account (account_text));
-				if (!error)
-				{
-					rai::transaction transaction (node.store.environment, nullptr, false);
-					auto account_check (existing->second->store.find (transaction, account));
-					if (account_check != existing->second->store.end ())
-					{
-						uint64_t work (0);
-						auto error_work (existing->second->store.work_get (transaction, account, work));
-						boost::property_tree::ptree response_l;
-						response_l.put ("work", rai::to_string_hex (work));
-						response (response_l);
-					}
-					else
-					{
-						error_response (response, "Account not found in wallet");
-					}
-				}
-				else
-				{
-					error_response (response, "Bad account number");
-				}
-			}
-			else
-			{
-				error_response (response, "Wallet not found");
-			}
-		}
-		else
-		{
-			error_response (response, "Bad wallet number");
+			wallet->store.work_put (transaction, account, work);
+			response_l.put ("success", "");
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::work_set ()
+void badem::rpc_handler::work_validate ()
 {
-	if (rpc.config.enable_control)
+	auto hash (hash_impl ());
+	auto work (work_optional_impl ());
+	if (!ec)
 	{
-		std::string wallet_text (request.get<std::string> ("wallet"));
-		rai::uint256_union wallet;
-		auto error (wallet.decode_hex (wallet_text));
-		if (!error)
-		{
-			auto existing (node.wallets.items.find (wallet));
-			if (existing != node.wallets.items.end ())
-			{
-				std::string account_text (request.get<std::string> ("account"));
-				rai::account account;
-				auto error (account.decode_account (account_text));
-				if (!error)
-				{
-					rai::transaction transaction (node.store.environment, nullptr, true);
-					auto account_check (existing->second->store.find (transaction, account));
-					if (account_check != existing->second->store.end ())
-					{
-						std::string work_text (request.get<std::string> ("work"));
-						uint64_t work;
-						auto work_error (rai::from_string_hex (work_text, work));
-						if (!work_error)
-						{
-							existing->second->store.work_put (transaction, account, work);
-							boost::property_tree::ptree response_l;
-							response_l.put ("success", "");
-							response (response_l);
-						}
-						else
-						{
-							error_response (response, "Bad work");
-						}
-					}
-					else
-					{
-						error_response (response, "Account not found in wallet");
-					}
-				}
-				else
-				{
-					error_response (response, "Bad account number");
-				}
-			}
-			else
-			{
-				error_response (response, "Wallet not found");
-			}
-		}
-		else
-		{
-			error_response (response, "Bad wallet number");
-		}
+		auto validate (badem::work_validate (hash, work));
+		response_l.put ("valid", validate ? "0" : "1");
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::work_validate ()
+void badem::rpc_handler::work_peer_add ()
 {
-	std::string hash_text (request.get<std::string> ("hash"));
-	rai::block_hash hash;
-	auto error (hash.decode_hex (hash_text));
-	if (!error)
-	{
-		std::string work_text (request.get<std::string> ("work"));
-		uint64_t work;
-		auto work_error (rai::from_string_hex (work_text, work));
-		if (!work_error)
-		{
-			auto validate (rai::work_validate (hash, work));
-			boost::property_tree::ptree response_l;
-			response_l.put ("valid", validate ? "0" : "1");
-			response (response_l);
-		}
-		else
-		{
-			error_response (response, "Bad work");
-		}
-	}
-	else
-	{
-		error_response (response, "Bad block hash");
-	}
-}
-
-void rai::rpc_handler::work_peer_add ()
-{
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	if (!ec)
 	{
 		std::string address_text = request.get<std::string> ("address");
 		std::string port_text = request.get<std::string> ("port");
 		uint16_t port;
-		if (!rai::parse_port (port_text, port))
+		if (!badem::parse_port (port_text, port))
 		{
 			node.config.work_peers.push_back (std::make_pair (address_text, port));
-			boost::property_tree::ptree response_l;
 			response_l.put ("success", "");
-			response (response_l);
 		}
 		else
 		{
-			error_response (response, "Invalid port");
+			ec = badem::error_common::invalid_port;
 		}
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::work_peers ()
+void badem::rpc_handler::work_peers ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	if (!ec)
 	{
 		boost::property_tree::ptree work_peers_l;
 		for (auto i (node.config.work_peers.begin ()), n (node.config.work_peers.end ()); i != n; ++i)
@@ -4465,55 +4084,53 @@ void rai::rpc_handler::work_peers ()
 			entry.put ("", boost::str (boost::format ("%1%:%2%") % i->first % i->second));
 			work_peers_l.push_back (std::make_pair ("", entry));
 		}
-		boost::property_tree::ptree response_l;
 		response_l.add_child ("work_peers", work_peers_l);
-		response (response_l);
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-void rai::rpc_handler::work_peers_clear ()
+void badem::rpc_handler::work_peers_clear ()
 {
-	if (rpc.config.enable_control)
+	rpc_control_impl ();
+	if (!ec)
 	{
 		node.config.work_peers.clear ();
-		boost::property_tree::ptree response_l;
 		response_l.put ("success", "");
-		response (response_l);
 	}
-	else
-	{
-		error_response (response, "RPC control is disabled");
-	}
+	response_errors ();
 }
 
-rai::rpc_connection::rpc_connection (rai::node & node_a, rai::rpc & rpc_a) :
+badem::rpc_connection::rpc_connection (badem::node & node_a, badem::rpc & rpc_a) :
 node (node_a.shared ()),
 rpc (rpc_a),
-socket (node_a.service)
+socket (node_a.io_ctx)
 {
 	responded.clear ();
 }
 
-void rai::rpc_connection::parse_connection ()
+void badem::rpc_connection::parse_connection ()
 {
 	read ();
 }
 
-void rai::rpc_connection::write_result (std::string body, unsigned version)
+void badem::rpc_connection::prepare_head (unsigned version, boost::beast::http::status status)
+{
+	res.version (version);
+	res.result (status);
+	res.set (boost::beast::http::field::allow, "POST, OPTIONS");
+	res.set (boost::beast::http::field::content_type, "application/json");
+	res.set (boost::beast::http::field::access_control_allow_origin, "*");
+	res.set (boost::beast::http::field::access_control_allow_methods, "POST, OPTIONS");
+	res.set (boost::beast::http::field::access_control_allow_headers, "Accept, Accept-Language, Content-Language, Content-Type");
+	res.set (boost::beast::http::field::connection, "close");
+}
+
+void badem::rpc_connection::write_result (std::string body, unsigned version, boost::beast::http::status status)
 {
 	if (!responded.test_and_set ())
 	{
-		res.set ("Content-Type", "application/json");
-		res.set ("Access-Control-Allow-Origin", "*");
-		res.set ("Access-Control-Allow-Headers", "Accept, Accept-Language, Content-Language, Content-Type");
-		res.set ("Connection", "close");
-		res.result (boost::beast::http::status::ok);
+		prepare_head (version, status);
 		res.body () = body;
-		res.version (version);
 		res.prepare_payload ();
 	}
 	else
@@ -4523,7 +4140,7 @@ void rai::rpc_connection::write_result (std::string body, unsigned version)
 	}
 }
 
-void rai::rpc_connection::read ()
+void badem::rpc_connection::read ()
 {
 	auto this_l (shared_from_this ());
 	boost::beast::http::async_read (socket, buffer, request, [this_l](boost::system::error_code const & ec, size_t bytes_transferred) {
@@ -4532,8 +4149,8 @@ void rai::rpc_connection::read ()
 			this_l->node->background ([this_l]() {
 				auto start (std::chrono::steady_clock::now ());
 				auto version (this_l->request.version ());
-				auto response_handler ([this_l, version, start](boost::property_tree::ptree const & tree_a) {
-
+				std::string request_id (boost::str (boost::format ("%1%") % boost::io::group (std::hex, std::showbase, reinterpret_cast<uintptr_t> (this_l.get ()))));
+				auto response_handler ([this_l, version, start, request_id](boost::property_tree::ptree const & tree_a) {
 					std::stringstream ostream;
 					boost::property_tree::write_json (ostream, tree_a);
 					ostream.flush ();
@@ -4544,17 +4161,31 @@ void rai::rpc_connection::read ()
 
 					if (this_l->node->config.logging.log_rpc ())
 					{
-						BOOST_LOG (this_l->node->log) << boost::str (boost::format ("RPC request %2% completed in: %1% microseconds") % std::chrono::duration_cast<std::chrono::microseconds> (std::chrono::steady_clock::now () - start).count () % boost::io::group (std::hex, std::showbase, reinterpret_cast<uintptr_t> (this_l.get ())));
+						BOOST_LOG (this_l->node->log) << boost::str (boost::format ("RPC request %2% completed in: %1% microseconds") % std::chrono::duration_cast<std::chrono::microseconds> (std::chrono::steady_clock::now () - start).count () % request_id);
 					}
 				});
-				if (this_l->request.method () == boost::beast::http::verb::post)
+				auto method = this_l->request.method ();
+				switch (method)
 				{
-					auto handler (std::make_shared<rai::rpc_handler> (*this_l->node, this_l->rpc, this_l->request.body (), response_handler));
-					handler->process_request ();
-				}
-				else
-				{
-					error_response (response_handler, "Can only POST requests");
+					case boost::beast::http::verb::post:
+					{
+						auto handler (std::make_shared<badem::rpc_handler> (*this_l->node, this_l->rpc, this_l->request.body (), request_id, response_handler));
+						handler->process_request ();
+						break;
+					}
+					case boost::beast::http::verb::options:
+					{
+						this_l->prepare_head (version);
+						this_l->res.prepare_payload ();
+						boost::beast::http::async_write (this_l->socket, this_l->res, [this_l](boost::system::error_code const & ec, size_t bytes_transferred) {
+						});
+						break;
+					}
+					default:
+					{
+						error_response (response_handler, "Can only POST requests");
+						break;
+					}
 				}
 			});
 		}
@@ -4567,470 +4198,555 @@ void rai::rpc_connection::read ()
 
 namespace
 {
-void reprocess_body (std::string & body, boost::property_tree::ptree & tree_a)
+std::string filter_request (boost::property_tree::ptree tree_a)
 {
+	// Replace password
+	boost::optional<std::string> password_text (tree_a.get_optional<std::string> ("password"));
+	if (password_text.is_initialized ())
+	{
+		tree_a.put ("password", "password");
+	}
+	// Save first 2 symbols of wallet, key, seed
+	boost::optional<std::string> wallet_text (tree_a.get_optional<std::string> ("wallet"));
+	if (wallet_text.is_initialized () && wallet_text.get ().length () > 2)
+	{
+		tree_a.put ("wallet", wallet_text.get ().replace (wallet_text.get ().begin () + 2, wallet_text.get ().end (), wallet_text.get ().length () - 2, 'X'));
+	}
+	boost::optional<std::string> key_text (tree_a.get_optional<std::string> ("key"));
+	if (key_text.is_initialized () && key_text.get ().length () > 2)
+	{
+		tree_a.put ("key", key_text.get ().replace (key_text.get ().begin () + 2, key_text.get ().end (), key_text.get ().length () - 2, 'X'));
+	}
+	boost::optional<std::string> seed_text (tree_a.get_optional<std::string> ("seed"));
+	if (seed_text.is_initialized () && seed_text.get ().length () > 2)
+	{
+		tree_a.put ("seed", seed_text.get ().replace (seed_text.get ().begin () + 2, seed_text.get ().end (), seed_text.get ().length () - 2, 'X'));
+	}
+	std::string result;
 	std::stringstream stream;
-	boost::property_tree::write_json (stream, tree_a);
-	body = stream.str ();
+	boost::property_tree::write_json (stream, tree_a, false);
+	result = stream.str ();
+	// removing std::endl
+	if (result.length () > 1)
+	{
+		result.pop_back ();
+	}
+	return result;
 }
 }
 
-void rai::rpc_handler::process_request ()
+void badem::rpc_handler::process_request ()
 {
 	try
 	{
-		std::stringstream istream (body);
-		boost::property_tree::read_json (istream, request);
-		std::string action (request.get<std::string> ("action"));
-		if (action == "password_enter")
-		{
-			password_enter ();
-			request.erase ("password");
-			reprocess_body (body, request);
-		}
-		else if (action == "password_change")
-		{
-			password_change ();
-			request.erase ("password");
-			reprocess_body (body, request);
-		}
-		else if (action == "wallet_unlock")
-		{
-			password_enter ();
-			request.erase ("password");
-			reprocess_body (body, request);
-		}
-		if (node.config.logging.log_rpc ())
-		{
-			BOOST_LOG (node.log) << body;
-		}
-		if (action == "account_balance")
-		{
-			account_balance ();
-		}
-		else if (action == "account_block_count")
-		{
-			account_block_count ();
-		}
-		else if (action == "account_count")
-		{
-			account_count ();
-		}
-		else if (action == "account_create")
-		{
-			account_create ();
-		}
-		else if (action == "account_get")
-		{
-			account_get ();
-		}
-		else if (action == "account_history")
-		{
-			account_history ();
-		}
-		else if (action == "account_info")
-		{
-			account_info ();
-		}
-		else if (action == "account_key")
-		{
-			account_key ();
-		}
-		else if (action == "account_list")
-		{
-			account_list ();
-		}
-		else if (action == "account_move")
-		{
-			account_move ();
-		}
-		else if (action == "account_remove")
-		{
-			account_remove ();
-		}
-		else if (action == "account_representative")
-		{
-			account_representative ();
-		}
-		else if (action == "account_representative_set")
-		{
-			account_representative_set ();
-		}
-		else if (action == "account_weight")
-		{
-			account_weight ();
-		}
-		else if (action == "accounts_balances")
-		{
-			accounts_balances ();
-		}
-		else if (action == "accounts_create")
-		{
-			accounts_create ();
-		}
-		else if (action == "accounts_frontiers")
-		{
-			accounts_frontiers ();
-		}
-		else if (action == "accounts_pending")
-		{
-			accounts_pending ();
-		}
-		else if (action == "available_supply")
-		{
-			available_supply ();
-		}
-		else if (action == "block")
-		{
-			block ();
-		}
-		else if (action == "block_confirm")
-		{
-			block_confirm ();
-		}
-		else if (action == "blocks")
-		{
-			blocks ();
-		}
-		else if (action == "blocks_info")
-		{
-			blocks_info ();
-		}
-		else if (action == "block_account")
-		{
-			block_account ();
-		}
-		else if (action == "block_count")
-		{
-			block_count ();
-		}
-		else if (action == "block_count_type")
-		{
-			block_count_type ();
-		}
-		else if (action == "block_create")
-		{
-			block_create ();
-		}
-		else if (action == "block_hash")
-		{
-			block_hash ();
-		}
-		else if (action == "successors")
-		{
-			successors ();
-		}
-		else if (action == "bootstrap")
-		{
-			bootstrap ();
-		}
-		else if (action == "bootstrap_any")
-		{
-			bootstrap_any ();
-		}
-		else if (action == "chain")
-		{
-			chain ();
-		}
-		else if (action == "delegators")
-		{
-			delegators ();
-		}
-		else if (action == "delegators_count")
-		{
-			delegators_count ();
-		}
-		else if (action == "deterministic_key")
-		{
-			deterministic_key ();
-		}
-		else if (action == "confirmation_history")
-		{
-			confirmation_history ();
-		}
-		else if (action == "frontiers")
-		{
-			frontiers ();
-		}
-		else if (action == "frontier_count")
-		{
-			account_count ();
-		}
-		else if (action == "history")
-		{
-			request.put ("head", request.get<std::string> ("hash"));
-			account_history ();
-		}
-		else if (action == "keepalive")
-		{
-			keepalive ();
-		}
-		else if (action == "key_create")
-		{
-			key_create ();
-		}
-		else if (action == "key_expand")
-		{
-			key_expand ();
-		}
-		else if (action == "bademcik_from_raw")
-		{
-			bademcik_from_raw ();
-		}
-		else if (action == "bademcik_to_raw")
-		{
-			bademcik_to_raw ();
-		}
-		else if (action == "ledger")
-		{
-			ledger ();
-		}
-		else if (action == "bdm_from_raw")
-		{
-			bdm_from_raw ();
-		}
-		else if (action == "bdm_to_raw")
-		{
-			bdm_to_raw ();
-		}
-		else if (action == "password_change")
-		{
-			// Processed before logging
-		}
-		else if (action == "password_enter")
-		{
-			// Processed before logging
-		}
-		else if (action == "password_valid")
-		{
-			password_valid ();
-		}
-		else if (action == "payment_begin")
-		{
-			payment_begin ();
-		}
-		else if (action == "payment_init")
-		{
-			payment_init ();
-		}
-		else if (action == "payment_end")
-		{
-			payment_end ();
-		}
-		else if (action == "payment_wait")
-		{
-			payment_wait ();
-		}
-		else if (action == "peers")
-		{
-			peers ();
-		}
-		else if (action == "pending")
-		{
-			pending ();
-		}
-		else if (action == "pending_exists")
-		{
-			pending_exists ();
-		}
-		else if (action == "process")
-		{
-			process ();
-		}
-		else if (action == "raw_from_raw")
-		{
-			raw_from_raw ();
-		}
-		else if (action == "raw_to_raw")
-		{
-			raw_to_raw ();
-		}
-		else if (action == "receive")
-		{
-			receive ();
-		}
-		else if (action == "receive_minimum")
-		{
-			receive_minimum ();
-		}
-		else if (action == "receive_minimum_set")
-		{
-			receive_minimum_set ();
-		}
-		else if (action == "representatives")
-		{
-			representatives ();
-		}
-		else if (action == "representatives_online")
-		{
-			representatives_online ();
-		}
-		else if (action == "republish")
-		{
-			republish ();
-		}
-		else if (action == "search_pending")
-		{
-			search_pending ();
-		}
-		else if (action == "search_pending_all")
-		{
-			search_pending_all ();
-		}
-		else if (action == "send")
-		{
-			send ();
-		}
-		else if (action == "stats")
-		{
-			stats ();
-		}
-		else if (action == "stop")
-		{
-			stop ();
-		}
-		else if (action == "unchecked")
-		{
-			unchecked ();
-		}
-		else if (action == "unchecked_clear")
-		{
-			unchecked_clear ();
-		}
-		else if (action == "unchecked_get")
-		{
-			unchecked_get ();
-		}
-		else if (action == "unchecked_keys")
-		{
-			unchecked_keys ();
-		}
-		else if (action == "validate_account_number")
-		{
-			validate_account_number ();
-		}
-		else if (action == "version")
-		{
-			version ();
-		}
-		else if (action == "wallet_add")
-		{
-			wallet_add ();
-		}
-		else if (action == "wallet_add_watch")
-		{
-			wallet_add_watch ();
-		}
-		else if (action == "wallet_balance_total")
-		{
-			wallet_balance_total ();
-		}
-		else if (action == "wallet_balances")
-		{
-			wallet_balances ();
-		}
-		else if (action == "wallet_change_seed")
-		{
-			wallet_change_seed ();
-		}
-		else if (action == "wallet_contains")
-		{
-			wallet_contains ();
-		}
-		else if (action == "wallet_create")
-		{
-			wallet_create ();
-		}
-		else if (action == "wallet_destroy")
-		{
-			wallet_destroy ();
-		}
-		else if (action == "wallet_export")
-		{
-			wallet_export ();
-		}
-		else if (action == "wallet_frontiers")
-		{
-			wallet_frontiers ();
-		}
-		else if (action == "wallet_key_valid")
-		{
-			wallet_key_valid ();
-		}
-		else if (action == "wallet_ledger")
-		{
-			wallet_ledger ();
-		}
-		else if (action == "wallet_lock")
-		{
-			wallet_lock ();
-		}
-		else if (action == "wallet_locked")
-		{
-			password_valid (true);
-		}
-		else if (action == "wallet_pending")
-		{
-			wallet_pending ();
-		}
-		else if (action == "wallet_representative")
-		{
-			wallet_representative ();
-		}
-		else if (action == "wallet_representative_set")
-		{
-			wallet_representative_set ();
-		}
-		else if (action == "wallet_republish")
-		{
-			wallet_republish ();
-		}
-		else if (action == "wallet_unlock")
-		{
-			// Processed before logging
-		}
-		else if (action == "wallet_work_get")
-		{
-			wallet_work_get ();
-		}
-		else if (action == "work_generate")
-		{
-			work_generate ();
-		}
-		else if (action == "work_cancel")
-		{
-			work_cancel ();
-		}
-		else if (action == "work_get")
-		{
-			work_get ();
-		}
-		else if (action == "work_set")
-		{
-			work_set ();
-		}
-		else if (action == "work_validate")
-		{
-			work_validate ();
-		}
-		else if (action == "work_peer_add")
-		{
-			work_peer_add ();
-		}
-		else if (action == "work_peers")
-		{
-			work_peers ();
-		}
-		else if (action == "work_peers_clear")
-		{
-			work_peers_clear ();
+		auto max_depth_exceeded (false);
+		auto max_depth_possible (0);
+		for (auto ch : body)
+		{
+			if (ch == '[' || ch == '{')
+			{
+				if (max_depth_possible >= rpc.config.max_json_depth)
+				{
+					max_depth_exceeded = true;
+					break;
+				}
+				++max_depth_possible;
+			}
+		}
+		if (max_depth_exceeded)
+		{
+			error_response (response, "Max JSON depth exceeded");
 		}
 		else
 		{
-			error_response (response, "Unknown command");
+			std::stringstream istream (body);
+			boost::property_tree::read_json (istream, request);
+			std::string action (request.get<std::string> ("action"));
+			if (node.config.logging.log_rpc ())
+			{
+				BOOST_LOG (node.log) << boost::str (boost::format ("%1% ") % request_id) << filter_request (request);
+			}
+			if (action == "account_balance")
+			{
+				account_balance ();
+			}
+			else if (action == "account_block_count")
+			{
+				account_block_count ();
+			}
+			else if (action == "account_count")
+			{
+				account_count ();
+			}
+			else if (action == "account_create")
+			{
+				account_create ();
+			}
+			else if (action == "account_get")
+			{
+				account_get ();
+			}
+			else if (action == "account_history")
+			{
+				account_history ();
+			}
+			else if (action == "account_info")
+			{
+				account_info ();
+			}
+			else if (action == "account_key")
+			{
+				account_key ();
+			}
+			else if (action == "account_list")
+			{
+				account_list ();
+			}
+			else if (action == "account_move")
+			{
+				account_move ();
+			}
+			else if (action == "account_remove")
+			{
+				account_remove ();
+			}
+			else if (action == "account_representative")
+			{
+				account_representative ();
+			}
+			else if (action == "account_representative_set")
+			{
+				account_representative_set ();
+			}
+			else if (action == "account_weight")
+			{
+				account_weight ();
+			}
+			else if (action == "accounts_balances")
+			{
+				accounts_balances ();
+			}
+			else if (action == "accounts_create")
+			{
+				accounts_create ();
+			}
+			else if (action == "accounts_frontiers")
+			{
+				accounts_frontiers ();
+			}
+			else if (action == "accounts_pending")
+			{
+				accounts_pending ();
+			}
+			else if (action == "available_supply")
+			{
+				available_supply ();
+			}
+			else if (action == "block")
+			{
+				block_info ();
+			}
+			else if (action == "block_info")
+			{
+				block_info ();
+			}
+			else if (action == "block_confirm")
+			{
+				block_confirm ();
+			}
+			else if (action == "blocks")
+			{
+				blocks ();
+			}
+			else if (action == "blocks_info")
+			{
+				blocks_info ();
+			}
+			else if (action == "block_account")
+			{
+				block_account ();
+			}
+			else if (action == "block_count")
+			{
+				block_count ();
+			}
+			else if (action == "block_count_type")
+			{
+				block_count_type ();
+			}
+			else if (action == "block_create")
+			{
+				block_create ();
+			}
+			else if (action == "block_hash")
+			{
+				block_hash ();
+			}
+			else if (action == "successors")
+			{
+				chain (true);
+			}
+			else if (action == "bootstrap")
+			{
+				bootstrap ();
+			}
+			else if (action == "bootstrap_any")
+			{
+				bootstrap_any ();
+			}
+			else if (action == "bootstrap_lazy")
+			{
+				bootstrap_lazy ();
+			}
+			else if (action == "bootstrap_status")
+			{
+				bootstrap_status ();
+			}
+			else if (action == "chain")
+			{
+				chain ();
+			}
+			else if (action == "delegators")
+			{
+				delegators ();
+			}
+			else if (action == "delegators_count")
+			{
+				delegators_count ();
+			}
+			else if (action == "deterministic_key")
+			{
+				deterministic_key ();
+			}
+			else if (action == "confirmation_active")
+			{
+				confirmation_active ();
+			}
+			else if (action == "confirmation_history")
+			{
+				confirmation_history ();
+			}
+			else if (action == "confirmation_info")
+			{
+				confirmation_info ();
+			}
+			else if (action == "confirmation_quorum")
+			{
+				confirmation_quorum ();
+			}
+			else if (action == "frontiers")
+			{
+				frontiers ();
+			}
+			else if (action == "frontier_count")
+			{
+				account_count ();
+			}
+			else if (action == "history")
+			{
+				request.put ("head", request.get<std::string> ("hash"));
+				account_history ();
+			}
+			else if (action == "keepalive")
+			{
+				keepalive ();
+			}
+			else if (action == "key_create")
+			{
+				key_create ();
+			}
+			else if (action == "key_expand")
+			{
+				key_expand ();
+			}
+			else if (action == "kbadem_from_raw" || action == "bademcik_from_raw")
+			{
+				mbadem_from_raw (badem::bademcik_ratio);
+			}
+			else if (action == "kbadem_to_raw" || action == "bademcik_from_raw")
+			{
+				mbadem_to_raw (badem::bademcik_ratio);
+			}
+			else if (action == "ledger")
+			{
+				ledger ();
+			}
+			else if (action == "mbadem_from_raw" || action == "bdm_from_raw")
+			{
+				mbadem_from_raw ();
+			}
+			else if (action == "mbadem_to_raw" || action == "bdm_to_raw")
+			{
+				mbadem_to_raw ();
+			}
+			else if (action == "node_id")
+			{
+				node_id ();
+			}
+			else if (action == "node_id_delete")
+			{
+				node_id_delete ();
+			}
+			else if (action == "password_change")
+			{
+				password_change ();
+			}
+			else if (action == "password_enter")
+			{
+				password_enter ();
+			}
+			else if (action == "password_valid")
+			{
+				password_valid ();
+			}
+			else if (action == "payment_begin")
+			{
+				payment_begin ();
+			}
+			else if (action == "payment_init")
+			{
+				payment_init ();
+			}
+			else if (action == "payment_end")
+			{
+				payment_end ();
+			}
+			else if (action == "payment_wait")
+			{
+				payment_wait ();
+			}
+			else if (action == "peers")
+			{
+				peers ();
+			}
+			else if (action == "pending")
+			{
+				pending ();
+			}
+			else if (action == "pending_exists")
+			{
+				pending_exists ();
+			}
+			else if (action == "process")
+			{
+				process ();
+			}
+			else if (action == "badem_from_raw" || action == "bdm_from_raw")
+			{
+				mbadem_from_raw (badem::bdm_ratio);
+			}
+			else if (action == "badem_to_raw" || action == "bdm_to_raw")
+			{
+				mbadem_to_raw (badem::bdm_ratio);
+			}
+			else if (action == "receive")
+			{
+				receive ();
+			}
+			else if (action == "receive_minimum")
+			{
+				receive_minimum ();
+			}
+			else if (action == "receive_minimum_set")
+			{
+				receive_minimum_set ();
+			}
+			else if (action == "representatives")
+			{
+				representatives ();
+			}
+			else if (action == "representatives_online")
+			{
+				representatives_online ();
+			}
+			else if (action == "republish")
+			{
+				republish ();
+			}
+			else if (action == "search_pending")
+			{
+				search_pending ();
+			}
+			else if (action == "search_pending_all")
+			{
+				search_pending_all ();
+			}
+			else if (action == "send")
+			{
+				send ();
+			}
+			else if (action == "sign")
+			{
+				sign ();
+			}
+			else if (action == "stats")
+			{
+				stats ();
+			}
+			else if (action == "stats_clear")
+			{
+				stats_clear ();
+			}
+			else if (action == "stop")
+			{
+				stop ();
+			}
+			else if (action == "unchecked")
+			{
+				unchecked ();
+			}
+			else if (action == "unchecked_clear")
+			{
+				unchecked_clear ();
+			}
+			else if (action == "unchecked_get")
+			{
+				unchecked_get ();
+			}
+			else if (action == "unchecked_keys")
+			{
+				unchecked_keys ();
+			}
+			else if (action == "uptime")
+			{
+				uptime ();
+			}
+			else if (action == "validate_account_number")
+			{
+				validate_account_number ();
+			}
+			else if (action == "version")
+			{
+				version ();
+			}
+			else if (action == "wallet_add")
+			{
+				wallet_add ();
+			}
+			else if (action == "wallet_add_watch")
+			{
+				wallet_add_watch ();
+			}
+			// Obsolete
+			else if (action == "wallet_balance_total")
+			{
+				wallet_info ();
+			}
+			else if (action == "wallet_balances")
+			{
+				wallet_balances ();
+			}
+			else if (action == "wallet_change_seed")
+			{
+				wallet_change_seed ();
+			}
+			else if (action == "wallet_contains")
+			{
+				wallet_contains ();
+			}
+			else if (action == "wallet_create")
+			{
+				wallet_create ();
+			}
+			else if (action == "wallet_destroy")
+			{
+				wallet_destroy ();
+			}
+			else if (action == "wallet_export")
+			{
+				wallet_export ();
+			}
+			else if (action == "wallet_frontiers")
+			{
+				wallet_frontiers ();
+			}
+			else if (action == "wallet_history")
+			{
+				wallet_history ();
+			}
+			else if (action == "wallet_info")
+			{
+				wallet_info ();
+			}
+			else if (action == "wallet_key_valid")
+			{
+				wallet_key_valid ();
+			}
+			else if (action == "wallet_ledger")
+			{
+				wallet_ledger ();
+			}
+			else if (action == "wallet_lock")
+			{
+				wallet_lock ();
+			}
+			else if (action == "wallet_locked")
+			{
+				password_valid (true);
+			}
+			else if (action == "wallet_pending")
+			{
+				wallet_pending ();
+			}
+			else if (action == "wallet_representative")
+			{
+				wallet_representative ();
+			}
+			else if (action == "wallet_representative_set")
+			{
+				wallet_representative_set ();
+			}
+			else if (action == "wallet_republish")
+			{
+				wallet_republish ();
+			}
+			else if (action == "wallet_unlock")
+			{
+				password_enter ();
+			}
+			else if (action == "wallet_work_get")
+			{
+				wallet_work_get ();
+			}
+			else if (action == "work_generate")
+			{
+				work_generate ();
+			}
+			else if (action == "work_cancel")
+			{
+				work_cancel ();
+			}
+			else if (action == "work_get")
+			{
+				work_get ();
+			}
+			else if (action == "work_set")
+			{
+				work_set ();
+			}
+			else if (action == "work_validate")
+			{
+				work_validate ();
+			}
+			else if (action == "work_peer_add")
+			{
+				work_peer_add ();
+			}
+			else if (action == "work_peers")
+			{
+				work_peers ();
+			}
+			else if (action == "work_peers_clear")
+			{
+				work_peers_clear ();
+			}
+			else
+			{
+				error_response (response, "Unknown command");
+			}
 		}
 	}
-	catch (std::runtime_error const & err)
+	catch (std::runtime_error const &)
 	{
 		error_response (response, "Unable to parse JSON");
 	}
@@ -5040,7 +4756,7 @@ void rai::rpc_handler::process_request ()
 	}
 }
 
-rai::payment_observer::payment_observer (std::function<void(boost::property_tree::ptree const &)> const & response_a, rai::rpc & rpc_a, rai::account const & account_a, rai::amount const & amount_a) :
+badem::payment_observer::payment_observer (std::function<void(boost::property_tree::ptree const &)> const & response_a, badem::rpc & rpc_a, badem::account const & account_a, badem::amount const & amount_a) :
 rpc (rpc_a),
 account (account_a),
 amount (amount_a),
@@ -5049,27 +4765,27 @@ response (response_a)
 	completed.clear ();
 }
 
-void rai::payment_observer::start (uint64_t timeout)
+void badem::payment_observer::start (uint64_t timeout)
 {
 	auto this_l (shared_from_this ());
 	rpc.node.alarm.add (std::chrono::steady_clock::now () + std::chrono::milliseconds (timeout), [this_l]() {
-		this_l->complete (rai::payment_status::nothing);
+		this_l->complete (badem::payment_status::nothing);
 	});
 }
 
-rai::payment_observer::~payment_observer ()
+badem::payment_observer::~payment_observer ()
 {
 }
 
-void rai::payment_observer::observe ()
+void badem::payment_observer::observe ()
 {
 	if (rpc.node.balance (account) >= amount.number ())
 	{
-		complete (rai::payment_status::success);
+		complete (badem::payment_status::success);
 	}
 }
 
-void rai::payment_observer::complete (rai::payment_status status)
+void badem::payment_observer::complete (badem::payment_status status)
 {
 	auto already (completed.test_and_set ());
 	if (!already)
@@ -5080,14 +4796,14 @@ void rai::payment_observer::complete (rai::payment_status status)
 		}
 		switch (status)
 		{
-			case rai::payment_status::nothing:
+			case badem::payment_status::nothing:
 			{
 				boost::property_tree::ptree response_l;
 				response_l.put ("status", "nothing");
 				response (response_l);
 				break;
 			}
-			case rai::payment_status::success:
+			case badem::payment_status::success:
 			{
 				boost::property_tree::ptree response_l;
 				response_l.put ("status", "success");
@@ -5106,22 +4822,49 @@ void rai::payment_observer::complete (rai::payment_status status)
 	}
 }
 
-std::unique_ptr<rai::rpc> rai::get_rpc (boost::asio::io_service & service_a, rai::node & node_a, rai::rpc_config const & config_a)
+std::unique_ptr<badem::rpc> badem::get_rpc (boost::asio::io_context & io_ctx_a, badem::node & node_a, badem::rpc_config const & config_a)
 {
 	std::unique_ptr<rpc> impl;
 
 	if (config_a.secure.enable)
 	{
 #ifdef BADEM_SECURE_RPC
-		impl.reset (new rpc_secure (service_a, node_a, config_a));
+		impl.reset (new rpc_secure (io_ctx_a, node_a, config_a));
 #else
 		std::cerr << "RPC configured for TLS, but the node is not compiled with TLS support" << std::endl;
 #endif
 	}
 	else
 	{
-		impl.reset (new rpc (service_a, node_a, config_a));
+		impl.reset (new rpc (io_ctx_a, node_a, config_a));
 	}
 
 	return impl;
+}
+
+namespace
+{
+void construct_json (badem::seq_con_info_component * component, boost::property_tree::ptree & parent)
+{
+	// We are a leaf node, print name and exit
+	if (!component->is_composite ())
+	{
+		auto & leaf_info = static_cast<badem::seq_con_info_leaf *> (component)->get_info ();
+		boost::property_tree::ptree child;
+		child.put ("count", leaf_info.count);
+		child.put ("size", leaf_info.count * leaf_info.sizeof_element);
+		parent.add_child (leaf_info.name, child);
+		return;
+	}
+
+	auto composite = static_cast<badem::seq_con_info_composite *> (component);
+
+	boost::property_tree::ptree current;
+	for (auto & child : composite->get_children ())
+	{
+		construct_json (child.get (), current);
+	}
+
+	parent.add_child (composite->get_name (), current);
+}
 }

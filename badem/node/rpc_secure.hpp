@@ -3,18 +3,18 @@
 #include <boost/asio/ssl/stream.hpp>
 #include <badem/node/rpc.hpp>
 
-namespace rai
+namespace badem
 {
 /**
- * Specialization of rai::rpc with TLS support
+ * Specialization of badem::rpc with TLS support
  */
 class rpc_secure : public rpc
 {
 public:
-	rpc_secure (boost::asio::io_service & service_a, rai::node & node_a, rai::rpc_config const & config_a);
+	rpc_secure (boost::asio::io_service & service_a, badem::node & node_a, badem::rpc_config const & config_a);
 
 	/** Starts accepting connections */
-	virtual void accept () override;
+	void accept () override;
 
 	/** Installs the server certificate, key and DH, and optionally sets up client certificate verification */
 	void load_certs (boost::asio::ssl::context & ctx);
@@ -30,15 +30,15 @@ public:
 };
 
 /**
- * Specialization of rai::rpc_connection for establishing TLS connections.
+ * Specialization of badem::rpc_connection for establishing TLS connections.
  * Handshakes with client certificates are supported.
  */
 class rpc_connection_secure : public rpc_connection
 {
 public:
-	rpc_connection_secure (rai::node &, rai::rpc_secure &);
-	virtual void parse_connection () override;
-	virtual void read () override;
+	rpc_connection_secure (badem::node &, badem::rpc_secure &);
+	void parse_connection () override;
+	void read () override;
 	/** The TLS handshake callback */
 	void handle_handshake (const boost::system::error_code & error);
 	/** The TLS async shutdown callback */

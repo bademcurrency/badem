@@ -1,7 +1,7 @@
 #pragma once
 #include <array>
 
-namespace rai
+namespace badem
 {
 class xorshift1024star
 {

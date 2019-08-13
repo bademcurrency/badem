@@ -1,11 +1,11 @@
 #include <badem/node/node.hpp>
 #include <badem/node/rpc_secure.hpp>
 
-bool rai::rpc_secure::on_verify_certificate (bool preverified, boost::asio::ssl::verify_context & ctx)
+bool badem::rpc_secure::on_verify_certificate (bool preverified, boost::asio::ssl::verify_context & ctx)
 {
 	X509_STORE_CTX * cts = ctx.native_handle ();
-
-	switch (cts->error)
+	auto error (X509_STORE_CTX_get_error (cts));
+	switch (error)
 	{
 		case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT:
 			BOOST_LOG (node.log) << "TLS: Unable to get issuer";
@@ -36,9 +36,9 @@ bool rai::rpc_secure::on_verify_certificate (bool preverified, boost::asio::ssl:
 
 	if (config.secure.verbose_logging)
 	{
-		if (cts->error != 0)
+		if (error != 0)
 		{
-			BOOST_LOG (node.log) << "TLS: Error: " << cts->error;
+			BOOST_LOG (node.log) << "TLS: Error: " << X509_verify_cert_error_string (error);
 			BOOST_LOG (node.log) << "TLS: Error chain depth : " << X509_STORE_CTX_get_error_depth (cts);
 		}
 
@@ -56,7 +56,7 @@ bool rai::rpc_secure::on_verify_certificate (bool preverified, boost::asio::ssl:
 	return preverified;
 }
 
-void rai::rpc_secure::load_certs (boost::asio::ssl::context & context_a)
+void badem::rpc_secure::load_certs (boost::asio::ssl::context & context_a)
 {
 	// This is called if the key is password protected
 	context_a.set_password_callback (
@@ -82,24 +82,29 @@ void rai::rpc_secure::load_certs (boost::asio::ssl::context & context_a)
 	{
 		context_a.set_verify_mode (boost::asio::ssl::verify_fail_if_no_peer_cert | boost::asio::ssl::verify_peer);
 		context_a.add_verify_path (config.secure.client_certs_path);
-		context_a.set_verify_callback (boost::bind (&rai::rpc_secure::on_verify_certificate, this, _1, _2));
+		context_a.set_verify_callback ([this](auto preverified, auto & ctx) {
+			return this->on_verify_certificate (preverified, ctx);
+		});
 	}
 }
 
-rai::rpc_secure::rpc_secure (boost::asio::io_service & service_a, rai::node & node_a, rai::rpc_config const & config_a) :
+badem::rpc_secure::rpc_secure (boost::asio::io_service & service_a, badem::node & node_a, badem::rpc_config const & config_a) :
 rpc (service_a, node_a, config_a),
 ssl_context (boost::asio::ssl::context::tlsv12_server)
 {
 	load_certs (ssl_context);
 }
 
-void rai::rpc_secure::accept ()
+void badem::rpc_secure::accept ()
 {
-	auto connection (std::make_shared<rai::rpc_connection_secure> (node, *this));
+	auto connection (std::make_shared<badem::rpc_connection_secure> (node, *this));
 	acceptor.async_accept (connection->socket, [this, connection](boost::system::error_code const & ec) {
-		if (!ec)
+		if (acceptor.is_open ())
 		{
 			accept ();
+		}
+		if (!ec)
+		{
 			connection->parse_connection ();
 		}
 		else
@@ -109,29 +114,29 @@ void rai::rpc_secure::accept ()
 	});
 }
 
-rai::rpc_connection_secure::rpc_connection_secure (rai::node & node_a, rai::rpc_secure & rpc_a) :
-rai::rpc_connection (node_a, rpc_a),
+badem::rpc_connection_secure::rpc_connection_secure (badem::node & node_a, badem::rpc_secure & rpc_a) :
+badem::rpc_connection (node_a, rpc_a),
 stream (socket, rpc_a.ssl_context)
 {
 }
 
-void rai::rpc_connection_secure::parse_connection ()
+void badem::rpc_connection_secure::parse_connection ()
 {
 	// Perform the SSL handshake
+	auto this_l = std::static_pointer_cast<badem::rpc_connection_secure> (shared_from_this ());
 	stream.async_handshake (boost::asio::ssl::stream_base::server,
-	std::bind (
-	&rai::rpc_connection_secure::handle_handshake,
-	std::static_pointer_cast<rai::rpc_connection_secure> (shared_from_this ()),
-	std::placeholders::_1));
+	[this_l](auto & ec) {
+		this_l->handle_handshake (ec);
+	});
 }
 
-void rai::rpc_connection_secure::on_shutdown (const boost::system::error_code & error)
+void badem::rpc_connection_secure::on_shutdown (const boost::system::error_code & error)
 {
 	// No-op. We initiate the shutdown (since the RPC server kills the connection after each request)
 	// and we'll thus get an expected EOF error. If the client disconnects, a short-read error will be expected.
 }
 
-void rai::rpc_connection_secure::handle_handshake (const boost::system::error_code & error)
+void badem::rpc_connection_secure::handle_handshake (const boost::system::error_code & error)
 {
 	if (!error)
 	{
@@ -143,46 +148,65 @@ void rai::rpc_connection_secure::handle_handshake (const boost::system::error_co
 	}
 }
 
-void rai::rpc_connection_secure::read ()
+void badem::rpc_connection_secure::read ()
 {
-	auto this_l (std::static_pointer_cast<rai::rpc_connection_secure> (shared_from_this ()));
+	auto this_l (std::static_pointer_cast<badem::rpc_connection_secure> (shared_from_this ()));
 	boost::beast::http::async_read (stream, buffer, request, [this_l](boost::system::error_code const & ec, size_t bytes_transferred) {
 		if (!ec)
 		{
 			this_l->node->background ([this_l]() {
 				auto start (std::chrono::steady_clock::now ());
 				auto version (this_l->request.version ());
-				auto response_handler ([this_l, version, start](boost::property_tree::ptree const & tree_a) {
+				std::string request_id (boost::str (boost::format ("%1%") % boost::io::group (std::hex, std::showbase, reinterpret_cast<uintptr_t> (this_l.get ()))));
+				auto response_handler ([this_l, version, start, request_id](boost::property_tree::ptree const & tree_a) {
 					std::stringstream ostream;
 					boost::property_tree::write_json (ostream, tree_a);
 					ostream.flush ();
 					auto body (ostream.str ());
 					this_l->write_result (body, version);
 					boost::beast::http::async_write (this_l->stream, this_l->res, [this_l](boost::system::error_code const & ec, size_t bytes_transferred) {
-
 						// Perform the SSL shutdown
-						this_l->stream.async_shutdown (
-						std::bind (
-						&rai::rpc_connection_secure::on_shutdown,
-						this_l,
-						std::placeholders::_1));
-
+						this_l->stream.async_shutdown ([this_l](auto const & ec_shutdown) {
+							this_l->on_shutdown (ec_shutdown);
+						});
 					});
 
 					if (this_l->node->config.logging.log_rpc ())
 					{
-						BOOST_LOG (this_l->node->log) << boost::str (boost::format ("TLS: RPC request %2% completed in: %1% microseconds") % std::chrono::duration_cast<std::chrono::microseconds> (std::chrono::steady_clock::now () - start).count () % boost::io::group (std::hex, std::showbase, reinterpret_cast<uintptr_t> (this_l.get ())));
+						BOOST_LOG (this_l->node->log) << boost::str (boost::format ("TLS: RPC request %2% completed in: %1% microseconds") % std::chrono::duration_cast<std::chrono::microseconds> (std::chrono::steady_clock::now () - start).count () % request_id);
 					}
 				});
+				auto method = this_l->request.method ();
+				switch (method)
+				{
+					case boost::beast::http::verb::post:
+					{
+						auto handler (std::make_shared<badem::rpc_handler> (*this_l->node, this_l->rpc, this_l->request.body (), request_id, response_handler));
+						handler->process_request ();
+						break;
+					}
+					case boost::beast::http::verb::options:
+					{
+						this_l->prepare_head (version);
+						this_l->res.set (boost::beast::http::field::allow, "POST, OPTIONS");
+						this_l->res.prepare_payload ();
+						boost::beast::http::async_write (this_l->stream, this_l->res, [this_l](boost::system::error_code const & ec, size_t bytes_transferred) {
 
-				if (this_l->request.method () == boost::beast::http::verb::post)
-				{
-					auto handler (std::make_shared<rai::rpc_handler> (*this_l->node, this_l->rpc, this_l->request.body (), response_handler));
-					handler->process_request ();
-				}
-				else
-				{
-					error_response (response_handler, "Can only POST requests");
+							// Perform the SSL shutdown
+							this_l->stream.async_shutdown (
+							std::bind (
+							&badem::rpc_connection_secure::on_shutdown,
+							this_l,
+							std::placeholders::_1));
+
+						});
+						break;
+					}
+					default:
+					{
+						error_response (response_handler, "Can only POST requests");
+						break;
+					}
 				}
 			});
 		}

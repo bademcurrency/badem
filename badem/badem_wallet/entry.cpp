@@ -1,11 +1,14 @@
-#include <badem/qt/qt.hpp>
-
-#include <badem/icon.hpp>
+#include <badem/lib/errors.hpp>
+#include <badem/lib/jsonconfig.hpp>
+#include <badem/lib/utility.hpp>
+#include <badem/badem_wallet/icon.hpp>
+#include <badem/node/cli.hpp>
+#include <badem/node/ipc.hpp>
 #include <badem/node/rpc.hpp>
 #include <badem/node/working.hpp>
+#include <badem/qt/qt.hpp>
 
 #include <boost/make_shared.hpp>
-
 #include <boost/program_options.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
@@ -18,145 +21,162 @@ public:
 	rpc_enable (false),
 	opencl_enable (false)
 	{
-		rai::random_pool.GenerateBlock (wallet.bytes.data (), wallet.bytes.size ());
+		badem::random_pool::generate_block (wallet.bytes.data (), wallet.bytes.size ());
 		assert (!wallet.is_zero ());
 	}
-	bool upgrade_json (unsigned version_a, boost::property_tree::ptree & tree_a)
+	bool upgrade_json (unsigned version_a, badem::jsonconfig & json)
 	{
-		auto result (false);
+		json.put ("version", json_version ());
+		auto upgraded (false);
 		switch (version_a)
 		{
 			case 1:
 			{
-				rai::account account;
-				account.decode_account (tree_a.get<std::string> ("account"));
-				tree_a.erase ("account");
-				tree_a.put ("account", account.to_account ());
-				tree_a.erase ("version");
-				tree_a.put ("version", "2");
-				result = true;
+				badem::account account;
+				account.decode_account (json.get<std::string> ("account"));
+				json.erase ("account");
+				json.put ("account", account.to_account ());
+				json.erase ("version");
+				upgraded = true;
 			}
 			case 2:
 			{
-				boost::property_tree::ptree rpc_l;
+				badem::jsonconfig rpc_l;
 				rpc.serialize_json (rpc_l);
-				tree_a.put ("rpc_enable", "false");
-				tree_a.put_child ("rpc", rpc_l);
-				tree_a.erase ("version");
-				tree_a.put ("version", "3");
-				result = true;
+				json.put ("rpc_enable", "false");
+				json.put_child ("rpc", rpc_l);
+				json.erase ("version");
+				upgraded = true;
 			}
 			case 3:
 			{
-				auto opencl_enable_l (tree_a.get_optional<bool> ("opencl_enable"));
+				auto opencl_enable_l (json.get_optional<bool> ("opencl_enable"));
 				if (!opencl_enable_l)
 				{
-					tree_a.put ("opencl_enable", "false");
+					json.put ("opencl_enable", "false");
 				}
-				auto opencl_l (tree_a.get_child_optional ("opencl"));
+				auto opencl_l (json.get_optional_child ("opencl"));
 				if (!opencl_l)
 				{
-					boost::property_tree::ptree opencl_l;
+					badem::jsonconfig opencl_l;
 					opencl.serialize_json (opencl_l);
-					tree_a.put_child ("opencl", opencl_l);
+					json.put_child ("opencl", opencl_l);
 				}
-				tree_a.put ("version", "4");
-				result = true;
+				upgraded = true;
 			}
 			case 4:
 				break;
 			default:
 				throw std::runtime_error ("Unknown qt_wallet_config version");
 		}
-		return result;
+		return upgraded;
 	}
-	bool deserialize_json (bool & upgraded_a, boost::property_tree::ptree & tree_a)
+
+	badem::error deserialize_json (bool & upgraded_a, badem::jsonconfig & json)
 	{
-		auto error (false);
-		if (!tree_a.empty ())
+		if (!json.empty ())
 		{
-			auto version_l (tree_a.get_optional<std::string> ("version"));
+			auto version_l (json.get_optional<unsigned> ("version"));
 			if (!version_l)
 			{
-				tree_a.put ("version", "1");
-				version_l = "1";
+				version_l = 1;
+				json.put ("version", version_l.get ());
 				upgraded_a = true;
 			}
-			upgraded_a |= upgrade_json (std::stoull (version_l.get ()), tree_a);
-			auto wallet_l (tree_a.get<std::string> ("wallet"));
-			auto account_l (tree_a.get<std::string> ("account"));
-			auto & node_l (tree_a.get_child ("node"));
-			rpc_enable = tree_a.get<bool> ("rpc_enable");
-			auto & rpc_l (tree_a.get_child ("rpc"));
-			opencl_enable = tree_a.get<bool> ("opencl_enable");
-			auto & opencl_l (tree_a.get_child ("opencl"));
-			try
+			upgraded_a |= upgrade_json (version_l.get (), json);
+			auto wallet_l (json.get<std::string> ("wallet"));
+			auto account_l (json.get<std::string> ("account"));
+			auto node_l (json.get_required_child ("node"));
+			rpc_enable = json.get<bool> ("rpc_enable");
+			auto rpc_l (json.get_required_child ("rpc"));
+			opencl_enable = json.get<bool> ("opencl_enable");
+			auto opencl_l (json.get_required_child ("opencl"));
+
+			if (wallet.decode_hex (wallet_l))
 			{
-				error |= wallet.decode_hex (wallet_l);
-				error |= account.decode_account (account_l);
-				error |= node.deserialize_json (upgraded_a, node_l);
-				error |= rpc.deserialize_json (rpc_l);
-				error |= opencl.deserialize_json (opencl_l);
-				if (wallet.is_zero ())
-				{
-					rai::random_pool.GenerateBlock (wallet.bytes.data (), wallet.bytes.size ());
-					upgraded_a = true;
-				}
+				json.get_error ().set ("Invalid wallet id. Did you open a node daemon config?");
 			}
-			catch (std::logic_error const &)
+			else if (account.decode_account (account_l))
 			{
-				error = true;
+				json.get_error ().set ("Invalid account");
+			}
+			if (!node_l.get_error ())
+			{
+				node.deserialize_json (upgraded_a, node_l);
+			}
+			if (!rpc_l.get_error ())
+			{
+				rpc.deserialize_json (rpc_l);
+			}
+			if (!opencl_l.get_error ())
+			{
+				opencl.deserialize_json (opencl_l);
+			}
+			if (wallet.is_zero ())
+			{
+				badem::random_pool::generate_block (wallet.bytes.data (), wallet.bytes.size ());
+				upgraded_a = true;
 			}
 		}
 		else
 		{
-			serialize_json (tree_a);
+			serialize_json (json);
 			upgraded_a = true;
 		}
-		return error;
+		return json.get_error ();
 	}
-	void serialize_json (boost::property_tree::ptree & tree_a)
+
+	void serialize_json (badem::jsonconfig & json)
 	{
 		std::string wallet_string;
 		wallet.encode_hex (wallet_string);
-		tree_a.put ("version", "4");
-		tree_a.put ("wallet", wallet_string);
-		tree_a.put ("account", account.to_account ());
-		boost::property_tree::ptree node_l;
+		json.put ("version", json_version ());
+		json.put ("wallet", wallet_string);
+		json.put ("account", account.to_account ());
+		badem::jsonconfig node_l;
+		node.enable_voting = false;
+		node.bootstrap_connections_max = 4;
 		node.serialize_json (node_l);
-		tree_a.add_child ("node", node_l);
-		boost::property_tree::ptree rpc_l;
+		json.put_child ("node", node_l);
+		badem::jsonconfig rpc_l;
 		rpc.serialize_json (rpc_l);
-		tree_a.add_child ("rpc", rpc_l);
-		tree_a.put ("rpc_enable", rpc_enable);
-		tree_a.put ("opencl_enable", opencl_enable);
-		boost::property_tree::ptree opencl_l;
+		json.put_child ("rpc", rpc_l);
+		json.put ("rpc_enable", rpc_enable);
+		json.put ("opencl_enable", opencl_enable);
+		badem::jsonconfig opencl_l;
 		opencl.serialize_json (opencl_l);
-		tree_a.add_child ("opencl", opencl_l);
+		json.put_child ("opencl", opencl_l);
 	}
+
 	bool serialize_json_stream (std::ostream & stream_a)
 	{
 		auto result (false);
 		stream_a.seekp (0);
 		try
 		{
-			boost::property_tree::ptree tree;
-			serialize_json (tree);
-			boost::property_tree::write_json (stream_a, tree);
+			badem::jsonconfig json;
+			serialize_json (json);
+			json.write (stream_a);
 		}
-		catch (std::runtime_error const &)
+		catch (std::runtime_error const & ex)
 		{
+			std::cerr << ex.what () << std::endl;
 			result = true;
 		}
 		return result;
 	}
-	rai::uint256_union wallet;
-	rai::account account;
-	rai::node_config node;
+
+	badem::uint256_union wallet;
+	badem::account account;
+	badem::node_config node;
 	bool rpc_enable;
-	rai::rpc_config rpc;
+	badem::rpc_config rpc;
 	bool opencl_enable;
-	rai::opencl_config opencl;
+	badem::opencl_config opencl;
+	int json_version () const
+	{
+		return 4;
+	}
 };
 
 namespace
@@ -168,30 +188,35 @@ void show_error (std::string const & message_a)
 	message.show ();
 	message.exec ();
 }
-bool update_config (qt_wallet_config & config_a, boost::filesystem::path const & config_path_a, std::fstream & config_file_a)
+bool update_config (qt_wallet_config & config_a, boost::filesystem::path const & config_path_a)
 {
 	auto account (config_a.account);
 	auto wallet (config_a.wallet);
 	auto error (false);
-	if (!rai::fetch_object (config_a, config_path_a, config_file_a))
+	badem::jsonconfig config;
+	if (!config.read_and_update (config_a, config_path_a))
 	{
 		if (account != config_a.account || wallet != config_a.wallet)
 		{
 			config_a.account = account;
 			config_a.wallet = wallet;
-			config_file_a.close ();
-			config_file_a.open (config_path_a.string (), std::ios_base::out | std::ios_base::trunc);
-			error = config_a.serialize_json_stream (config_file_a);
+
+			// Update json file with new account and/or wallet values
+			std::fstream config_file;
+			config_file.open (config_path_a.string (), std::ios_base::out | std::ios_base::trunc);
+			error = config_a.serialize_json_stream (config_file);
 		}
 	}
 	return error;
 }
 }
 
-int run_wallet (QApplication & application, int argc, char * const * argv, boost::filesystem::path const & data_path)
+int run_wallet (QApplication & application, int argc, char * const * argv, boost::filesystem::path const & data_path, badem::node_flags const & flags)
 {
 	badem_qt::eventloop_processor processor;
+	boost::system::error_code error_chmod;
 	boost::filesystem::create_directories (data_path);
+	badem::set_secure_perm_directory (data_path, error_chmod);
 	QPixmap pixmap (":/logo.png");
 	QSplashScreen * splash = new QSplashScreen (pixmap);
 	splash->show ();
@@ -201,24 +226,24 @@ int run_wallet (QApplication & application, int argc, char * const * argv, boost
 	qt_wallet_config config (data_path);
 	auto config_path ((data_path / "config.json"));
 	int result (0);
-	std::fstream config_file;
-	auto error (rai::fetch_object (config, config_path, config_file));
-	config_file.close ();
+	badem::jsonconfig json;
+	auto error (json.read_and_update (config, config_path));
+	badem::set_secure_perm_file (config_path, error_chmod);
 	if (!error)
 	{
-		boost::asio::io_service service;
+		boost::asio::io_context io_ctx;
 		config.node.logging.init (data_path);
-		std::shared_ptr<rai::node> node;
+		std::shared_ptr<badem::node> node;
 		std::shared_ptr<badem_qt::wallet> gui;
-		rai::set_application_icon (application);
-		auto opencl (rai::opencl_work::create (config.opencl_enable, config.opencl, config.node.logging));
-		rai::work_pool work (config.node.work_threads, opencl ? [&opencl](rai::uint256_union const & root_a) {
+		badem::set_application_icon (application);
+		auto opencl (badem::opencl_work::create (config.opencl_enable, config.opencl, config.node.logging));
+		badem::work_pool work (config.node.work_threads, opencl ? [&opencl](badem::uint256_union const & root_a) {
 			return opencl->generate_work (root_a);
 		}
-		                                                      : std::function<boost::optional<uint64_t> (rai::uint256_union const &)> (nullptr));
-		rai::alarm alarm (service);
-		rai::node_init init;
-		node = std::make_shared<rai::node> (init, service, data_path, alarm, config.node, work);
+		                                                       : std::function<boost::optional<uint64_t> (badem::uint256_union const &)> (nullptr));
+		badem::alarm alarm (io_ctx);
+		badem::node_init init;
+		node = std::make_shared<badem::node> (init, io_ctx, data_path, alarm, config.node, work, flags);
 		if (!init.error ())
 		{
 			auto wallet (node->wallets.open (config.wallet));
@@ -237,11 +262,11 @@ int run_wallet (QApplication & application, int argc, char * const * argv, boost
 			}
 			if (config.account.is_zero () || !wallet->exists (config.account))
 			{
-				rai::transaction transaction (wallet->store.environment, nullptr, true);
+				auto transaction (wallet->wallets.tx_begin (true));
 				auto existing (wallet->store.begin (transaction));
 				if (existing != wallet->store.end ())
 				{
-					rai::uint256_union account (existing->first.uint256 ());
+					badem::uint256_union account (existing->first);
 					config.account = account;
 				}
 				else
@@ -250,15 +275,17 @@ int run_wallet (QApplication & application, int argc, char * const * argv, boost
 				}
 			}
 			assert (wallet->exists (config.account));
-			update_config (config, config_path, config_file);
+			update_config (config, config_path);
 			node->start ();
-			std::unique_ptr<rai::rpc> rpc = get_rpc (service, *node, config.rpc);
-			if (rpc && config.rpc_enable)
+			std::unique_ptr<badem::rpc> rpc = get_rpc (io_ctx, *node, config.rpc);
+			if (rpc)
 			{
-				rpc->start ();
+				rpc->start (config.rpc_enable);
 			}
-			rai::thread_runner runner (service, node->config.io_threads);
+			badem::ipc::ipc_server ipc (*node, *rpc);
+			badem::thread_runner runner (io_ctx, node->config.io_threads);
 			QObject::connect (&application, &QApplication::aboutToQuit, [&]() {
+				ipc.stop ();
 				rpc->stop ();
 				node->stop ();
 			});
@@ -273,59 +300,88 @@ int run_wallet (QApplication & application, int argc, char * const * argv, boost
 		}
 		else
 		{
+			splash->hide ();
 			show_error ("Error initializing node");
 		}
-		update_config (config, config_path, config_file);
+		update_config (config, config_path);
 	}
 	else
 	{
-		show_error ("Error deserializing config");
+		splash->hide ();
+		show_error ("Error deserializing config: " + json.get_error ().get_message ());
 	}
 	return result;
 }
 
 int main (int argc, char * const * argv)
 {
+	badem::set_umask ();
+
 	try
 	{
 		QApplication application (argc, const_cast<char **> (argv));
 		boost::program_options::options_description description ("Command line options");
 		description.add_options () ("help", "Print out options");
-		rai::add_node_options (description);
+		badem::add_node_options (description);
 		boost::program_options::variables_map vm;
 		boost::program_options::store (boost::program_options::command_line_parser (argc, argv).options (description).allow_unregistered ().run (), vm);
 		boost::program_options::notify (vm);
 		int result (0);
-		if (!rai::handle_node_options (vm))
+
+		if (!vm.count ("data_path"))
 		{
-		}
-		else if (vm.count ("help") != 0)
-		{
-			std::cout << description << std::endl;
-		}
-		else
-		{
-			try
+			std::string error_string;
+			if (!badem::migrate_working_path (error_string))
 			{
-				boost::filesystem::path data_path;
-				if (vm.count ("data_path"))
-				{
-					auto name (vm["data_path"].as<std::string> ());
-					data_path = boost::filesystem::path (name);
-				}
-				else
-				{
-					data_path = rai::working_path ();
-				}
-				result = run_wallet (application, argc, argv, data_path);
+				throw std::runtime_error (error_string);
 			}
-			catch (std::exception const & e)
+		}
+
+		auto ec = badem::handle_node_options (vm);
+		if (ec == badem::error_cli::unknown_command)
+		{
+			if (vm.count ("help") != 0)
 			{
-				show_error (boost::str (boost::format ("Exception while running wallet: %1%") % e.what ()));
+				std::cout << description << std::endl;
 			}
-			catch (...)
+			else
 			{
-				show_error ("Unknown exception while running wallet");
+				try
+				{
+					boost::filesystem::path data_path;
+					if (vm.count ("data_path"))
+					{
+						auto name (vm["data_path"].as<std::string> ());
+						data_path = boost::filesystem::path (name);
+					}
+					else
+					{
+						data_path = badem::working_path ();
+					}
+					badem::node_flags flags;
+					auto batch_size_it = vm.find ("batch_size");
+					if (batch_size_it != vm.end ())
+					{
+						flags.sideband_batch_size = batch_size_it->second.as<size_t> ();
+					}
+					flags.disable_backup = (vm.count ("disable_backup") > 0);
+					flags.disable_lazy_bootstrap = (vm.count ("disable_lazy_bootstrap") > 0);
+					flags.disable_legacy_bootstrap = (vm.count ("disable_legacy_bootstrap") > 0);
+					flags.disable_wallet_bootstrap = (vm.count ("disable_wallet_bootstrap") > 0);
+					flags.disable_bootstrap_listener = (vm.count ("disable_bootstrap_listener") > 0);
+					flags.disable_unchecked_cleanup = (vm.count ("disable_unchecked_cleanup") > 0);
+					flags.disable_unchecked_drop = (vm.count ("disable_unchecked_drop") > 0);
+					flags.fast_bootstrap = (vm.count ("fast_bootstrap") > 0);
+					result = run_wallet (application, argc, argv, data_path, flags);
+				}
+				catch (std::exception const & e)
+				{
+					show_error (boost::str (boost::format ("Exception while running wallet: %1%") % e.what ()));
+				}
+				catch (...)
+				{
+					show_error ("Unknown exception while running wallet");
+				}
 			}
 		}
 		return result;

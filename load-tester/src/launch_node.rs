@@ -22,7 +22,7 @@ const RPC_PORT_START: u64 = 55000;
 const PEERING_PORT_START: u64 = 54000;
 
 pub fn launch_node(
-    badem: &Path,
+    badem_node: &Path,
     tmp_dir: &Path,
     handle: Handle,
     i: u64,
@@ -51,7 +51,7 @@ pub fn launch_node(
             "version": "8",
             "peering_port": peering_port.to_string(),
             "bootstrap_fraction_numerator": "1",
-            "receive_minimum": "10000000000000000000000000000",
+            "receive_minimum": "1000000000000000000000000",
             "logging": {
                 "version": "2",
                 "ledger": "false",

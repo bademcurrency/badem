@@ -24,13 +24,11 @@ fi
 
 if [[ ${SIMD} -eq 1 ]]; then
     SIMD_CFG="-DBADEM_SIMD_OPTIMIZATIONS=ON"
-    CRYPTOPP_CFG=""
     echo SIMD and other optimizations enabled
     echo local CPU:
     cat /proc/cpuinfo # TBD for macOS
 else
     SIMD_CFG=""
-    CRYPTOPP_CFG="-DCRYPTOPP_CUSTOM=ON"
 fi
 
 if [[ ${ASAN_INT} -eq 1 ]]; then
@@ -54,6 +52,14 @@ if [[ ${FLAVOR-_} == "_" ]]; then
     FLAVOR=""
 fi
 
+if [[ "${BETA}" -eq 1 ]]; then
+    NETWORK_CFG="-DACTIVE_NETWORK=badem_beta_network"
+    CONFIGURATION="RelWithDebInfo"
+else
+    NETWORK_CFG="-DACTIVE_NETWORK=badem_live_network"
+    CONFIGURATION="Release"
+fi
+
 set -o nounset
 
 run_build() {
@@ -63,10 +69,10 @@ run_build() {
     cd ${build_dir}
     cmake -GNinja \
        -DBADEM_GUI=ON \
-       -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_BUILD_TYPE=${CONFIGURATION} \
        -DCMAKE_VERBOSE_MAKEFILE=ON \
        -DCMAKE_INSTALL_PREFIX="../install" \
-       ${CRYPTOPP_CFG} \
+       ${NETWORK_CFG} \
        ${DISTRO_CFG} \
        ${SIMD_CFG} \
        -DBOOST_ROOT=/usr/local/boost \
@@ -76,7 +82,7 @@ run_build() {
 
     cmake --build ${PWD} -- -v
     cmake --build ${PWD} -- install -v
-    cpack -G ${CPACK_TYPE} ${PWD}
+    cpack -G ${CPACK_TYPE} -C ${CONFIGURATION} ${PWD}
     sha1sum *.tar* > SHA1SUMS
 }
 

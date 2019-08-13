@@ -11,6 +11,7 @@
 
 namespace badem_qt
 {
+static const QString saved_ratio_key = "settings/ratio";
 class wallet;
 class eventloop_processor : public QObject
 {
@@ -66,9 +67,9 @@ public:
 	QHBoxLayout * scale_layout;
 	QLabel * scale_label;
 	QButtonGroup * ratio_group;
-	QRadioButton * badembutton;
-	QRadioButton * bademcikbutton;
-	QRadioButton * rawbutton;
+	QRadioButton * mbadem_unit;
+	QRadioButton * kbadem_unit;
+	QRadioButton * badem_unit;
 	QPushButton * back;
 
 	QWidget * ledger_window;
@@ -82,7 +83,9 @@ public:
 	QVBoxLayout * peers_layout;
 	QStandardItemModel * peers_model;
 	QTableView * peers_view;
+	QHBoxLayout * peer_summary_layout;
 	QLabel * bootstrap_label;
+	QLabel * peer_count_label;
 	QLineEdit * bootstrap_line;
 	QPushButton * peers_bootstrap;
 	QPushButton * peers_refresh;
@@ -147,8 +150,8 @@ public:
 class self_pane
 {
 public:
-	self_pane (badem_qt::wallet &, rai::account const &);
-	void refresh_balance ();
+	self_pane (badem_qt::wallet &, badem::account const &);
+	void set_balance_text (std::pair<badem::uint128_t, badem::uint128_t>);
 	QWidget * window;
 	QVBoxLayout * layout;
 	QHBoxLayout * self_layout;
@@ -208,7 +211,7 @@ public:
 class history
 {
 public:
-	history (rai::ledger &, rai::account const &, badem_qt::wallet &);
+	history (badem::ledger &, badem::account const &, badem_qt::wallet &);
 	void refresh ();
 	QWidget * window;
 	QVBoxLayout * layout;
@@ -218,15 +221,15 @@ public:
 	QHBoxLayout * tx_layout;
 	QLabel * tx_label;
 	QSpinBox * tx_count;
-	rai::ledger & ledger;
-	rai::account const & account;
+	badem::ledger & ledger;
+	badem::account const & account;
 	badem_qt::wallet & wallet;
 };
 class block_viewer
 {
 public:
 	block_viewer (badem_qt::wallet &);
-	void rebroadcast_action (rai::uint256_union const &);
+	void rebroadcast_action (badem::uint256_union const &);
 	QWidget * window;
 	QVBoxLayout * layout;
 	QLabel * hash_label;
@@ -254,7 +257,7 @@ public:
 	QLabel * balance_label;
 	badem_qt::history history;
 	QPushButton * back;
-	rai::account account;
+	badem::account account;
 	badem_qt::wallet & wallet;
 };
 class stats_viewer
@@ -296,17 +299,17 @@ public:
 class wallet : public std::enable_shared_from_this<badem_qt::wallet>
 {
 public:
-	wallet (QApplication &, badem_qt::eventloop_processor &, rai::node &, std::shared_ptr<rai::wallet>, rai::account &);
+	wallet (QApplication &, badem_qt::eventloop_processor &, badem::node &, std::shared_ptr<badem::wallet>, badem::account &);
 	void start ();
 	void refresh ();
 	void update_connected ();
 	void empty_password ();
-	void change_rendering_ratio (rai::uint128_t const &);
-	std::string format_balance (rai::uint128_t const &) const;
-	rai::uint128_t rendering_ratio;
-	rai::node & node;
-	std::shared_ptr<rai::wallet> wallet_m;
-	rai::account & account;
+	void change_rendering_ratio (badem::uint128_t const &);
+	std::string format_balance (badem::uint128_t const &) const;
+	badem::uint128_t rendering_ratio;
+	badem::node & node;
+	std::shared_ptr<badem::wallet> wallet_m;
+	badem::account & account;
 	badem_qt::eventloop_processor & processor;
 	badem_qt::history history;
 	badem_qt::accounts accounts;
@@ -348,5 +351,8 @@ public:
 	badem_qt::status active_status;
 	void pop_main_stack ();
 	void push_main_stack (QWidget *);
+	void ongoing_refresh ();
+	std::atomic<bool> needs_balance_refresh;
+	std::atomic<bool> needs_deterministic_restore;
 };
 }

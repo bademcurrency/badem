@@ -20,13 +20,25 @@ case "${network}" in
                 ;;
 esac
 
+bdmdir="${HOME}/Bdm${dirSuffix}"
 bademdir="${HOME}/Badem${dirSuffix}"
 dbFile="${bademdir}/data.ldb"
-mkdir -p "${bademdir}"
+
+if [ -d "${bdmdir}" ]; then
+	echo "Moving ${raidir} to ${bademdir}"
+	mv $bdmdir $bademdir
+else
+	mkdir -p "${bademdir}"
+fi
+
 if [ ! -f "${bademdir}/config.json" ]; then
         echo "Config File not found, adding default."
         cp "/usr/share/badem/config/${network}.json" "${bademdir}/config.json"
 fi
+
+# Start watching the log file we are going to log output to
+logfile="${bademdir}/badem-docker-output.log"
+tail -F "${logfile}" &
 
 pid=''
 firstTimeComplete=''
@@ -62,4 +74,10 @@ while true; do
 		badem_node --daemon &
 		pid="$!"
 	fi
-done
+
+	if [ "$(stat -c '%s' "${logfile}")" -gt 4194304 ]; then
+		cp "${logfile}" "${logfile}.old"
+		: > "${logfile}"
+		echo "$(date) Rotated log file"
+	fi
+done >> "${logfile}" 2>&1

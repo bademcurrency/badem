@@ -1,15 +1,14 @@
-cmake_minimum_required (VERSION 2.8.11)
-project (rai)
+cmake_minimum_required (VERSION 3.4)
+project (badem-node)
 
-set (CPACK_PACKAGE_VERSION_MAJOR "14")
+set (CPACK_PACKAGE_VERSION_MAJOR "18")
 set (CPACK_PACKAGE_VERSION_MINOR "0")
 set (CPACK_PACKAGE_VERSION_PATCH "0")
-if (DEFINED GIT_COMMIT)
-set (CPACK_PACKAGE_VERSION_PATCH "GIT-${GIT_COMMIT}")
-endif (DEFINED GIT_COMMIT)
 set (CPACK_PACKAGE_VENDOR "Badem Currency")
 
 set(CMAKE_INSTALL_RPATH "@executable_path/../Frameworks")
+# Create all libraries and executables in the root binary dir
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 set (BADEM_GUI OFF CACHE BOOL "")
 set (BADEM_TEST OFF CACHE BOOL "")
@@ -17,93 +16,110 @@ set (BADEM_SECURE_RPC OFF CACHE BOOL "")
 
 option(BADEM_ASAN_INT "Enable ASan+UBSan+Integer overflow" OFF)
 option(BADEM_ASAN "Enable ASan+UBSan" OFF)
+option(BADEM_TSAN "Enable TSan" OFF)
 option(BADEM_SIMD_OPTIMIZATIONS "Enable CPU-specific SIMD optimizations (SSE/AVX or NEON, e.g.)" OFF)
-set (BOOST_CUSTOM OFF CACHE BOOL "")
+option(ENABLE_AES "Enable AES optimizations (enabled by default with BADEM_SIMD_OPTIMIZATIONS, set OFF to disable" ON)
+option(ENABLE_AVX2 "Enable AVX2 optimizations" OFF)
+
+SET (ACTIVE_NETWORK badem_live_network CACHE STRING "Selects which network parameters are used")
+set_property (CACHE ACTIVE_NETWORK PROPERTY STRINGS badem_test_network badem_beta_network badem_live_network)
 
 if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build, options are: Debug Release RelWithDebInfo MinSizeRel." FORCE)
-endif(NOT CMAKE_BUILD_TYPE)
+endif()
+
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+find_package(Threads)
 
 if (WIN32)
-	set (PLATFORM_COMPILE_FLAGS "-DBOOST_SPIRIT_THREADSAFE -D_WIN32_WINNT=0x0600 -DWINVER=0x0600 -DWIN32_LEAN_AND_MEAN -DMINIUPNP_STATICLIB")
-	set (BLAKE2_IMPLEMENTATION "blake2/blake2b.c")
-else (WIN32)
-	set (PLATFORM_COMPILE_FLAGS "-DBOOST_SPIRIT_THREADSAFE -Werror=switch -fPIC")
-	if (BADEM_ASAN)
-		set (PLATFORM_COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS} -fsanitize=address,undefined -DED25519_NO_INLINE_ASM")
-	elseif (BADEM_ASAN_INT)
-		set (PLATFORM_COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS} -fsanitize=address,undefined,integer -DED25519_NO_INLINE_ASM")
-	elseif (BADEM_TSAN)
-		set (PLATFORM_COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS} -fsanitize=thread -DED25519_NO_INLINE_ASM")
+	add_definitions(-D_WIN32_WINNT=0x0600
+					-DWINVER=0x0600
+					-DWIN32_LEAN_AND_MEAN
+					-DMINIUPNP_STATICLIB
+					-D_CRT_SECURE_NO_WARNINGS)
+else ()
+	add_compile_options(-Werror=switch)
+	if (BADEM_ASAN OR BDM_ASAN)
+		add_compile_options(-fsanitize=address,undefined)
+		add_definitions(-DED25519_NO_INLINE_ASM)
+	elseif (BADEM_ASAN_INT OR BDM_ASAN_INT)
+		add_compile_options(-fsanitize=address,undefined,integer)
+		add_definitions(-DED25519_NO_INLINE_ASM)
+	elseif (BADEM_TSAN OR BDM_TSAN)
+		add_compile_options(-fsanitize=thread)
+		if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+			add_compile_options("-fsanitize-blacklist=${PROJECT_SOURCE_DIR}/tsan_blacklist")
+		endif()
+		add_definitions(-DED25519_NO_INLINE_ASM)
 	endif()
 
-	IF (CMAKE_SYSTEM_PROCESSOR MATCHES "^(i.86|x86(_64)?)$")
-		if (BADEM_SIMD_OPTIMIZATIONS)
-			set (PLATFORM_COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS} -msse4")
-		elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
-			set (PLATFORM_COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS} -msse2")
+	if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(i.86|x86(_64)?)$")
+		if (BADEM_SIMD_OPTIMIZATIONS OR BDM_SIMD_OPTIMIZATIONS)
+			add_compile_options(-msse4)
+			if (ENABLE_AES)
+				add_compile_options(-maes)
+			else ()
+				add_definitions(-DCRYPTOPP_DISABLE_AESNI)
+			endif ()
+		elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+			add_compile_options(-msse2)
+			add_definitions(-DCRYPTOPP_DISABLE_SSSE3
+							-DCRYPTOPP_DISABLE_AESNI)
 		endif()
 
-		set (BLAKE2_IMPLEMENTATION "blake2/blake2b.c")
 		if (ENABLE_AVX2)
-			set (PLATFORM_COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS} -mavx2 -mbmi -mbmi2")
+			add_compile_options(-mavx2 -mbmi -mbmi2 -maes)
 			if (PERMUTE_WITH_GATHER)
-				set (PLATFORM_COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS} -DPERMUTE_WITH_GATHER")
+				add_definitions(-DPERMUTE_WITH_GATHER)
 			elseif (PERMUTE_WITH_SHUFFLES)
-				set (PLATFORM_COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS} -DPERMUTE_WITH_SHUFFLES")
+				add_definitions(-DPERMUTE_WITH_SHUFFLES)
 			endif()
 		endif()
-	else()
-		set (BLAKE2_IMPLEMENTATION "blake2/blake2b-ref.c")
+	elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+		if (BADEM_SIMD_OPTIMIZATIONS OR BDM_SIMD_OPTIMIZATIONS)
+			add_compile_options(-march=armv8-a+crc+crypto)
+		else ()
+			add_compile_options(-march=armv8-a)
+			add_definitions(-DCRYPTOPP_DISABLE_ASM)
+		endif ()
 	endif()
-endif (WIN32)
+endif ()
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+#set(CMAKE_C_EXTENSIONS OFF)
+
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+#set(CMAKE_CXX_EXTENSIONS OFF)
 
 if (WIN32)
-	set (PLATFORM_C_FLAGS "/std=c11")
-else (WIN32)
-	set (PLATFORM_C_FLAGS "-std=c11")
-endif (WIN32)
-
-if (WIN32)
-	set (PLATFORM_CXX_FLAGS "/bigobj")
-else (WIN32)
-	set (PLATFORM_CXX_FLAGS "-std=c++14")
-endif (WIN32)
-
-if (WIN32)
-	set (PLATFORM_GUI_TARGET_PROPERTIES WIN32)
-else (WIN32)
-	set (PLATFORM_GUI_TARGET_PROPERTIES "")
-endif (WIN32)
-
-if (APPLE)
-	set (PLATFORM_LINK_FLAGS "-framework Foundation -framework OpenCL")
-elseif (WIN32)
-	set (PLATFORM_LINK_FLAGS "")
+	set (PLATFORM_LINK_FLAGS "") 
+	add_definitions(/bigobj)
 else ()
-	set (PLATFORM_LINK_FLAGS "-static-libgcc -static-libstdc++")
-	if (BADEM_ASAN)
+	if (APPLE)
+		set (PLATFORM_LINK_FLAGS "-framework Foundation -framework OpenCL")
+	else ()
+		set (PLATFORM_LINK_FLAGS "-static-libgcc -static-libstdc++")
+	endif ()
+
+	if (BADEM_ASAN OR BDM_ASAN)
 		set (PLATFORM_LINK_FLAGS "${PLATFORM_LINK_FLAGS} -fsanitize=address,undefined")
-	elseif (BADEM_ASAN_INT)
+	elseif (BADEM_ASAN_INT OR BDM_ASAN_INT)
 		set (PLATFORM_LINK_FLAGS "${PLATFORM_LINK_FLAGS} -fsanitize=address,undefined,integer")
-	elseif (BADEM_TSAN)
+	elseif (BADEM_TSAN OR BDM_TSAN)
 		set (PLATFORM_LINK_FLAGS "${PLATFORM_LINK_FLAGS} -fsanitize=thread")
+		if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+			set (PLATFORM_LINK_FLAGS "${PLATFORM_LINK_FLAGS} -fsanitize-blacklist=${PROJECT_SOURCE_DIR}/tsan_blacklist")
+		endif()
 	endif()
-endif (APPLE)
+endif ()
 
-if (BADEM_GUI)
-	if (WIN32)
-		set (PLATFORM_QT_PACKAGES WinExtras)
-	else (WIN32)
-		set (PLATFORM_QT_PACKAGES)
-	endif (WIN32)
+SET( CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${PLATFORM_LINK_FLAGS}" )
 
-	find_package (Qt5 COMPONENTS Core Gui Widgets Test ${PLATFORM_QT_PACKAGES})
-	include_directories (${Qt5Core_INCLUDE_DIRS} ${Qt5Gui_INCLUDE_DIRS} ${Qt5Widgets_INCLUDE_DIRS} ${Qt5Test_INCLUDE_DIRS})
-endif (BADEM_GUI)
-
-if (BADEM_SECURE_RPC)
-	find_package (OpenSSL 1.0 EXACT REQUIRED)
+if (BADEM_SECURE_RPC OR BDM_SECURE_RPC)
+	find_package (OpenSSL 1.0 REQUIRED)
 	include_directories(${OPENSSL_INCLUDE_DIR})
 	add_definitions (-DBADEM_SECURE_RPC)
 	message("OpenSSL include dir: ${OPENSSL_INCLUDE_DIR}")
@@ -112,319 +128,270 @@ if (BADEM_SECURE_RPC)
 	message("Crypto lib: ${OPENSSL_CRYPTO_LIBRARY}")
 else ()
 	set (OPENSSL_LIBRARIES "")
-endif (BADEM_SECURE_RPC)
+endif ()
 
 include_directories (${CMAKE_SOURCE_DIR})
 
 set(Boost_USE_STATIC_LIBS        ON)
 set(Boost_USE_MULTITHREADED      ON)
 
-if (BOOST_CUSTOM)
-    list(APPEND CMAKE_MODULE_PATH ".\\" ${CMAKE_SOURCE_PATH})
-endif (BOOST_CUSTOM)
-
-find_package (Boost 1.66.0 REQUIRED COMPONENTS date_time filesystem system log log_setup thread program_options regex chrono atomic)
-include_directories (${Boost_INCLUDE_DIR})
-
-add_library (ed25519
-	ed25519-donna/ed25519-donna-portable.h
-	ed25519-donna/ed25519-hash-custom.h
-	ed25519-donna/ed25519-randombytes-custom.h
-	ed25519-donna/ed25519.h
-	ed25519-donna/ed25519.c)
-
-include_directories("${CMAKE_SOURCE_DIR}/phc-winner-argon2/include")
-include_directories("${CMAKE_SOURCE_DIR}/phc-winner-argon2/src")
-include_directories("${CMAKE_SOURCE_DIR}/blake2")
-
-if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
-	set (ARGON_CORE phc-winner-argon2/src/opt.c)
-else ()
-	set (ARGON_CORE phc-winner-argon2/src/ref.c)
+if (BOOST_ROOT)
+	list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/Modules")
 endif ()
 
-if (WIN32)
-	set (gtest_force_shared_crt ON)
-else ()
-	set (gtest_force_shared_crt OFF)
-endif()
-add_subdirectory (gtest)
-include_directories ("gtest/include")
+find_package (Boost 1.66.0 REQUIRED COMPONENTS filesystem log thread program_options system)
 
-include_directories (beast/include)
+add_subdirectory(crypto/ed25519-donna)
 
 set (UPNPC_BUILD_SHARED OFF CACHE BOOL "")
-add_subdirectory (miniupnp/miniupnpc)
-include_directories (miniupnp/miniupnpc)
+add_subdirectory (miniupnp/miniupnpc EXCLUDE_FROM_ALL)
+# FIXME: This fixes miniupnpc include directories without modifying miniupnpc's
+# CMakeLists.txt but should be set there
+set_target_properties(libminiupnpc-static PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+	"${CMAKE_SOURCE_DIR}/miniupnp/miniupnpc")
 
 set (BUILD_SHARED OFF CACHE BOOL "")
 set (BUILD_TESTING OFF CACHE BOOL "")
 set (USE_INTERMEDIATE_OBJECTS_TARGET OFF CACHE BOOL "")
-if (CRYPTOPP_CUSTOM OR NOT BADEM_SIMD_OPTIMIZATIONS)
-	set (CRYPTOPP_LIBRARY cryptopp)
-	add_library (cryptopp
-	cryptopp/algparam.cpp
-	cryptopp/asn.cpp
-	cryptopp/basecode.cpp
-	cryptopp/cpu.cpp
-	cryptopp/cryptlib.cpp
-	cryptopp/default.cpp
-	cryptopp/des.cpp
-	cryptopp/dessp.cpp
-	cryptopp/dll.cpp
-	cryptopp/ec2n.cpp
-	cryptopp/ecp.cpp
-	cryptopp/filters.cpp
-	cryptopp/fips140.cpp
-	cryptopp/gcm.cpp
-	cryptopp/gf2n.cpp
-	cryptopp/gfpcrypt.cpp
-	cryptopp/hex.cpp
-	cryptopp/hmac.cpp
-	cryptopp/hrtimer.cpp
-	cryptopp/integer.cpp
-	cryptopp/iterhash.cpp
-	cryptopp/misc.cpp
-	cryptopp/modes.cpp
-	cryptopp/mqueue.cpp
-	cryptopp/nbtheory.cpp
-	cryptopp/oaep.cpp
-	cryptopp/osrng.cpp
-	cryptopp/pubkey.cpp
-	cryptopp/queue.cpp
-	cryptopp/randpool.cpp
-	cryptopp/rdtables.cpp
-	cryptopp/rijndael.cpp
-	cryptopp/rng.cpp
-	cryptopp/sha.cpp
-	cryptopp/simple.cpp
-	cryptopp/winpipes.cpp)
-	set_target_properties (cryptopp PROPERTIES COMPILE_FLAGS "${PLATFORM_CXX_FLAGS} ${PLATFORM_COMPILE_FLAGS}")
+set (CRYPTOPP_EXTRA "")
+if (WIN32)
+	set (CRYPTOPP_EXTRA crypto/cryptopp/x64dll.asm
+					crypto/cryptopp/x64masm.asm)
+	enable_language(ASM)
+	enable_language(ASM_MASM)
+	# similar to SSE2 settings
+	add_definitions(-DCRYPTOPP_DISABLE_SSSE3
+					-DCRYPTOPP_DISABLE_AESNI)
+elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" AND (BADEM_SIMD_OPTIMIZATIONS OR BDM_SIMD_OPTIMIZATIONS))
+	set (CRYPTOPP_EXTRA crypto/cryptopp/crc_simd.cpp
+					crypto/cryptopp/gcm_simd.cpp
+					crypto/cryptopp/gf2n_simd.cpp
+					crypto/cryptopp/neon_simd.cpp)
+	add_definitions(-DCRYPTOPP_NO_CPU_FEATURE_PROBES)
+endif ()
+# Some Clang cannot handle mixed asm with positional arguments, where the
+# body is Intel style with no prefix and the templates are AT&T style.
+# See: crypto/cryptopp/config.h
+# Also see https://bugs.llvm.org/show_bug.cgi?id=39895
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+	add_definitions(-DCRYPTOPP_DISABLE_MIXED_ASM -DCRYPTOPP_DISABLE_ASM)
+	message("CryptoPP with disabled ASM for ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+endif ()
+add_definitions(-DCRYPTOPP_DISABLE_SHANI)
+# Fix failing builds after commit https://github.com/weidai11/cryptopp/commit/df9fa62205f2d341e2b1b26595a3a1b6377c60c5
+add_definitions(-DCRYPTOPP_DISABLE_CLMUL)
+
+set (CRYPTOPP_LIBRARY cryptopp)
+add_library (cryptopp
+	crypto/cryptopp/algparam.cpp
+	crypto/cryptopp/asn.cpp
+	crypto/cryptopp/basecode.cpp
+	crypto/cryptopp/cpu.cpp
+	crypto/cryptopp/cryptlib.cpp
+	crypto/cryptopp/default.cpp
+	crypto/cryptopp/des.cpp
+	crypto/cryptopp/dessp.cpp
+	crypto/cryptopp/dll.cpp
+	crypto/cryptopp/ec2n.cpp
+	crypto/cryptopp/ecp.cpp
+	crypto/cryptopp/filters.cpp
+	crypto/cryptopp/fips140.cpp
+	crypto/cryptopp/gcm.cpp
+	crypto/cryptopp/gf2n.cpp
+	crypto/cryptopp/gfpcrypt.cpp
+	crypto/cryptopp/hex.cpp
+	crypto/cryptopp/hmac.cpp
+	crypto/cryptopp/hrtimer.cpp
+	crypto/cryptopp/integer.cpp
+	crypto/cryptopp/iterhash.cpp
+	crypto/cryptopp/misc.cpp
+	crypto/cryptopp/modes.cpp
+	crypto/cryptopp/mqueue.cpp
+	crypto/cryptopp/nbtheory.cpp
+	crypto/cryptopp/oaep.cpp
+	crypto/cryptopp/osrng.cpp
+	crypto/cryptopp/pubkey.cpp
+	crypto/cryptopp/queue.cpp
+	crypto/cryptopp/randpool.cpp
+	crypto/cryptopp/rdtables.cpp
+	crypto/cryptopp/rijndael.cpp
+	crypto/cryptopp/rijndael_simd.cpp
+	crypto/cryptopp/rng.cpp
+	crypto/cryptopp/sha.cpp
+	crypto/cryptopp/sha_simd.cpp
+	crypto/cryptopp/simple.cpp
+	crypto/cryptopp/sse_simd.cpp
+	${CRYPTOPP_EXTRA})
+
+if ((BADEM_SIMD_OPTIMIZATIONS OR BDM_SIMD_OPTIMIZATIONS) AND NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+	set (ARGON_CORE crypto/phc-winner-argon2/src/opt.c)
 else ()
-	set (CRYPTOPP_LIBRARY cryptopp-static)
-	add_subdirectory (cryptopp)
+	set (ARGON_CORE crypto/phc-winner-argon2/src/ref.c)
 endif ()
 
 add_library (argon2
-	phc-winner-argon2/src/argon2.c
-	phc-winner-argon2/include/argon2.h
-	phc-winner-argon2/src/core.c
-	phc-winner-argon2/src/thread.c
-	phc-winner-argon2/src/encoding.c
+	crypto/phc-winner-argon2/src/argon2.c
+	crypto/phc-winner-argon2/include/argon2.h
+	crypto/phc-winner-argon2/src/core.c
+	crypto/phc-winner-argon2/src/thread.c
+	crypto/phc-winner-argon2/src/encoding.c
 	${ARGON_CORE})
 
+target_include_directories(argon2 PUBLIC crypto/phc-winner-argon2/include)
+target_include_directories(argon2 PUBLIC crypto/phc-winner-argon2/src)
+target_include_directories(argon2 PUBLIC crypto/blake2)
+
 add_library (xxhash
-	xxhash/xxhash.c
-	xxhash/xxhash.h)
+	crypto/xxhash/xxhash.c
+	crypto/xxhash/xxhash.h)
 
 add_library (lmdb
 	lmdb/libraries/liblmdb/lmdb.h
 	lmdb/libraries/liblmdb/mdb.c
 	lmdb/libraries/liblmdb/midl.c)
 
+if (WIN32)
+	target_link_libraries(lmdb ntdll)
+endif()
+
+if (WIN32)
+	set (BLAKE2_IMPLEMENTATION "crypto/blake2/blake2b.c")
+else ()
+	IF (CMAKE_SYSTEM_PROCESSOR MATCHES "^(i.86|x86(_64)?)$")
+		set (BLAKE2_IMPLEMENTATION "crypto/blake2/blake2b.c")
+	else()
+		set (BLAKE2_IMPLEMENTATION "crypto/blake2/blake2b-ref.c")
+	endif()
+endif ()
+
 add_library (blake2
-	blake2/blake2-config.h
-	blake2/blake2-impl.h
-	blake2/blake2.h
+	crypto/blake2/blake2-config.h
+	crypto/blake2/blake2-impl.h
+	crypto/blake2/blake2.h
 	${BLAKE2_IMPLEMENTATION})
 
-if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
-	set (PLATFORM_LIB_SOURCE badem/plat/default/priority.cpp)
-	set (PLATFORM_SECURE_SOURCE badem/plat/osx/working.mm)
-	set (PLATFORM_WALLET_SOURCE badem/plat/default/icon.cpp)
-elseif (${CMAKE_SYSTEM_NAME} MATCHES "Windows")
-	set (PLATFORM_LIB_SOURCE badem/plat/windows/priority.cpp)
-	set (PLATFORM_SECURE_SOURCE badem/plat/windows/working.cpp)
-	set (PLATFORM_NODE_SOURCE badem/plat/windows/openclapi.cpp)
-	set (PLATFORM_WALLET_SOURCE badem/plat/windows/icon.cpp Badem.rc)
-elseif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-	set (PLATFORM_LIB_SOURCE badem/plat/linux/priority.cpp)
-	set (PLATFORM_SECURE_SOURCE badem/plat/posix/working.cpp)
-	set (PLATFORM_NODE_SOURCE badem/plat/posix/openclapi.cpp)
-	set (PLATFORM_WALLET_SOURCE badem/plat/default/icon.cpp)
-elseif (${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD")
-	set (PLATFORM_LIB_SOURCE badem/plat/default/priority.cpp)
-	set (PLATFORM_SECURE_SOURCE badem/plat/posix/working.cpp)
-	set (PLATFORM_NODE_SOURCE badem/plat/posix/openclapi.cpp)
-	set (PLATFORM_WALLET_SOURCE badem/plat/default/icon.cpp)
-else ()
-	error ("Unknown platform: ${CMAKE_SYSTEM_NAME}")
+target_compile_definitions(blake2 PRIVATE -D__SSE2__)
+
+add_subdirectory(badem/secure)
+add_subdirectory(badem/lib)
+add_subdirectory(badem/node)
+add_subdirectory(badem/badem_node)
+
+if (BADEM_TEST OR BDM_TEST)
+    if(WIN32)
+        if(MSVC_VERSION)
+            if(MSVC_VERSION GREATER_EQUAL 1910)
+                add_definitions(-DGTEST_LANG_CXX11=1)
+                add_definitions(-DGTEST_HAS_TR1_TUPLE=0)
+            endif()
+        endif()
+        set (gtest_force_shared_crt ON)
+    else ()
+        set (gtest_force_shared_crt OFF)
+    endif()
+
+    add_subdirectory (gtest)
+	# FIXME: This fixes gtest include directories without modifying gtest's
+	# CMakeLists.txt. Ideally we should use GTest::GTest and GTest::Main as
+	# dependencies but it requires building gtest differently
+	set_target_properties(gtest PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+		"${CMAKE_SOURCE_DIR}/gtest/include")
+
+	add_subdirectory(badem/core_test)
+	add_subdirectory(badem/slow_test)
 endif ()
 
-# Embed bootstrap representative weights in executable
-file (READ rep_weights.bin filedata HEX)
-string (REGEX REPLACE "(..)" "0x\\1," filedata ${filedata})
-file (WRITE ${CMAKE_BINARY_DIR}/bootstrap_weights.cpp "#include <cstddef>\n"
-	"namespace rai {\n"
-	"	unsigned char badem_bootstrap_weights[] = {${filedata} 0x00};\n"
-	"	size_t badem_bootstrap_weights_size = sizeof(badem_bootstrap_weights) - 1;\n"
-	"}\n")
-	
-if (BADEM_SECURE_RPC)
-	set (SECURE_RPC_SOURCE badem/node/rpc_secure.cpp badem/node/rpc_secure.hpp)
-endif ()
+if (BADEM_GUI OR BDM_GUI)
+	if (WIN32)
+		set (PLATFORM_QT_PACKAGES WinExtras)
+	else ()
+		set (PLATFORM_QT_PACKAGES)
+	endif ()
 
-add_library (secure
-	${PLATFORM_SECURE_SOURCE}
-	${CMAKE_BINARY_DIR}/bootstrap_weights.cpp
-	badem/config.hpp
-	badem/common.cpp
-	badem/common.hpp
-	badem/blockstore.cpp
-	badem/blockstore.hpp
-	badem/ledger.cpp
-	badem/ledger.hpp
-	badem/node/utility.cpp
-	badem/node/utility.hpp
-	badem/versioning.hpp
-	badem/versioning.cpp)
-
-SET (RAI_LIB_SOURCES
-	${PLATFORM_LIB_SOURCE}
-	badem/lib/blocks.cpp
-	badem/lib/blocks.hpp
-	badem/lib/interface.cpp
-	badem/lib/interface.h
-	badem/lib/numbers.cpp
-	badem/lib/numbers.hpp
-	badem/lib/utility.cpp
-	badem/lib/utility.hpp
-	badem/lib/work.hpp
-	badem/lib/work.cpp)
-
-add_library (badem_lib SHARED ${RAI_LIB_SOURCES})
-add_library (badem_lib_static STATIC ${RAI_LIB_SOURCES})
-
-add_library (node
-	${PLATFORM_NODE_SOURCE}
-	${SECURE_RPC_SOURCE}
-	badem/node/bootstrap.cpp
-	badem/node/bootstrap.hpp
-	badem/node/common.cpp
-	badem/node/common.hpp
-	badem/node/node.hpp
-	badem/node/node.cpp
-	badem/node/openclwork.cpp
-	badem/node/openclwork.hpp
-	badem/node/rpc.hpp
-	badem/node/rpc.cpp
-	badem/node/testing.hpp
-	badem/node/testing.cpp
-	badem/node/wallet.hpp
-	badem/node/wallet.cpp
-	badem/node/stats.hpp
-	badem/node/stats.cpp
-	badem/node/working.hpp
-	badem/node/xorshift.hpp)
-
-
-SET (ACTIVE_NETWORK badem_live_network CACHE STRING "Selects which network parameters are used")
-set_property (CACHE ACTIVE_NETWORK PROPERTY STRINGS badem_test_network badem_beta_network badem_live_network)
-
-if (BADEM_TEST)
-	add_executable (core_test
-		badem/core_test/block.cpp
-		badem/core_test/block_store.cpp
-		badem/core_test/interface.cpp
-		badem/core_test/conflicts.cpp
-		badem/core_test/daemon.cpp
-		badem/core_test/entry.cpp
-		badem/core_test/gap_cache.cpp
-		badem/core_test/ledger.cpp
-		badem/core_test/network.cpp
-		badem/core_test/node.cpp
-		badem/core_test/message.cpp
-		badem/core_test/message_parser.cpp
-		badem/core_test/processor_service.cpp
-		badem/core_test/peer_container.cpp
-		badem/core_test/rpc.cpp
-		badem/core_test/uint256_union.cpp
-		badem/core_test/versioning.cpp
-		badem/core_test/wallet.cpp
-		badem/core_test/wallets.cpp
-		badem/core_test/work_pool.cpp)
-
-	add_executable (slow_test
-		badem/slow_test/node.cpp)
-	
-	set_target_properties (core_test slow_test PROPERTIES COMPILE_FLAGS "${PLATFORM_CXX_FLAGS} ${PLATFORM_COMPILE_FLAGS} -DQT_NO_KEYWORDS -DACTIVE_NETWORK=${ACTIVE_NETWORK} -DBADEM_VERSION_MAJOR=${CPACK_PACKAGE_VERSION_MAJOR} -DBADEM_VERSION_MINOR=${CPACK_PACKAGE_VERSION_MINOR} -DBOOST_ASIO_HAS_STD_ARRAY=1")
-	set_target_properties (core_test slow_test PROPERTIES LINK_FLAGS "${PLATFORM_LINK_FLAGS}")
-endif (BADEM_TEST)
-
-if (BADEM_GUI)
-
-	qt5_add_resources(RES resources.qrc)
-
+	find_package (Qt5 COMPONENTS Core Gui Widgets Test ${PLATFORM_QT_PACKAGES})
 
 	add_library (qt
 		badem/qt/qt.cpp
 		badem/qt/qt.hpp)
 
+	target_link_libraries(qt
+		secure badem_lib node libminiupnpc-static Qt5::Gui Qt5::Widgets)
+
+	target_compile_definitions(qt
+		PRIVATE
+		-DBADEM_VERSION_MAJOR=${CPACK_PACKAGE_VERSION_MAJOR}
+		-DBADEM_VERSION_MINOR=${CPACK_PACKAGE_VERSION_MINOR}
+		-DBADEM_VERSION_PATCH=${CPACK_PACKAGE_VERSION_PATCH})
+
+	if (WIN32)
+		set (PLATFORM_GUI_TARGET_PROPERTIES WIN32)
+	else ()
+		set (PLATFORM_GUI_TARGET_PROPERTIES "")
+	endif ()
+
+	if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+		set (PLATFORM_WALLET_SOURCE badem/badem_wallet/plat/default/icon.cpp)
+	elseif (${CMAKE_SYSTEM_NAME} MATCHES "Windows")
+		set (PLATFORM_WALLET_SOURCE badem/badem_wallet/plat/windows/icon.cpp Badem.rc)
+	elseif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+		set (PLATFORM_WALLET_SOURCE badem/badem_wallet/plat/default/icon.cpp)
+	elseif (${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD")
+		set (PLATFORM_WALLET_SOURCE badem/badem_wallet/plat/default/icon.cpp)
+	else ()
+		error ("Unknown platform: ${CMAKE_SYSTEM_NAME}")
+	endif ()
+
+	qt5_add_resources(RES resources.qrc)
+
 	add_executable (badem_wallet ${PLATFORM_GUI_TARGET_PROPERTIES}
 		${PLATFORM_WALLET_SOURCE}
 		badem/badem_wallet/entry.cpp
+		badem/badem_wallet/icon.hpp
 		${RES})
 
-	add_executable (qt_test
-		badem/qt_test/entry.cpp
-		badem/qt_test/qt.cpp)
+	target_link_libraries (badem_wallet
+		node
+		qt)
+
+	if (WIN32)
+		target_link_libraries (badem_wallet Qt5::WinExtras)
+		# badem_wallet.com executable for Windows console
+		add_executable(badem_wallet_com
+			badem/badem_wallet/entry_com.cpp)
+		target_link_libraries (badem_wallet_com
+			node)
+		set_target_properties (badem_wallet_com PROPERTIES COMPILE_FLAGS "-DBOOST_ASIO_HAS_STD_ARRAY=1" OUTPUT_NAME "badem_wallet" SUFFIX ".com")
+	endif()
 
 	add_executable (qt_system
 		badem/qt_system/entry.cpp)
 
-	set_target_properties (badem_wallet qt_test PROPERTIES LINK_FLAGS "${PLATFORM_LINK_FLAGS}")
-	
-	set_target_properties (qt_test qt badem_wallet qt_system PROPERTIES COMPILE_FLAGS "${PLATFORM_CXX_FLAGS} ${PLATFORM_COMPILE_FLAGS} -DQT_NO_KEYWORDS -DACTIVE_NETWORK=${ACTIVE_NETWORK} -DBADEM_VERSION_MAJOR=${CPACK_PACKAGE_VERSION_MAJOR} -DBADEM_VERSION_MINOR=${CPACK_PACKAGE_VERSION_MINOR} -DBOOST_ASIO_HAS_STD_ARRAY=1")
-	set_target_properties (qt qt_system PROPERTIES LINK_FLAGS "${PLATFORM_LINK_FLAGS}")
-endif (BADEM_GUI)
+	target_link_libraries (qt_system qt node Qt5::Gui Qt5::Widgets)
 
-add_executable (badem_node
-	badem/badem_node/daemon.cpp
-	badem/badem_node/daemon.hpp
-	badem/badem_node/entry.cpp)
+	set_target_properties (qt badem_wallet qt_system PROPERTIES COMPILE_FLAGS "-DQT_NO_KEYWORDS -DBOOST_ASIO_HAS_STD_ARRAY=1")
 
-set_target_properties (argon2 PROPERTIES COMPILE_FLAGS "${PLATFORM_C_FLAGS} ${PLATFORM_COMPILE_FLAGS}")
-set_target_properties (blake2 PROPERTIES COMPILE_FLAGS "${PLATFORM_C_FLAGS} ${PLATFORM_COMPILE_FLAGS} -D__SSE2__")
-set_target_properties (ed25519 PROPERTIES COMPILE_FLAGS "${PLATFORM_C_FLAGS} ${PLATFORM_COMPILE_FLAGS} -DED25519_CUSTOMHASH -DED25519_CUSTOMRNG")
-set_target_properties (secure node badem_node badem_lib badem_lib_static PROPERTIES COMPILE_FLAGS "${PLATFORM_CXX_FLAGS} ${PLATFORM_COMPILE_FLAGS} -DQT_NO_KEYWORDS -DACTIVE_NETWORK=${ACTIVE_NETWORK} -DBADEM_VERSION_MAJOR=${CPACK_PACKAGE_VERSION_MAJOR} -DBADEM_VERSION_MINOR=${CPACK_PACKAGE_VERSION_MINOR} -DBOOST_ASIO_HAS_STD_ARRAY=1")
-set_target_properties (secure node badem_node PROPERTIES LINK_FLAGS "${PLATFORM_LINK_FLAGS}")
+	if (BADEM_TEST OR BDM_TEST)
+		add_executable (qt_test
+			badem/qt_test/entry.cpp
+			badem/qt_test/qt.cpp)
 
-if (WIN32)
-	set (PLATFORM_LIBS Ws2_32 mswsock iphlpapi ntdll)
-else (WIN32)
-	set (PLATFORM_LIBS pthread ${CMAKE_DL_LIBS})
-endif (WIN32)
+		target_link_libraries(qt_test gtest gtest_main qt Qt5::Test)
 
-if (WIN32)
-	set (PLATFORM_WALLET_LIBS Qt5::WinExtras)
-else (WIN32)
-	set (PLATFORM_WALLET_LIBS)
-endif (WIN32)
+		set_target_properties (qt_test PROPERTIES COMPILE_FLAGS "-DQT_NO_KEYWORDS -DBOOST_ASIO_HAS_STD_ARRAY=1")
+	endif ()
 
-if (BADEM_TEST)
-	target_link_libraries (core_test node secure lmdb ed25519 badem_lib_static argon2 ${OPENSSL_LIBRARIES} ${CRYPTOPP_LIBRARY} gtest_main gtest libminiupnpc-static ${Boost_ATOMIC_LIBRARY} ${Boost_CHRONO_LIBRARY} ${Boost_REGEX_LIBRARY} ${Boost_DATE_TIME_LIBRARY} ${Boost_FILESYSTEM_LIBRARY} ${Boost_SYSTEM_LIBRARY} ${Boost_LOG_LIBRARY} ${Boost_LOG_SETUP_LIBRARY} ${Boost_PROGRAM_OPTIONS_LIBRARY} ${Boost_THREAD_LIBRARY} ${PLATFORM_LIBS})
-
-	target_link_libraries (slow_test node secure lmdb ed25519 badem_lib_static argon2 ${OPENSSL_LIBRARIES} ${CRYPTOPP_LIBRARY} gtest_main gtest libminiupnpc-static ${Boost_ATOMIC_LIBRARY} ${Boost_CHRONO_LIBRARY} ${Boost_REGEX_LIBRARY} ${Boost_DATE_TIME_LIBRARY} ${Boost_FILESYSTEM_LIBRARY} ${Boost_SYSTEM_LIBRARY} ${Boost_LOG_LIBRARY} ${Boost_PROGRAM_OPTIONS_LIBRARY} ${Boost_LOG_SETUP_LIBRARY} ${Boost_THREAD_LIBRARY} ${PLATFORM_LIBS})
-endif (BADEM_TEST)
-
-if (BADEM_GUI)
-	target_link_libraries (qt_test node secure lmdb ed25519 badem_lib_static qt argon2 ${OPENSSL_LIBRARIES} ${CRYPTOPP_LIBRARY} gtest libminiupnpc-static ${Boost_ATOMIC_LIBRARY} ${Boost_CHRONO_LIBRARY} ${Boost_REGEX_LIBRARY} ${Boost_DATE_TIME_LIBRARY} ${Boost_FILESYSTEM_LIBRARY} ${Boost_SYSTEM_LIBRARY} ${Boost_LOG_LIBRARY} ${Boost_PROGRAM_OPTIONS_LIBRARY} ${Boost_LOG_SETUP_LIBRARY} ${Boost_THREAD_LIBRARY} Qt5::Core Qt5::Gui Qt5::Widgets Qt5::Test ${QT_QTGUI_LIBRARY} ${PLATFORM_LIBS})
-
-	target_link_libraries (qt_system node secure lmdb ed25519 badem_lib_static qt argon2 ${OPENSSL_LIBRARIES} ${CRYPTOPP_LIBRARY} gtest libminiupnpc-static ${Boost_ATOMIC_LIBRARY} ${Boost_CHRONO_LIBRARY} ${Boost_REGEX_LIBRARY} ${Boost_DATE_TIME_LIBRARY} ${Boost_FILESYSTEM_LIBRARY} ${Boost_SYSTEM_LIBRARY} ${Boost_LOG_LIBRARY} ${Boost_PROGRAM_OPTIONS_LIBRARY} ${Boost_LOG_SETUP_LIBRARY} ${Boost_THREAD_LIBRARY} Qt5::Core Qt5::Gui Qt5::Widgets ${QT_QTGUI_LIBRARY} ${PLATFORM_LIBS})
-
-	target_link_libraries (badem_wallet node secure lmdb ed25519 badem_lib_static qt argon2 ${OPENSSL_LIBRARIES} ${CRYPTOPP_LIBRARY} libminiupnpc-static ${Boost_ATOMIC_LIBRARY} ${Boost_CHRONO_LIBRARY} ${Boost_REGEX_LIBRARY} ${Boost_DATE_TIME_LIBRARY} ${Boost_FILESYSTEM_LIBRARY} ${Boost_SYSTEM_LIBRARY} ${Boost_LOG_LIBRARY} ${Boost_PROGRAM_OPTIONS_LIBRARY} ${Boost_LOG_SETUP_LIBRARY} ${Boost_THREAD_LIBRARY} Qt5::Core Qt5::Gui Qt5::Widgets ${QT_QTGUI_LIBRARY} ${PLATFORM_LIBS} ${PLATFORM_WALLET_LIBS})
-endif (BADEM_GUI)
-
-target_link_libraries (badem_lib ed25519 xxhash blake2 ${CRYPTOPP_LIBRARY})
-target_link_libraries (badem_lib_static ed25519 xxhash blake2 ${CRYPTOPP_LIBRARY})
-
-target_link_libraries (badem_node node secure lmdb ed25519 badem_lib_static argon2 ${OPENSSL_LIBRARIES} ${CRYPTOPP_LIBRARY} libminiupnpc-static ${Boost_ATOMIC_LIBRARY} ${Boost_CHRONO_LIBRARY} ${Boost_REGEX_LIBRARY} ${Boost_DATE_TIME_LIBRARY} ${Boost_FILESYSTEM_LIBRARY} ${Boost_SYSTEM_LIBRARY} ${Boost_LOG_LIBRARY} ${Boost_PROGRAM_OPTIONS_LIBRARY} ${Boost_LOG_SETUP_LIBRARY} ${Boost_THREAD_LIBRARY} ${PLATFORM_LIBS})
-
-set (CPACK_RESOURCE_FILE_LICENSE ${CMAKE_SOURCE_DIR}/LICENSE)
-if (BADEM_GUI)
 	if (APPLE)
+		CONFIGURE_FILE(${CMAKE_SOURCE_DIR}/Info.plist.in ${CMAKE_SOURCE_DIR}/Info.plist @ONLY)
 		install (TARGETS badem_wallet DESTINATION Badem.app/Contents/MacOS)
-		install (FILES badem.icns DESTINATION Badem.app/Contents/Resources)
+		install (FILES Info.plist DESTINATION Badem.app/Contents)
+		install (FILES qt.conf DESTINATION Badem.app/Contents/Resources)
+		install (DIRECTORY ${Qt5_DIR}/../../QtCore.framework DESTINATION Badem.app/Contents/Frameworks)
+		install (DIRECTORY ${Qt5_DIR}/../../QtGui.framework DESTINATION Badem.app/Contents/Frameworks)
+		install (DIRECTORY ${Qt5_DIR}/../../QtPrintSupport.framework DESTINATION Badem.app/Contents/Frameworks)
+		install (DIRECTORY ${Qt5_DIR}/../../QtTest.framework DESTINATION Badem.app/Contents/Frameworks)
+		install (DIRECTORY ${Qt5_DIR}/../../QtWidgets.framework DESTINATION Badem.app/Contents/Frameworks)
+		install (FILES "${Qt5_DIR}/../../../plugins/platforms/libqcocoa.dylib" DESTINATION Badem.app/Contents/PlugIns/platforms)
+		install (FILES Badem.icns DESTINATION Badem.app/Contents/Resources)
 	elseif (WIN32)
 		if ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
 			set (WIN_REDIST vc_redist.x64.exe)
@@ -432,17 +399,18 @@ if (BADEM_GUI)
 			set (WIN_REDIST vc_redist.x86.exe)
 		endif ()
 		set (CPACK_NSIS_EXTRA_INSTALL_COMMANDS "ExecWait '\\\"$INSTDIR\\\\${WIN_REDIST}\\\" /quiet /norestart'")
-		set (CPACK_NSIS_MUI_ICON ${CMAKE_SOURCE_DIR}/badem.ico)
+		set (CPACK_NSIS_MUI_ICON ${CMAKE_SOURCE_DIR}/Badem.ico)
 		set (CPACK_NSIS_DISPLAY_NAME "Badem")
 		set (CPACK_PACKAGE_NAME "Badem_Installer")
 		set (CPACK_NSIS_PACKAGE_NAME "Badem ${CPACK_PACKAGE_VERSION_MAJOR}.${CPACK_PACKAGE_VERSION_MINOR}.${CPACK_PACKAGE_VERSION_PATCH}")
-		set (CPACK_NSIS_URL_INFO_ABOUT "https://website.org")
-		set (CPACK_NSIS_CONTACT "contact@website.org")
-		set (CPACK_NSIS_MENU_LINKS "badem_wallet.exe" "Badem Wallet" "https://website.org" "Badem website")
+		set (CPACK_NSIS_URL_INFO_ABOUT "https://badem.io")
+		set (CPACK_NSIS_CONTACT "info@badem.io")
+		set (CPACK_NSIS_MENU_LINKS "badem_wallet.exe" "Badem Wallet" "https://badem.io" "Badem website")
 		set (CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
 		get_target_property (Qt5WindowsPlugin Qt5::QWindowsIntegrationPlugin LOCATION)
 		get_filename_component (Qt5_bin_DIR ${Qt5_DIR}/../../../bin ABSOLUTE)
 		install (TARGETS badem_wallet DESTINATION .)
+		install (TARGETS badem_wallet_com DESTINATION .)
 		install (FILES ${CMAKE_CURRENT_BINARY_DIR}/${WIN_REDIST} DESTINATION .)
 		install (FILES ${Qt5_bin_DIR}/libGLESv2.dll DESTINATION .)
 		install (FILES ${Qt5_bin_DIR}/Qt5Core.dll DESTINATION .)
@@ -451,12 +419,14 @@ if (BADEM_GUI)
 		install (FILES ${Qt5_bin_DIR}/Qt5WinExtras.dll DESTINATION .)
 		install (FILES ${Qt5WindowsPlugin} DESTINATION platforms)
 	else ()
-		install(TARGETS badem_wallet badem_node badem_lib
+		install(TARGETS badem_wallet
 				RUNTIME DESTINATION bin
 				LIBRARY DESTINATION lib
 				ARCHIVE DESTINATION lib
 		)
 	endif ()
-endif (BADEM_GUI)
+endif ()
+
+set (CPACK_RESOURCE_FILE_LICENSE ${CMAKE_SOURCE_DIR}/LICENSE)
 
 include (CPack)

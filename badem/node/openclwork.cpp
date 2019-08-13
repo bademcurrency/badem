@@ -371,7 +371,7 @@ __kernel void badem_work (__global ulong * attempt, __global ulong * result_a, _
 	blake2b_update (&state, item_l, 32);
 	ulong result;
 	blake2b_final (&state, (uchar *) &result, sizeof (result));
-	if (result >= 0xfffffe0000000000ul)
+	if (result >= 0xffffffc000000000ul)
 	//if (result >= 0xff00000000000000ul)
 	{
 		*result_a = attempt_l;
@@ -401,7 +401,7 @@ void printstate (blake2b_state * S)
 	<< std::dec << std::endl;
 }
 
-rai::opencl_environment::opencl_environment (bool & error_a)
+badem::opencl_environment::opencl_environment (bool & error_a)
 {
 	cl_uint platformIdCount = 0;
 	clGetPlatformIDs (0, nullptr, &platformIdCount);
@@ -409,7 +409,7 @@ rai::opencl_environment::opencl_environment (bool & error_a)
 	clGetPlatformIDs (platformIdCount, platformIds.data (), nullptr);
 	for (auto i (platformIds.begin ()), n (platformIds.end ()); i != n; ++i)
 	{
-		rai::opencl_platform platform;
+		badem::opencl_platform platform;
 		platform.platform = *i;
 		cl_uint deviceIdCount = 0;
 		clGetDeviceIDs (*i, CL_DEVICE_TYPE_ALL, 0, nullptr, &deviceIdCount);
@@ -423,10 +423,10 @@ rai::opencl_environment::opencl_environment (bool & error_a)
 	}
 }
 
-void rai::opencl_environment::dump (std::ostream & stream)
+void badem::opencl_environment::dump (std::ostream & stream)
 {
 	auto index (0);
-	auto device_count (0);
+	size_t device_count (0);
 	for (auto & i : platforms)
 	{
 		device_count += i.devices.size ();
@@ -498,54 +498,37 @@ void rai::opencl_environment::dump (std::ostream & stream)
 	}
 }
 
-rai::opencl_config::opencl_config () :
+badem::opencl_config::opencl_config () :
 platform (0),
 device (0),
 threads (1024 * 1024)
 {
 }
 
-rai::opencl_config::opencl_config (unsigned platform_a, unsigned device_a, unsigned threads_a) :
+badem::opencl_config::opencl_config (unsigned platform_a, unsigned device_a, unsigned threads_a) :
 platform (platform_a),
 device (device_a),
 threads (threads_a)
 {
 }
 
-void rai::opencl_config::serialize_json (boost::property_tree::ptree & tree_a) const
+badem::error badem::opencl_config::serialize_json (badem::jsonconfig & json) const
 {
-	tree_a.put ("platform", std::to_string (platform));
-	tree_a.put ("device", std::to_string (device));
-	tree_a.put ("threads", std::to_string (threads));
+	json.put ("platform", platform);
+	json.put ("device", device);
+	json.put ("threads", threads);
+	return json.get_error ();
 }
 
-bool rai::opencl_config::deserialize_json (boost::property_tree::ptree const & tree_a)
+badem::error badem::opencl_config::deserialize_json (badem::jsonconfig & json)
 {
-	auto result (false);
-	try
-	{
-		auto platform_l (tree_a.get<std::string> ("platform"));
-		auto device_l (tree_a.get<std::string> ("device"));
-		auto threads_l (tree_a.get<std::string> ("threads"));
-		try
-		{
-			platform = std::stoull (platform_l);
-			device = std::stoull (device_l);
-			threads = std::stoull (threads_l);
-		}
-		catch (std::logic_error const &)
-		{
-			result = true;
-		}
-	}
-	catch (std::runtime_error const &)
-	{
-		result = true;
-	}
-	return result;
+	json.get_optional<unsigned> ("platform", platform);
+	json.get_optional<unsigned> ("device", device);
+	json.get_optional<unsigned> ("threads", threads);
+	return json.get_error ();
 }
 
-rai::opencl_work::opencl_work (bool & error_a, rai::opencl_config const & config_a, rai::opencl_environment & environment_a, rai::logging & logging_a) :
+badem::opencl_work::opencl_work (bool & error_a, badem::opencl_config const & config_a, badem::opencl_environment & environment_a, badem::logging & logging_a) :
 config (config_a),
 context (0),
 attempt_buffer (0),
@@ -563,7 +546,7 @@ logging (logging_a)
 		error_a |= config.device >= platform.devices.size ();
 		if (!error_a)
 		{
-			rai::random_pool.GenerateBlock (reinterpret_cast<uint8_t *> (rand.s.data ()), rand.s.size () * sizeof (decltype (rand.s)::value_type));
+			badem::random_pool::generate_block (reinterpret_cast<uint8_t *> (rand.s.data ()), rand.s.size () * sizeof (decltype (rand.s)::value_type));
 			std::array<cl_device_id, 1> selected_devices;
 			selected_devices[0] = platform.devices[config.device];
 			cl_context_properties contextProperties[] = {
@@ -572,7 +555,7 @@ logging (logging_a)
 				0, 0
 			};
 			cl_int createContextError (0);
-			context = clCreateContext (contextProperties, selected_devices.size (), selected_devices.data (), nullptr, nullptr, &createContextError);
+			context = clCreateContext (contextProperties, static_cast<cl_uint> (selected_devices.size ()), selected_devices.data (), nullptr, nullptr, &createContextError);
 			error_a |= createContextError != CL_SUCCESS;
 			if (!error_a)
 			{
@@ -592,7 +575,7 @@ logging (logging_a)
 						if (!error_a)
 						{
 							cl_int item_error (0);
-							size_t item_size (sizeof (rai::uint256_union));
+							size_t item_size (sizeof (badem::uint256_union));
 							item_buffer = clCreateBuffer (context, 0, item_size, nullptr, &item_error);
 							error_a |= item_error != CL_SUCCESS;
 							if (!error_a)
@@ -604,7 +587,7 @@ logging (logging_a)
 								error_a |= program_error != CL_SUCCESS;
 								if (!error_a)
 								{
-									auto clBuildProgramError (clBuildProgram (program, selected_devices.size (), selected_devices.data (), "-D __APPLE__", nullptr, nullptr));
+									auto clBuildProgramError (clBuildProgram (program, static_cast<cl_uint> (selected_devices.size ()), selected_devices.data (), "-D __APPLE__", nullptr, nullptr));
 									error_a |= clBuildProgramError != CL_SUCCESS;
 									if (!error_a)
 									{
@@ -700,7 +683,7 @@ logging (logging_a)
 	}
 }
 
-rai::opencl_work::~opencl_work ()
+badem::opencl_work::~opencl_work ()
 {
 	if (kernel != 0)
 	{
@@ -716,20 +699,20 @@ rai::opencl_work::~opencl_work ()
 	}
 }
 
-boost::optional<uint64_t> rai::opencl_work::generate_work (rai::uint256_union const & root_a)
+boost::optional<uint64_t> badem::opencl_work::generate_work (badem::uint256_union const & root_a)
 {
 	std::lock_guard<std::mutex> lock (mutex);
 	bool error (false);
 	uint64_t result (0);
 	unsigned thread_count (config.threads);
 	size_t work_size[] = { thread_count, 0, 0 };
-	while (rai::work_validate (root_a, result) && !error)
+	while (badem::work_validate (root_a, result) && !error)
 	{
 		result = rand.next ();
 		cl_int write_error1 = clEnqueueWriteBuffer (queue, attempt_buffer, false, 0, sizeof (uint64_t), &result, 0, nullptr, nullptr);
 		if (write_error1 == CL_SUCCESS)
 		{
-			cl_int write_error2 = clEnqueueWriteBuffer (queue, item_buffer, false, 0, sizeof (rai::uint256_union), root_a.bytes.data (), 0, nullptr, nullptr);
+			cl_int write_error2 = clEnqueueWriteBuffer (queue, item_buffer, false, 0, sizeof (badem::uint256_union), root_a.bytes.data (), 0, nullptr, nullptr);
 			if (write_error2 == CL_SUCCESS)
 			{
 				cl_int enqueue_error = clEnqueueNDRangeKernel (queue, kernel, 1, nullptr, work_size, nullptr, 0, nullptr, nullptr);
@@ -780,19 +763,19 @@ boost::optional<uint64_t> rai::opencl_work::generate_work (rai::uint256_union co
 	return value;
 }
 
-std::unique_ptr<rai::opencl_work> rai::opencl_work::create (bool create_a, rai::opencl_config const & config_a, rai::logging & logging_a)
+std::unique_ptr<badem::opencl_work> badem::opencl_work::create (bool create_a, badem::opencl_config const & config_a, badem::logging & logging_a)
 {
-	std::unique_ptr<rai::opencl_work> result;
+	std::unique_ptr<badem::opencl_work> result;
 	if (create_a)
 	{
 		auto error (false);
-		rai::opencl_environment environment (error);
+		badem::opencl_environment environment (error);
 		std::stringstream stream;
 		environment.dump (stream);
 		BOOST_LOG (logging_a.log) << stream.str ();
 		if (!error)
 		{
-			result.reset (new rai::opencl_work (error, config_a, environment, logging_a));
+			result.reset (new badem::opencl_work (error, config_a, environment, logging_a));
 			if (error)
 			{
 				result.reset ();

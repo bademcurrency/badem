@@ -1,130 +1,149 @@
-#include <badem/badem_node/daemon.hpp>
-
 #include <boost/property_tree/json_parser.hpp>
 #include <fstream>
 #include <iostream>
+#include <badem/lib/jsonconfig.hpp>
+#include <badem/lib/utility.hpp>
+#include <badem/badem_node/daemon.hpp>
+#include <badem/node/ipc.hpp>
 #include <badem/node/working.hpp>
 
-badem_daemon::daemon_config::daemon_config (boost::filesystem::path const & application_path_a) :
+badem_daemon::daemon_config::daemon_config () :
 rpc_enable (false),
 opencl_enable (false)
 {
 }
 
-void badem_daemon::daemon_config::serialize_json (boost::property_tree::ptree & tree_a)
+badem::error badem_daemon::daemon_config::serialize_json (badem::jsonconfig & json)
 {
-	tree_a.put ("version", "2");
-	tree_a.put ("rpc_enable", rpc_enable);
-	boost::property_tree::ptree rpc_l;
+	json.put ("version", json_version ());
+	json.put ("rpc_enable", rpc_enable);
+
+	badem::jsonconfig rpc_l;
 	rpc.serialize_json (rpc_l);
-	tree_a.add_child ("rpc", rpc_l);
-	boost::property_tree::ptree node_l;
+	json.put_child ("rpc", rpc_l);
+
+	badem::jsonconfig node_l;
 	node.serialize_json (node_l);
-	tree_a.add_child ("node", node_l);
-	tree_a.put ("opencl_enable", opencl_enable);
-	boost::property_tree::ptree opencl_l;
+	badem::jsonconfig node (node_l);
+	json.put_child ("node", node);
+
+	json.put ("opencl_enable", opencl_enable);
+	badem::jsonconfig opencl_l;
 	opencl.serialize_json (opencl_l);
-	tree_a.add_child ("opencl", opencl_l);
+	json.put_child ("opencl", opencl_l);
+	return json.get_error ();
 }
 
-bool badem_daemon::daemon_config::deserialize_json (bool & upgraded_a, boost::property_tree::ptree & tree_a)
+badem::error badem_daemon::daemon_config::deserialize_json (bool & upgraded_a, badem::jsonconfig & json)
 {
-	auto error (false);
 	try
 	{
-		if (!tree_a.empty ())
+		if (!json.empty ())
 		{
-			auto version_l (tree_a.get_optional<std::string> ("version"));
-			if (!version_l)
+			int version_l;
+			json.get_optional<int> ("version", version_l);
+			upgraded_a |= upgrade_json (version_l, json);
+
+			json.get_optional<bool> ("rpc_enable", rpc_enable);
+			auto rpc_l (json.get_required_child ("rpc"));
+
+			if (!rpc.deserialize_json (rpc_l))
 			{
-				tree_a.put ("version", "1");
-				version_l = "1";
+				auto node_l (json.get_required_child ("node"));
+				if (!json.get_error ())
+				{
+					node.deserialize_json (upgraded_a, node_l);
+				}
 			}
-			upgraded_a |= upgrade_json (std::stoull (version_l.get ()), tree_a);
-			rpc_enable = tree_a.get<bool> ("rpc_enable");
-			auto rpc_l (tree_a.get_child ("rpc"));
-			error |= rpc.deserialize_json (rpc_l);
-			auto & node_l (tree_a.get_child ("node"));
-			error |= node.deserialize_json (upgraded_a, node_l);
-			opencl_enable = tree_a.get<bool> ("opencl_enable");
-			auto & opencl_l (tree_a.get_child ("opencl"));
-			error |= opencl.deserialize_json (opencl_l);
+			if (!json.get_error ())
+			{
+				json.get_required<bool> ("opencl_enable", opencl_enable);
+				auto opencl_l (json.get_required_child ("opencl"));
+				if (!json.get_error ())
+				{
+					opencl.deserialize_json (opencl_l);
+				}
+			}
 		}
 		else
 		{
 			upgraded_a = true;
-			serialize_json (tree_a);
+			serialize_json (json);
 		}
 	}
-	catch (std::runtime_error const &)
+	catch (std::runtime_error const & ex)
 	{
-		error = true;
+		json.get_error () = ex;
 	}
-	return error;
+	return json.get_error ();
 }
 
-bool badem_daemon::daemon_config::upgrade_json (unsigned version_a, boost::property_tree::ptree & tree_a)
+bool badem_daemon::daemon_config::upgrade_json (unsigned version_a, badem::jsonconfig & json)
 {
-	auto result (false);
+	json.put ("version", json_version ());
+	auto upgraded_l (false);
 	switch (version_a)
 	{
 		case 1:
 		{
-			auto opencl_enable_l (tree_a.get_optional<bool> ("opencl_enable"));
+			bool opencl_enable_l;
+			json.get_optional<bool> ("opencl_enable", opencl_enable_l);
 			if (!opencl_enable_l)
 			{
-				tree_a.put ("opencl_enable", "false");
+				json.put ("opencl_enable", false);
 			}
-			auto opencl_l (tree_a.get_child_optional ("opencl"));
+			auto opencl_l (json.get_optional_child ("opencl"));
 			if (!opencl_l)
 			{
-				boost::property_tree::ptree opencl_l;
+				badem::jsonconfig opencl_l;
 				opencl.serialize_json (opencl_l);
-				tree_a.put_child ("opencl", opencl_l);
+				json.put_child ("opencl", opencl_l);
 			}
-			tree_a.put ("version", "2");
-			result = true;
+			upgraded_l = true;
 		}
 		case 2:
 			break;
 		default:
 			throw std::runtime_error ("Unknown daemon_config version");
 	}
-	return result;
+	return upgraded_l;
 }
 
-void badem_daemon::daemon::run (boost::filesystem::path const & data_path)
+void badem_daemon::daemon::run (boost::filesystem::path const & data_path, badem::node_flags const & flags)
 {
+	boost::system::error_code error_chmod;
 	boost::filesystem::create_directories (data_path);
-	badem_daemon::daemon_config config (data_path);
+	badem_daemon::daemon_config config;
+	badem::set_secure_perm_directory (data_path, error_chmod);
 	auto config_path ((data_path / "config.json"));
-	std::fstream config_file;
-	std::unique_ptr<rai::thread_runner> runner;
-	auto error (rai::fetch_object (config, config_path, config_file));
+	std::unique_ptr<badem::thread_runner> runner;
+	badem::jsonconfig json;
+	auto error (json.read_and_update (config, config_path));
+	badem::set_secure_perm_file (config_path, error_chmod);
 	if (!error)
 	{
 		config.node.logging.init (data_path);
-		config_file.close ();
-		boost::asio::io_service service;
-		auto opencl (rai::opencl_work::create (config.opencl_enable, config.opencl, config.node.logging));
-		rai::work_pool opencl_work (config.node.work_threads, opencl ? [&opencl](rai::uint256_union const & root_a) {
+		boost::asio::io_context io_ctx;
+		auto opencl (badem::opencl_work::create (config.opencl_enable, config.opencl, config.node.logging));
+		badem::work_pool opencl_work (config.node.work_threads, opencl ? [&opencl](badem::uint256_union const & root_a) {
 			return opencl->generate_work (root_a);
 		}
-		                                                             : std::function<boost::optional<uint64_t> (rai::uint256_union const &)> (nullptr));
-		rai::alarm alarm (service);
-		rai::node_init init;
+		                                                              : std::function<boost::optional<uint64_t> (badem::uint256_union const &)> (nullptr));
+		badem::alarm alarm (io_ctx);
+		badem::node_init init;
 		try
 		{
-			auto node (std::make_shared<rai::node> (init, service, data_path, alarm, config.node, opencl_work));
+			auto node (std::make_shared<badem::node> (init, io_ctx, data_path, alarm, config.node, opencl_work, flags));
 			if (!init.error ())
 			{
 				node->start ();
-				std::unique_ptr<rai::rpc> rpc = get_rpc (service, *node, config.rpc);
-				if (rpc && config.rpc_enable)
+				std::unique_ptr<badem::rpc> rpc = get_rpc (io_ctx, *node, config.rpc);
+				if (rpc)
 				{
-					rpc->start ();
+					rpc->start (config.rpc_enable);
 				}
-				runner = std::make_unique<rai::thread_runner> (service, node->config.io_threads);
+				badem::ipc::ipc_server ipc (*node, *rpc);
+				runner = std::make_unique<badem::thread_runner> (io_ctx, node->config.io_threads);
 				runner->join ();
 			}
 			else
@@ -139,6 +158,6 @@ void badem_daemon::daemon::run (boost::filesystem::path const & data_path)
 	}
 	else
 	{
-		std::cerr << "Error deserializing config\n";
+		std::cerr << "Error deserializing config: " << error.get_message () << std::endl;
 	}
 }

@@ -1,37 +1,28 @@
 FROM ubuntu:16.04
 
-ENV BOOST_ROOT=/tmp/boost_install \
-    BOOST_BASENAME=boost_1_66_0 \
-    BOOST_URL=https://sourceforge.net/projects/boost/files/boost/1.66.0/boost_1_66_0.tar.gz/download
+ARG NETWORK=live
 
-WORKDIR /
+ENV BOOST_ROOT=/tmp/boost_install
 
-RUN apt-get update -qq && apt-get install -yqq \
-    build-essential \
-    cmake \
-    g++ \
-    git \
-    wget && \
-    wget -qO ${BOOST_BASENAME}.tar.gz ${BOOST_URL} && \
-    tar xzf ${BOOST_BASENAME}.tar.gz && \
-    cd ${BOOST_BASENAME} && \
-    ./bootstrap.sh && \
-    ./b2 -d0 --prefix=${BOOST_ROOT} link=static install && \
-    rm -rf ${BOOST_BASENAME} && \
-    rm -f ${BOOST_BASENAME}.tar.gz && \
+ADD ci /tmp/ci
+ADD util /tmp/util
+
+RUN /tmp/util/build_prep/update-common && /tmp/util/build_prep/ubuntu/prep.sh
+
+ADD ./ /tmp/src
+
+RUN mkdir /tmp/build && \
+    cd /tmp/build && \
+    cmake /tmp/src -DBOOST_ROOT=${BOOST_ROOT} -DACTIVE_NETWORK=badem_${NETWORK}_network && \
+    make badem_node && \
     cd .. && \
-    mkdir /usr/share/badem/
+    echo ${NETWORK} > /etc/badem-network
 
-RUN git clone https://github.com/bademcurrency/badem.git badem \
-    && cd badem \
-    && git checkout master \
-    && git submodule init \
-    && git submodule update \
-    && cmake -DBOOST_ROOT=${BOOST_ROOT} -G "Unix Makefiles" \
-    && make badem_node \
-    && mv badem_node / \
-    && rm -rf badem
-
-EXPOSE 2224 2224/udp 2225
-
-CMD ["/badem_node", "--daemon"]
+FROM ubuntu:16.04
+COPY --from=0 /tmp/build/badem_node /usr/bin
+COPY --from=0 /etc/badem-network /etc
+COPY docker/node/entry.sh /entry.sh
+COPY docker/node/config /usr/share/badem/config
+RUN chmod +x /entry.sh
+RUN ln -s /usr/bin/badem_node /usr/bin/bdm_node
+CMD ["/bin/bash",  "/entry.sh"]

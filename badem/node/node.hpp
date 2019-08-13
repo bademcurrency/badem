@@ -1,298 +1,231 @@
 #pragma once
 
-#include <badem/ledger.hpp>
 #include <badem/lib/work.hpp>
+#include <badem/node/blockprocessor.hpp>
 #include <badem/node/bootstrap.hpp>
+#include <badem/node/logging.hpp>
+#include <badem/node/nodeconfig.hpp>
+#include <badem/node/peers.hpp>
+#include <badem/node/portmapping.hpp>
+#include <badem/node/signatures.hpp>
 #include <badem/node/stats.hpp>
 #include <badem/node/wallet.hpp>
+#include <badem/secure/ledger.hpp>
 
+#include <atomic>
 #include <condition_variable>
 #include <memory>
-#include <mutex>
 #include <queue>
-#include <thread>
-#include <unordered_set>
 
-#include <boost/asio.hpp>
+#include <boost/asio/thread_pool.hpp>
 #include <boost/iostreams/device/array.hpp>
-#include <boost/log/trivial.hpp>
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/member.hpp>
 #include <boost/multi_index/ordered_index.hpp>
 #include <boost/multi_index/random_access_index.hpp>
 #include <boost/multi_index_container.hpp>
+#include <boost/thread/thread.hpp>
 
-#include <miniupnpc.h>
+#define xstr(a) ver_str (a)
+#define ver_str(a) #a
 
-namespace boost
-{
-namespace program_options
-{
-	class options_description;
-	class variables_map;
-}
-}
+/**
+* Returns build version information
+*/
+static const char * BADEM_MAJOR_MINOR_VERSION = xstr (BADEM_VERSION_MAJOR) "." xstr (BADEM_VERSION_MINOR);
+static const char * BADEM_MAJOR_MINOR_RC_VERSION = xstr (BADEM_VERSION_MAJOR) "." xstr (BADEM_VERSION_MINOR) "RC" xstr (BADEM_VERSION_PATCH);
 
-namespace rai
+namespace badem
 {
 class node;
 class election_status
 {
 public:
-	std::shared_ptr<rai::block> winner;
-	rai::amount tally;
+	std::shared_ptr<badem::block> winner;
+	badem::amount tally;
+	std::chrono::milliseconds election_end;
+	std::chrono::milliseconds election_duration;
 };
 class vote_info
 {
 public:
 	std::chrono::steady_clock::time_point time;
 	uint64_t sequence;
-	rai::block_hash hash;
-	bool operator< (rai::vote const &) const;
+	badem::block_hash hash;
 };
-class election : public std::enable_shared_from_this<rai::election>
+class election_vote_result
 {
-	std::function<void(std::shared_ptr<rai::block>)> confirmation_action;
-	void confirm_once (MDB_txn *);
+public:
+	election_vote_result ();
+	election_vote_result (bool, bool);
+	bool replay;
+	bool processed;
+};
+class election : public std::enable_shared_from_this<badem::election>
+{
+	std::function<void(std::shared_ptr<badem::block>)> confirmation_action;
+	void confirm_once (badem::transaction const &, bool = false);
+	void confirm_back (badem::transaction const &);
 
 public:
-	election (rai::node &, std::shared_ptr<rai::block>, std::function<void(std::shared_ptr<rai::block>)> const &);
-	bool vote (std::shared_ptr<rai::vote>);
+	election (badem::node &, std::shared_ptr<badem::block>, std::function<void(std::shared_ptr<badem::block>)> const &);
+	badem::election_vote_result vote (badem::account, uint64_t, badem::block_hash);
+	badem::tally_t tally (badem::transaction const &);
 	// Check if we have vote quorum
-	bool have_quorum (rai::tally_t const &);
-	// Tell the network our view of the winner
-	void broadcast_winner ();
+	bool have_quorum (badem::tally_t const &, badem::uint128_t);
 	// Change our winner to agree with the network
-	void compute_rep_votes (MDB_txn *, std::shared_ptr<rai::block>);
+	void compute_rep_votes (badem::transaction const &);
 	// Confirm this block if quorum is met
-	void confirm_if_quorum (MDB_txn *);
-	rai::votes votes;
-	rai::node & node;
-	std::unordered_map<rai::account, rai::vote_info> last_votes;
-	rai::election_status status;
+	void confirm_if_quorum (badem::transaction const &);
+	void log_votes (badem::tally_t const &);
+	bool publish (std::shared_ptr<badem::block> block_a);
+	size_t last_votes_size ();
+	void stop ();
+	badem::node & node;
+	std::unordered_map<badem::account, badem::vote_info> last_votes;
+	std::unordered_map<badem::block_hash, std::shared_ptr<badem::block>> blocks;
+	std::chrono::steady_clock::time_point election_start;
+	badem::election_status status;
 	std::atomic<bool> confirmed;
+	bool stopped;
+	std::unordered_map<badem::block_hash, badem::uint128_t> last_tally;
+	unsigned announcements;
 };
 class conflict_info
 {
 public:
-	rai::block_hash root;
-	std::shared_ptr<rai::election> election;
-	// Number of announcements in a row for this fork
-	unsigned announcements;
-	std::pair<std::shared_ptr<rai::block>, std::shared_ptr<rai::block>> confirm_req_options;
+	badem::uint512_union root;
+	uint64_t difficulty;
+	std::shared_ptr<badem::election> election;
 };
 // Core class for determining consensus
 // Holds all active blocks i.e. recently added blocks that need confirmation
 class active_transactions
 {
 public:
-	active_transactions (rai::node &);
+	active_transactions (badem::node &);
+	~active_transactions ();
 	// Start an election for a block
 	// Call action with confirmed block, may be different than what we started with
-	bool start (std::shared_ptr<rai::block>, std::function<void(std::shared_ptr<rai::block>)> const & = [](std::shared_ptr<rai::block>) {});
-	// Also supply alternatives to block, to confirm_req reps with if the boolean argument is true
-	// Should only be used for old elections
-	// The first block should be the one in the ledger
-	bool start (std::pair<std::shared_ptr<rai::block>, std::shared_ptr<rai::block>>, std::function<void(std::shared_ptr<rai::block>)> const & = [](std::shared_ptr<rai::block>) {});
+	// clang-format off
+	bool start (std::shared_ptr<badem::block>, std::function<void(std::shared_ptr<badem::block>)> const & = [](std::shared_ptr<badem::block>) {});
+	// clang-format on
 	// If this returns true, the vote is a replay
 	// If this returns false, the vote may or may not be a replay
-	bool vote (std::shared_ptr<rai::vote>);
+	bool vote (std::shared_ptr<badem::vote>, bool = false);
 	// Is the root of this block in the roots container
-	bool active (rai::block const &);
-	void announce_votes ();
-	std::deque<std::shared_ptr<rai::block>> list_blocks ();
-	void erase (rai::block const &);
+	bool active (badem::block const &);
+	void update_difficulty (badem::block const &);
+	std::deque<std::shared_ptr<badem::block>> list_blocks (bool = false);
+	void erase (badem::block const &);
+	bool empty ();
+	size_t size ();
 	void stop ();
+	bool publish (std::shared_ptr<badem::block> block_a);
 	boost::multi_index_container<
-	rai::conflict_info,
+	badem::conflict_info,
 	boost::multi_index::indexed_by<
-	boost::multi_index::hashed_unique<boost::multi_index::member<rai::conflict_info, rai::block_hash, &rai::conflict_info::root>>>>
+	boost::multi_index::hashed_unique<
+	boost::multi_index::member<badem::conflict_info, badem::uint512_union, &badem::conflict_info::root>>,
+	boost::multi_index::ordered_non_unique<
+	boost::multi_index::member<badem::conflict_info, uint64_t, &badem::conflict_info::difficulty>,
+	std::greater<uint64_t>>>>
 	roots;
-	std::deque<rai::election_status> confirmed;
-	rai::node & node;
+	std::unordered_map<badem::block_hash, std::shared_ptr<badem::election>> blocks;
+	std::deque<badem::election_status> list_confirmed ();
+	std::deque<badem::election_status> confirmed;
+	badem::node & node;
 	std::mutex mutex;
 	// Maximum number of conflicts to vote on per interval, lowest root hash first
 	static unsigned constexpr announcements_per_interval = 32;
 	// Minimum number of block announcements
-	static unsigned constexpr announcement_min = 4;
+	static unsigned constexpr announcement_min = 2;
 	// Threshold to start logging blocks haven't yet been confirmed
 	static unsigned constexpr announcement_long = 20;
-	static unsigned constexpr announce_interval_ms = (rai::badem_network == rai::badem_networks::badem_test_network) ? 10 : 16000;
+	static unsigned constexpr request_interval_ms = badem::is_test_network ? 10 : 16000;
 	static size_t constexpr election_history_size = 2048;
+	static size_t constexpr max_broadcast_queue = 1000;
+
+private:
+	// Call action with confirmed block, may be different than what we started with
+	// clang-format off
+	bool add (std::shared_ptr<badem::block>, std::function<void(std::shared_ptr<badem::block>)> const & = [](std::shared_ptr<badem::block>) {});
+	// clang-format on
+	void request_loop ();
+	void request_confirm (std::unique_lock<std::mutex> &);
+	std::condition_variable condition;
+	bool started;
+	bool stopped;
+	boost::thread thread;
 };
+
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (active_transactions & active_transactions, const std::string & name);
+
 class operation
 {
 public:
-	bool operator> (rai::operation const &) const;
+	bool operator> (badem::operation const &) const;
 	std::chrono::steady_clock::time_point wakeup;
 	std::function<void()> function;
 };
 class alarm
 {
 public:
-	alarm (boost::asio::io_service &);
+	alarm (boost::asio::io_context &);
 	~alarm ();
 	void add (std::chrono::steady_clock::time_point const &, std::function<void()> const &);
 	void run ();
-	boost::asio::io_service & service;
+	boost::asio::io_context & io_ctx;
 	std::mutex mutex;
 	std::condition_variable condition;
 	std::priority_queue<operation, std::vector<operation>, std::greater<operation>> operations;
-	std::thread thread;
+	boost::thread thread;
 };
+
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (alarm & alarm, const std::string & name);
+
 class gap_information
 {
 public:
 	std::chrono::steady_clock::time_point arrival;
-	rai::block_hash hash;
-	std::unique_ptr<rai::votes> votes;
+	badem::block_hash hash;
+	std::unordered_set<badem::account> voters;
 };
 class gap_cache
 {
 public:
-	gap_cache (rai::node &);
-	void add (MDB_txn *, std::shared_ptr<rai::block>);
-	void vote (std::shared_ptr<rai::vote>);
-	rai::uint128_t bootstrap_threshold (MDB_txn *);
-	void purge_old ();
+	gap_cache (badem::node &);
+	void add (badem::transaction const &, badem::block_hash const &, std::chrono::steady_clock::time_point = std::chrono::steady_clock::now ());
+	void vote (std::shared_ptr<badem::vote>);
+	badem::uint128_t bootstrap_threshold (badem::transaction const &);
+	size_t size ();
 	boost::multi_index_container<
-	rai::gap_information,
+	badem::gap_information,
 	boost::multi_index::indexed_by<
 	boost::multi_index::ordered_non_unique<boost::multi_index::member<gap_information, std::chrono::steady_clock::time_point, &gap_information::arrival>>,
-	boost::multi_index::hashed_unique<boost::multi_index::member<gap_information, rai::block_hash, &gap_information::hash>>>>
+	boost::multi_index::hashed_unique<boost::multi_index::member<gap_information, badem::block_hash, &gap_information::hash>>>>
 	blocks;
 	size_t const max = 256;
 	std::mutex mutex;
-	rai::node & node;
+	badem::node & node;
 };
+
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (gap_cache & gap_cache, const std::string & name);
+
 class work_pool;
-class peer_information
-{
-public:
-	peer_information (rai::endpoint const &, unsigned);
-	peer_information (rai::endpoint const &, std::chrono::steady_clock::time_point const &, std::chrono::steady_clock::time_point const &);
-	rai::endpoint endpoint;
-	std::chrono::steady_clock::time_point last_contact;
-	std::chrono::steady_clock::time_point last_attempt;
-	std::chrono::steady_clock::time_point last_bootstrap_attempt;
-	std::chrono::steady_clock::time_point last_rep_request;
-	std::chrono::steady_clock::time_point last_rep_response;
-	rai::amount rep_weight;
-	rai::account probable_rep_account;
-	unsigned network_version;
-};
-class peer_attempt
-{
-public:
-	rai::endpoint endpoint;
-	std::chrono::steady_clock::time_point last_attempt;
-};
-class peer_container
-{
-public:
-	peer_container (rai::endpoint const &);
-	// We were contacted by endpoint, update peers
-	void contacted (rai::endpoint const &, unsigned);
-	// Unassigned, reserved, self
-	bool not_a_peer (rai::endpoint const &);
-	// Returns true if peer was already known
-	bool known_peer (rai::endpoint const &);
-	// Notify of peer we received from
-	bool insert (rai::endpoint const &, unsigned);
-	std::unordered_set<rai::endpoint> random_set (size_t);
-	void random_fill (std::array<rai::endpoint, 8> &);
-	// Request a list of the top known representatives
-	std::vector<peer_information> representatives (size_t);
-	// List of all peers
-	std::deque<rai::endpoint> list ();
-	std::map<rai::endpoint, unsigned> list_version ();
-	// A list of random peers sized for the configured rebroadcast fanout
-	std::deque<rai::endpoint> list_fanout ();
-	// Get the next peer for attempting bootstrap
-	rai::endpoint bootstrap_peer ();
-	// Purge any peer where last_contact < time_point and return what was left
-	std::vector<rai::peer_information> purge_list (std::chrono::steady_clock::time_point const &);
-	std::vector<rai::endpoint> rep_crawl ();
-	bool rep_response (rai::endpoint const &, rai::account const &, rai::amount const &);
-	void rep_request (rai::endpoint const &);
-	// Should we reach out to this endpoint with a keepalive message
-	bool reachout (rai::endpoint const &);
-	size_t size ();
-	size_t size_sqrt ();
-	bool empty ();
-	std::mutex mutex;
-	rai::endpoint self;
-	boost::multi_index_container<
-	peer_information,
-	boost::multi_index::indexed_by<
-	boost::multi_index::hashed_unique<boost::multi_index::member<peer_information, rai::endpoint, &peer_information::endpoint>>,
-	boost::multi_index::ordered_non_unique<boost::multi_index::member<peer_information, std::chrono::steady_clock::time_point, &peer_information::last_contact>>,
-	boost::multi_index::ordered_non_unique<boost::multi_index::member<peer_information, std::chrono::steady_clock::time_point, &peer_information::last_attempt>, std::greater<std::chrono::steady_clock::time_point>>,
-	boost::multi_index::random_access<>,
-	boost::multi_index::ordered_non_unique<boost::multi_index::member<peer_information, std::chrono::steady_clock::time_point, &peer_information::last_bootstrap_attempt>>,
-	boost::multi_index::ordered_non_unique<boost::multi_index::member<peer_information, std::chrono::steady_clock::time_point, &peer_information::last_rep_request>>,
-	boost::multi_index::ordered_non_unique<boost::multi_index::member<peer_information, rai::amount, &peer_information::rep_weight>, std::greater<rai::amount>>>>
-	peers;
-	boost::multi_index_container<
-	peer_attempt,
-	boost::multi_index::indexed_by<
-	boost::multi_index::hashed_unique<boost::multi_index::member<peer_attempt, rai::endpoint, &peer_attempt::endpoint>>,
-	boost::multi_index::ordered_non_unique<boost::multi_index::member<peer_attempt, std::chrono::steady_clock::time_point, &peer_attempt::last_attempt>>>>
-	attempts;
-	// Called when a new peer is observed
-	std::function<void(rai::endpoint const &)> peer_observer;
-	std::function<void()> disconnect_observer;
-	// Number of peers to crawl for being a rep every period
-	static size_t constexpr peers_per_crawl = 8;
-};
 class send_info
 {
 public:
 	uint8_t const * data;
 	size_t size;
-	rai::endpoint endpoint;
+	badem::endpoint endpoint;
 	std::function<void(boost::system::error_code const &, size_t)> callback;
-};
-class mapping_protocol
-{
-public:
-	char const * name;
-	int remaining;
-	boost::asio::ip::address_v4 external_address;
-	uint16_t external_port;
-};
-// These APIs aren't easy to understand so comments are verbose
-class port_mapping
-{
-public:
-	port_mapping (rai::node &);
-	void start ();
-	void stop ();
-	void refresh_devices ();
-	// Refresh when the lease ends
-	void refresh_mapping ();
-	// Refresh occasionally in case router loses mapping
-	void check_mapping_loop ();
-	int check_mapping ();
-	bool has_address ();
-	std::mutex mutex;
-	rai::node & node;
-	UPNPDev * devices; // List of all UPnP devices
-	UPNPUrls urls; // Something for UPnP
-	IGDdatas data; // Some other UPnP thing
-	// Primes so they infrequently happen at the same time
-	static int constexpr mapping_timeout = rai::badem_network == rai::badem_networks::badem_test_network ? 53 : 3593;
-	static int constexpr check_timeout = rai::badem_network == rai::badem_networks::badem_test_network ? 17 : 53;
-	boost::asio::ip::address_v4 address;
-	std::array<mapping_protocol, 2> protocols;
-	uint64_t check_count;
-	bool on;
 };
 class block_arrival_info
 {
 public:
 	std::chrono::steady_clock::time_point arrival;
-	rai::block_hash hash;
+	badem::block_hash hash;
 };
 // This class tracks blocks that are probably live because they arrived in a UDP packet
 // This gives a fairly reliable way to differentiate between blocks being inserted via bootstrap or new, live blocks.
@@ -300,310 +233,326 @@ class block_arrival
 {
 public:
 	// Return `true' to indicated an error if the block has already been inserted
-	bool add (rai::block_hash const &);
-	bool recent (rai::block_hash const &);
+	bool add (badem::block_hash const &);
+	bool recent (badem::block_hash const &);
 	boost::multi_index_container<
-	rai::block_arrival_info,
+	badem::block_arrival_info,
 	boost::multi_index::indexed_by<
-	boost::multi_index::ordered_non_unique<boost::multi_index::member<rai::block_arrival_info, std::chrono::steady_clock::time_point, &rai::block_arrival_info::arrival>>,
-	boost::multi_index::hashed_unique<boost::multi_index::member<rai::block_arrival_info, rai::block_hash, &rai::block_arrival_info::hash>>>>
+	boost::multi_index::ordered_non_unique<boost::multi_index::member<badem::block_arrival_info, std::chrono::steady_clock::time_point, &badem::block_arrival_info::arrival>>,
+	boost::multi_index::hashed_unique<boost::multi_index::member<badem::block_arrival_info, badem::block_hash, &badem::block_arrival_info::hash>>>>
 	arrival;
 	std::mutex mutex;
 	static size_t constexpr arrival_size_min = 8 * 1024;
 	static std::chrono::seconds constexpr arrival_time_min = std::chrono::seconds (300);
 };
-class rep_last_heard_info
-{
-public:
-	std::chrono::steady_clock::time_point last_heard;
-	rai::account representative;
-};
+
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (block_arrival & block_arrival, const std::string & name);
+
 class online_reps
 {
 public:
-	online_reps (rai::node &);
-	void vote (std::shared_ptr<rai::vote> const &);
-	void recalculate_stake ();
-	rai::uint128_t online_stake ();
-	std::deque<rai::account> list ();
-	boost::multi_index_container<
-	rai::rep_last_heard_info,
-	boost::multi_index::indexed_by<
-	boost::multi_index::ordered_non_unique<boost::multi_index::member<rai::rep_last_heard_info, std::chrono::steady_clock::time_point, &rai::rep_last_heard_info::last_heard>>,
-	boost::multi_index::hashed_unique<boost::multi_index::member<rai::rep_last_heard_info, rai::account, &rai::rep_last_heard_info::representative>>>>
-	reps;
+	online_reps (badem::ledger &, badem::uint128_t);
+	void observe (badem::account const &);
+	void sample ();
+	badem::uint128_t online_stake ();
+	std::vector<badem::account> list ();
+	static uint64_t constexpr weight_period = 5 * 60; // 5 minutes
+	// The maximum amount of samples for a 2 week period on live or 3 days on beta
+	static uint64_t constexpr weight_samples = badem::is_live_network ? 4032 : 864;
 
 private:
-	rai::uint128_t online_stake_total;
+	badem::uint128_t trend (badem::transaction &);
 	std::mutex mutex;
-	rai::node & node;
+	badem::ledger & ledger;
+	std::unordered_set<badem::account> reps;
+	badem::uint128_t online;
+	badem::uint128_t minimum;
+
+	friend std::unique_ptr<seq_con_info_component> collect_seq_con_info (online_reps & online_reps, const std::string & name);
+};
+
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (online_reps & online_reps, const std::string & name);
+
+class udp_data
+{
+public:
+	uint8_t * buffer;
+	size_t size;
+	badem::endpoint endpoint;
+};
+/**
+  * A circular buffer for servicing UDP datagrams. This container follows a producer/consumer model where the operating system is producing data in to buffers which are serviced by internal threads.
+  * If buffers are not serviced fast enough they're internally dropped.
+  * This container has a maximum space to hold N buffers of M size and will allocate them in round-robin order.
+  * All public methods are thread-safe
+*/
+class udp_buffer
+{
+public:
+	// Stats - Statistics
+	// Size - Size of each individual buffer
+	// Count - Number of buffers to allocate
+	udp_buffer (badem::stat & stats, size_t, size_t);
+	// Return a buffer where UDP data can be put
+	// Method will attempt to return the first free buffer
+	// If there are no free buffers, an unserviced buffer will be dequeued and returned
+	// Function will block if there are no free or unserviced buffers
+	// Return nullptr if the container has stopped
+	badem::udp_data * allocate ();
+	// Queue a buffer that has been filled with UDP data and notify servicing threads
+	void enqueue (badem::udp_data *);
+	// Return a buffer that has been filled with UDP data
+	// Function will block until a buffer has been added
+	// Return nullptr if the container has stopped
+	badem::udp_data * dequeue ();
+	// Return a buffer to the freelist after is has been serviced
+	void release (badem::udp_data *);
+	// Stop container and notify waiting threads
+	void stop ();
+
+private:
+	badem::stat & stats;
+	std::mutex mutex;
+	std::condition_variable condition;
+	boost::circular_buffer<badem::udp_data *> free;
+	boost::circular_buffer<badem::udp_data *> full;
+	std::vector<uint8_t> slab;
+	std::vector<badem::udp_data> entries;
+	bool stopped;
 };
 class network
 {
 public:
-	network (rai::node &, uint16_t);
+	network (badem::node &, uint16_t);
+	~network ();
 	void receive ();
+	void process_packets ();
+	void start ();
 	void stop ();
-	void receive_action (boost::system::error_code const &, size_t);
+	void receive_action (badem::udp_data *, badem::endpoint const &);
 	void rpc_action (boost::system::error_code const &, size_t);
-	void republish_vote (std::shared_ptr<rai::vote>);
-	void republish_block (MDB_txn *, std::shared_ptr<rai::block>);
-	void republish (rai::block_hash const &, std::shared_ptr<std::vector<uint8_t>>, rai::endpoint);
-	void publish_broadcast (std::vector<rai::peer_information> &, std::unique_ptr<rai::block>);
-	void confirm_send (rai::confirm_ack const &, std::shared_ptr<std::vector<uint8_t>>, rai::endpoint const &);
-	void merge_peers (std::array<rai::endpoint, 8> const &);
-	void send_keepalive (rai::endpoint const &);
-	void broadcast_confirm_req (std::shared_ptr<rai::block>);
-	void broadcast_confirm_req_base (std::shared_ptr<rai::block>, std::shared_ptr<std::vector<rai::peer_information>>, unsigned);
-	void send_confirm_req (rai::endpoint const &, std::shared_ptr<rai::block>);
-	void send_buffer (uint8_t const *, size_t, rai::endpoint const &, std::function<void(boost::system::error_code const &, size_t)>);
-	rai::endpoint endpoint ();
-	rai::endpoint remote;
-	std::array<uint8_t, 512> buffer;
+	void republish_vote (std::shared_ptr<badem::vote>);
+	void republish_block (std::shared_ptr<badem::block>);
+	void republish_block (std::shared_ptr<badem::block>, badem::endpoint const &);
+	static unsigned const broadcast_interval_ms = 10;
+	void republish_block_batch (std::deque<std::shared_ptr<badem::block>>, unsigned = broadcast_interval_ms);
+	void republish (badem::block_hash const &, std::shared_ptr<std::vector<uint8_t>>, badem::endpoint);
+	void confirm_send (badem::confirm_ack const &, std::shared_ptr<std::vector<uint8_t>>, badem::endpoint const &);
+	void merge_peers (std::array<badem::endpoint, 8> const &);
+	void send_keepalive (badem::endpoint const &);
+	void send_node_id_handshake (badem::endpoint const &, boost::optional<badem::uint256_union> const & query, boost::optional<badem::uint256_union> const & respond_to);
+	void broadcast_confirm_req (std::shared_ptr<badem::block>);
+	void broadcast_confirm_req_base (std::shared_ptr<badem::block>, std::shared_ptr<std::vector<badem::peer_information>>, unsigned, bool = false);
+	void broadcast_confirm_req_batch (std::unordered_map<badem::endpoint, std::vector<std::pair<badem::block_hash, badem::block_hash>>>, unsigned = broadcast_interval_ms, bool = false);
+	void broadcast_confirm_req_batch (std::deque<std::pair<std::shared_ptr<badem::block>, std::shared_ptr<std::vector<badem::peer_information>>>>, unsigned = broadcast_interval_ms);
+	void send_confirm_req (badem::endpoint const &, std::shared_ptr<badem::block>);
+	void send_confirm_req_hashes (badem::endpoint const &, std::vector<std::pair<badem::block_hash, badem::block_hash>> const &);
+	void confirm_hashes (badem::transaction const &, badem::endpoint const &, std::vector<badem::block_hash>);
+	bool send_votes_cache (badem::block_hash const &, badem::endpoint const &);
+	void send_buffer (uint8_t const *, size_t, badem::endpoint const &, std::function<void(boost::system::error_code const &, size_t)>);
+	badem::endpoint endpoint ();
+	badem::udp_buffer buffer_container;
 	boost::asio::ip::udp::socket socket;
 	std::mutex socket_mutex;
 	boost::asio::ip::udp::resolver resolver;
-	rai::node & node;
-	bool on;
-	static uint16_t const node_port = rai::badem_network == rai::badem_networks::badem_live_network ? 2224 : 54000;
+	std::vector<boost::thread> packet_processing_threads;
+	badem::node & node;
+	std::atomic<bool> on;
+	static uint16_t const node_port = badem::is_live_network ? 2224 : 54000;
+	static size_t const buffer_size = 512;
+	static size_t const confirm_req_hashes_max = 6;
 };
-class logging
-{
-public:
-	logging ();
-	void serialize_json (boost::property_tree::ptree &) const;
-	bool deserialize_json (bool &, boost::property_tree::ptree &);
-	bool upgrade_json (unsigned, boost::property_tree::ptree &);
-	bool ledger_logging () const;
-	bool ledger_duplicate_logging () const;
-	bool vote_logging () const;
-	bool network_logging () const;
-	bool network_message_logging () const;
-	bool network_publish_logging () const;
-	bool network_packet_logging () const;
-	bool network_keepalive_logging () const;
-	bool node_lifetime_tracing () const;
-	bool insufficient_work_logging () const;
-	bool log_rpc () const;
-	bool bulk_pull_logging () const;
-	bool callback_logging () const;
-	bool work_generation_time () const;
-	bool log_to_cerr () const;
-	void init (boost::filesystem::path const &);
 
-	bool ledger_logging_value;
-	bool ledger_duplicate_logging_value;
-	bool vote_logging_value;
-	bool network_logging_value;
-	bool network_message_logging_value;
-	bool network_publish_logging_value;
-	bool network_packet_logging_value;
-	bool network_keepalive_logging_value;
-	bool node_lifetime_tracing_value;
-	bool insufficient_work_logging_value;
-	bool log_rpc_value;
-	bool bulk_pull_logging_value;
-	bool work_generation_time_value;
-	bool log_to_cerr_value;
-	bool flush;
-	uintmax_t max_size;
-	uintmax_t rotation_size;
-	boost::log::sources::logger_mt log;
-};
 class node_init
 {
 public:
 	node_init ();
 	bool error ();
 	bool block_store_init;
+	bool wallets_store_init;
 	bool wallet_init;
-};
-class node_config
-{
-public:
-	node_config ();
-	node_config (uint16_t, rai::logging const &);
-	void serialize_json (boost::property_tree::ptree &) const;
-	bool deserialize_json (bool &, boost::property_tree::ptree &);
-	bool upgrade_json (unsigned, boost::property_tree::ptree &);
-	rai::account random_representative ();
-	uint16_t peering_port;
-	rai::logging logging;
-	std::vector<std::pair<std::string, uint16_t>> work_peers;
-	std::vector<std::string> preconfigured_peers;
-	std::vector<rai::account> preconfigured_representatives;
-	unsigned bootstrap_fraction_numerator;
-	rai::amount receive_minimum;
-	rai::amount online_weight_minimum;
-	unsigned online_weight_quorum;
-	unsigned password_fanout;
-	unsigned io_threads;
-	unsigned work_threads;
-	bool enable_voting;
-	unsigned bootstrap_connections;
-	unsigned bootstrap_connections_max;
-	std::string callback_address;
-	uint16_t callback_port;
-	std::string callback_target;
-	int lmdb_max_dbs;
-	rai::stat_config stat_config;
-	rai::block_hash state_block_parse_canary;
-	rai::block_hash state_block_generate_canary;
-	static std::chrono::seconds constexpr keepalive_period = std::chrono::seconds (60);
-	static std::chrono::seconds constexpr keepalive_cutoff = keepalive_period * 5;
-	static std::chrono::minutes constexpr wallet_backup_interval = std::chrono::minutes (5);
 };
 class node_observers
 {
 public:
-	rai::observer_set<std::shared_ptr<rai::block>, rai::account const &, rai::uint128_t const &, bool> blocks;
-	rai::observer_set<bool> wallet;
-	rai::observer_set<std::shared_ptr<rai::vote>, rai::endpoint const &> vote;
-	rai::observer_set<rai::account const &, bool> account_balance;
-	rai::observer_set<rai::endpoint const &> endpoint;
-	rai::observer_set<> disconnect;
-	rai::observer_set<> started;
+	badem::observer_set<std::shared_ptr<badem::block>, badem::account const &, badem::uint128_t const &, bool> blocks;
+	badem::observer_set<bool> wallet;
+	badem::observer_set<badem::transaction const &, std::shared_ptr<badem::vote>, badem::endpoint const &> vote;
+	badem::observer_set<badem::account const &, bool> account_balance;
+	badem::observer_set<badem::endpoint const &> endpoint;
+	badem::observer_set<> disconnect;
 };
+
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (node_observers & node_observers, const std::string & name);
+
 class vote_processor
 {
 public:
-	vote_processor (rai::node &);
-	rai::vote_code vote (std::shared_ptr<rai::vote>, rai::endpoint);
-	rai::node & node;
+	vote_processor (badem::node &);
+	void vote (std::shared_ptr<badem::vote>, badem::endpoint);
+	// node.active.mutex lock required
+	badem::vote_code vote_blocking (badem::transaction const &, std::shared_ptr<badem::vote>, badem::endpoint, bool = false);
+	void verify_votes (std::deque<std::pair<std::shared_ptr<badem::vote>, badem::endpoint>> &);
+	void flush ();
+	void calculate_weights ();
+	badem::node & node;
+	void stop ();
+
+private:
+	void process_loop ();
+	std::deque<std::pair<std::shared_ptr<badem::vote>, badem::endpoint>> votes;
+	// Representatives levels for random early detection
+	std::unordered_set<badem::account> representatives_1;
+	std::unordered_set<badem::account> representatives_2;
+	std::unordered_set<badem::account> representatives_3;
+	std::condition_variable condition;
+	std::mutex mutex;
+	bool started;
+	bool stopped;
+	bool active;
+	boost::thread thread;
+
+	friend std::unique_ptr<seq_con_info_component> collect_seq_con_info (vote_processor & vote_processor, const std::string & name);
 };
+
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (vote_processor & vote_processor, const std::string & name);
+
 // The network is crawled for representatives by occasionally sending a unicast confirm_req for a specific block and watching to see if it's acknowledged with a vote.
 class rep_crawler
 {
 public:
-	void add (rai::block_hash const &);
-	void remove (rai::block_hash const &);
-	bool exists (rai::block_hash const &);
+	void add (badem::block_hash const &);
+	void remove (badem::block_hash const &);
+	bool exists (badem::block_hash const &);
 	std::mutex mutex;
-	std::unordered_set<rai::block_hash> active;
+	std::unordered_set<badem::block_hash> active;
 };
-// Processing blocks is a potentially long IO operation
-// This class isolates block insertion from other operations like servicing network operations
-class block_processor
-{
-public:
-	block_processor (rai::node &);
-	~block_processor ();
-	void stop ();
-	void flush ();
-	bool full ();
-	void add (std::shared_ptr<rai::block>);
-	void force (std::shared_ptr<rai::block>);
-	bool should_log ();
-	bool have_blocks ();
-	void process_blocks ();
-	rai::process_return process_receive_one (MDB_txn *, std::shared_ptr<rai::block>);
 
-private:
-	void queue_unchecked (MDB_txn *, rai::block_hash const &);
-	void process_receive_many (std::unique_lock<std::mutex> &);
-	bool stopped;
-	bool active;
-	std::chrono::steady_clock::time_point next_log;
-	std::deque<std::shared_ptr<rai::block>> blocks;
-	std::deque<std::shared_ptr<rai::block>> forced;
-	std::condition_variable condition;
-	rai::node & node;
-	std::mutex mutex;
-};
-class node : public std::enable_shared_from_this<rai::node>
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (rep_crawler & rep_crawler, const std::string & name);
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (block_processor & block_processor, const std::string & name);
+
+class node : public std::enable_shared_from_this<badem::node>
 {
 public:
-	node (rai::node_init &, boost::asio::io_service &, uint16_t, boost::filesystem::path const &, rai::alarm &, rai::logging const &, rai::work_pool &);
-	node (rai::node_init &, boost::asio::io_service &, boost::filesystem::path const &, rai::alarm &, rai::node_config const &, rai::work_pool &);
+	node (badem::node_init &, boost::asio::io_context &, uint16_t, boost::filesystem::path const &, badem::alarm &, badem::logging const &, badem::work_pool &);
+	node (badem::node_init &, boost::asio::io_context &, boost::filesystem::path const &, badem::alarm &, badem::node_config const &, badem::work_pool &, badem::node_flags = badem::node_flags ());
 	~node ();
 	template <typename T>
 	void background (T action_a)
 	{
-		alarm.service.post (action_a);
+		alarm.io_ctx.post (action_a);
 	}
-	void send_keepalive (rai::endpoint const &);
+	void send_keepalive (badem::endpoint const &);
 	bool copy_with_compaction (boost::filesystem::path const &);
-	void keepalive (std::string const &, uint16_t);
+	void keepalive (std::string const &, uint16_t, bool = false);
 	void start ();
 	void stop ();
-	std::shared_ptr<rai::node> shared ();
+	std::shared_ptr<badem::node> shared ();
 	int store_version ();
-	void process_confirmed (std::shared_ptr<rai::block>);
-	void process_message (rai::message &, rai::endpoint const &);
-	void process_active (std::shared_ptr<rai::block>);
-	rai::process_return process (rai::block const &);
+	void process_confirmed (std::shared_ptr<badem::block>, uint8_t = 0);
+	void process_message (badem::message &, badem::endpoint const &);
+	void process_active (std::shared_ptr<badem::block>);
+	badem::process_return process (badem::block const &);
 	void keepalive_preconfigured (std::vector<std::string> const &);
-	rai::block_hash latest (rai::account const &);
-	rai::uint128_t balance (rai::account const &);
-	std::unique_ptr<rai::block> block (rai::block_hash const &);
-	std::pair<rai::uint128_t, rai::uint128_t> balance_pending (rai::account const &);
-	rai::uint128_t weight (rai::account const &);
-	rai::account representative (rai::account const &);
+	badem::block_hash latest (badem::account const &);
+	badem::uint128_t balance (badem::account const &);
+	std::shared_ptr<badem::block> block (badem::block_hash const &);
+	std::pair<badem::uint128_t, badem::uint128_t> balance_pending (badem::account const &);
+	badem::uint128_t weight (badem::account const &);
+	badem::account representative (badem::account const &);
 	void ongoing_keepalive ();
+	void ongoing_syn_cookie_cleanup ();
 	void ongoing_rep_crawl ();
+	void ongoing_rep_calculation ();
 	void ongoing_bootstrap ();
 	void ongoing_store_flush ();
+	void ongoing_peer_store ();
+	void ongoing_unchecked_cleanup ();
 	void backup_wallet ();
-	int price (rai::uint128_t const &, int);
-	void work_generate_blocking (rai::block &);
-	uint64_t work_generate_blocking (rai::uint256_union const &);
-	void work_generate (rai::uint256_union const &, std::function<void(uint64_t)>);
+	void search_pending ();
+	void bootstrap_wallet ();
+	void unchecked_cleanup ();
+	int price (badem::uint128_t const &, int);
+	void work_generate_blocking (badem::block &, uint64_t = badem::work_pool::publish_threshold);
+	uint64_t work_generate_blocking (badem::uint256_union const &, uint64_t = badem::work_pool::publish_threshold);
+	void work_generate (badem::uint256_union const &, std::function<void(uint64_t)>, uint64_t = badem::work_pool::publish_threshold);
 	void add_initial_peers ();
-	void block_confirm (std::shared_ptr<rai::block>);
-	void process_fork (MDB_txn *, std::shared_ptr<rai::block>);
-	rai::uint128_t delta ();
-	boost::asio::io_service & service;
-	rai::node_config config;
-	rai::alarm & alarm;
-	rai::work_pool & work;
+	void block_confirm (std::shared_ptr<badem::block>);
+	void process_fork (badem::transaction const &, std::shared_ptr<badem::block>);
+	bool validate_block_by_previous (badem::transaction const &, std::shared_ptr<badem::block>);
+	void do_rpc_callback (boost::asio::ip::tcp::resolver::iterator i_a, std::string const &, uint16_t, std::shared_ptr<std::string>, std::shared_ptr<std::string>, std::shared_ptr<boost::asio::ip::tcp::resolver>);
+	badem::uint128_t delta ();
+	void ongoing_online_weight_calculation ();
+	void ongoing_online_weight_calculation_queue ();
+	boost::asio::io_context & io_ctx;
+	badem::node_config config;
+	badem::node_flags flags;
+	badem::alarm & alarm;
+	badem::work_pool & work;
 	boost::log::sources::logger_mt log;
-	rai::block_store store;
-	rai::gap_cache gap_cache;
-	rai::ledger ledger;
-	rai::active_transactions active;
-	rai::network network;
-	rai::bootstrap_initiator bootstrap_initiator;
-	rai::bootstrap_listener bootstrap;
-	rai::peer_container peers;
+	std::unique_ptr<badem::block_store> store_impl;
+	badem::block_store & store;
+	std::unique_ptr<badem::wallets_store> wallets_store_impl;
+	badem::wallets_store & wallets_store;
+	badem::gap_cache gap_cache;
+	badem::ledger ledger;
+	badem::active_transactions active;
+	badem::network network;
+	badem::bootstrap_initiator bootstrap_initiator;
+	badem::bootstrap_listener bootstrap;
+	badem::peer_container peers;
 	boost::filesystem::path application_path;
-	rai::node_observers observers;
-	rai::wallets wallets;
-	rai::port_mapping port_mapping;
-	rai::vote_processor vote_processor;
-	rai::rep_crawler rep_crawler;
+	badem::node_observers observers;
+	badem::wallets wallets;
+	badem::port_mapping port_mapping;
+	badem::signature_checker checker;
+	badem::vote_processor vote_processor;
+	badem::rep_crawler rep_crawler;
 	unsigned warmed_up;
-	rai::block_processor block_processor;
-	std::thread block_processor_thread;
-	rai::block_arrival block_arrival;
-	rai::online_reps online_reps;
-	rai::stat stats;
+	badem::block_processor block_processor;
+	boost::thread block_processor_thread;
+	badem::block_arrival block_arrival;
+	badem::online_reps online_reps;
+	badem::votes_cache votes_cache;
+	badem::stat stats;
+	badem::keypair node_id;
+	badem::block_uniquer block_uniquer;
+	badem::vote_uniquer vote_uniquer;
+	const std::chrono::steady_clock::time_point startup_time;
 	static double constexpr price_max = 16.0;
 	static double constexpr free_cutoff = 1024.0;
-	static std::chrono::seconds constexpr period = std::chrono::seconds (60);
+	static std::chrono::seconds constexpr period = badem::is_test_network ? std::chrono::seconds (1) : std::chrono::seconds (60);
 	static std::chrono::seconds constexpr cutoff = period * 5;
+	static std::chrono::seconds constexpr syn_cookie_cutoff = std::chrono::seconds (5);
 	static std::chrono::minutes constexpr backup_interval = std::chrono::minutes (5);
+	static std::chrono::seconds constexpr search_pending_interval = badem::is_test_network ? std::chrono::seconds (1) : std::chrono::seconds (5 * 60);
+	static std::chrono::seconds constexpr peer_interval = search_pending_interval;
+	static std::chrono::hours constexpr unchecked_cleanup_interval = std::chrono::hours (1);
+	static std::chrono::milliseconds constexpr process_confirmed_interval = badem::is_test_network ? std::chrono::milliseconds (50) : std::chrono::milliseconds (500);
 };
+
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (node & node, const std::string & name);
+
 class thread_runner
 {
 public:
-	thread_runner (boost::asio::io_service &, unsigned);
+	thread_runner (boost::asio::io_context &, unsigned);
 	~thread_runner ();
 	void join ();
-	std::vector<std::thread> threads;
+	std::vector<boost::thread> threads;
 };
-void add_node_options (boost::program_options::options_description &);
-bool handle_node_options (boost::program_options::variables_map &);
 class inactive_node
 {
 public:
-	inactive_node (boost::filesystem::path const & path = rai::working_path ());
+	inactive_node (boost::filesystem::path const & path = badem::working_path (), uint16_t = 24000);
 	~inactive_node ();
 	boost::filesystem::path path;
-	boost::shared_ptr<boost::asio::io_service> service;
-	rai::alarm alarm;
-	rai::logging logging;
-	rai::node_init init;
-	rai::work_pool work;
-	std::shared_ptr<rai::node> node;
+	std::shared_ptr<boost::asio::io_context> io_context;
+	badem::alarm alarm;
+	badem::logging logging;
+	badem::node_init init;
+	badem::work_pool work;
+	uint16_t peering_port;
+	std::shared_ptr<badem::node> node;
 };
 }

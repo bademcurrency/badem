@@ -12,7 +12,7 @@
         "version": "8",
         "peering_port": "2224",
         "bootstrap_fraction_numerator": "1",
-        "receive_minimum": "10000000000000000000000000000",
+        "receive_minimum": "1000000000000000000000000",
         "logging": {
             "version": "2",
             "ledger": "false",
@@ -35,17 +35,10 @@
         },
         "work_peers": "",
         "preconfigured_peers": [
-            "rai-test.raiblocks.net"
+            ""
         ],
         "preconfigured_representatives": [
-            "bdm_3arg3asgtigae3xckabaaewkx3bzsh7nwz7jkmjos79ihyaxwphhm6qgjps4",
-            "bdm_3arg3asgtigae3xckabaaewkx3bzsh7nwz7jkmjos79ihyaxwphhm6qgjps4"
-            
-            
-            
-            
-           
-            
+            ""
         ],
         "inactive_supply": "0",
         "password_fanout": "1024",

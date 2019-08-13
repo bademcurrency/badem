@@ -1,81 +1,178 @@
 #include <badem/node/node.hpp>
 
 #include <badem/lib/interface.h>
+#include <badem/lib/timer.hpp>
+#include <badem/lib/utility.hpp>
 #include <badem/node/common.hpp>
 #include <badem/node/rpc.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <future>
-#include <memory>
 #include <sstream>
-#include <thread>
-#include <unordered_set>
 
-#include <boost/log/expressions.hpp>
-#include <boost/log/utility/setup/common_attributes.hpp>
-#include <boost/log/utility/setup/console.hpp>
-#include <boost/log/utility/setup/file.hpp>
-#include <boost/program_options.hpp>
+#include <boost/polymorphic_cast.hpp>
 #include <boost/property_tree/json_parser.hpp>
-#include <boost/property_tree/ptree.hpp>
 
-#include <upnpcommands.h>
+double constexpr badem::node::price_max;
+double constexpr badem::node::free_cutoff;
+std::chrono::seconds constexpr badem::node::period;
+std::chrono::seconds constexpr badem::node::cutoff;
+std::chrono::seconds constexpr badem::node::syn_cookie_cutoff;
+std::chrono::minutes constexpr badem::node::backup_interval;
+std::chrono::seconds constexpr badem::node::search_pending_interval;
+std::chrono::seconds constexpr badem::node::peer_interval;
+std::chrono::hours constexpr badem::node::unchecked_cleanup_interval;
+std::chrono::milliseconds constexpr badem::node::process_confirmed_interval;
 
-#include <ed25519-donna/ed25519.h>
+int constexpr badem::port_mapping::mapping_timeout;
+int constexpr badem::port_mapping::check_timeout;
+unsigned constexpr badem::active_transactions::request_interval_ms;
+size_t constexpr badem::active_transactions::max_broadcast_queue;
+size_t constexpr badem::block_arrival::arrival_size_min;
+std::chrono::seconds constexpr badem::block_arrival::arrival_time_min;
+uint64_t constexpr badem::online_reps::weight_period;
+uint64_t constexpr badem::online_reps::weight_samples;
 
-double constexpr rai::node::price_max;
-double constexpr rai::node::free_cutoff;
-std::chrono::seconds constexpr rai::node::period;
-std::chrono::seconds constexpr rai::node::cutoff;
-std::chrono::minutes constexpr rai::node::backup_interval;
-int constexpr rai::port_mapping::mapping_timeout;
-int constexpr rai::port_mapping::check_timeout;
-unsigned constexpr rai::active_transactions::announce_interval_ms;
-size_t constexpr rai::block_arrival::arrival_size_min;
-std::chrono::seconds constexpr rai::block_arrival::arrival_time_min;
+namespace badem
+{
+extern unsigned char badem_bootstrap_weights[];
+extern size_t badem_bootstrap_weights_size;
+}
 
-rai::network::network (rai::node & node_a, uint16_t port) :
-socket (node_a.service, rai::endpoint (boost::asio::ip::address_v6::any (), port)),
-resolver (node_a.service),
+badem::network::network (badem::node & node_a, uint16_t port) :
+buffer_container (node_a.stats, badem::network::buffer_size, 4096), // 2Mb receive buffer
+socket (node_a.io_ctx, badem::endpoint (boost::asio::ip::address_v6::any (), port)),
+resolver (node_a.io_ctx),
 node (node_a),
 on (true)
 {
+	boost::thread::attributes attrs;
+	badem::thread_attributes::set (attrs);
+	for (size_t i = 0; i < node.config.network_threads; ++i)
+	{
+		packet_processing_threads.push_back (boost::thread (attrs, [this]() {
+			badem::thread_role::set (badem::thread_role::name::packet_processing);
+			try
+			{
+				process_packets ();
+			}
+			catch (boost::system::error_code & ec)
+			{
+				BOOST_LOG (this->node.log) << FATAL_LOG_PREFIX << ec.message ();
+				release_assert (false);
+			}
+			catch (std::error_code & ec)
+			{
+				BOOST_LOG (this->node.log) << FATAL_LOG_PREFIX << ec.message ();
+				release_assert (false);
+			}
+			catch (std::runtime_error & err)
+			{
+				BOOST_LOG (this->node.log) << FATAL_LOG_PREFIX << err.what ();
+				release_assert (false);
+			}
+			catch (...)
+			{
+				BOOST_LOG (this->node.log) << FATAL_LOG_PREFIX << "Unknown exception";
+				release_assert (false);
+			}
+			if (this->node.config.logging.network_packet_logging ())
+			{
+				BOOST_LOG (this->node.log) << "Exiting packet processing thread";
+			}
+		}));
+	}
 }
 
-void rai::network::receive ()
+badem::network::~network ()
+{
+	for (auto & thread : packet_processing_threads)
+	{
+		thread.join ();
+	}
+}
+
+void badem::network::start ()
+{
+	for (size_t i = 0; i < node.config.io_threads; ++i)
+	{
+		receive ();
+	}
+}
+
+void badem::network::receive ()
 {
 	if (node.config.logging.network_packet_logging ())
 	{
 		BOOST_LOG (node.log) << "Receiving packet";
 	}
 	std::unique_lock<std::mutex> lock (socket_mutex);
-	socket.async_receive_from (boost::asio::buffer (buffer.data (), buffer.size ()), remote, [this](boost::system::error_code const & error, size_t size_a) {
-		receive_action (error, size_a);
+	auto data (buffer_container.allocate ());
+	socket.async_receive_from (boost::asio::buffer (data->buffer, badem::network::buffer_size), data->endpoint, [this, data](boost::system::error_code const & error, size_t size_a) {
+		if (!error && this->on)
+		{
+			data->size = size_a;
+			this->buffer_container.enqueue (data);
+			this->receive ();
+		}
+		else
+		{
+			this->buffer_container.release (data);
+			if (error)
+			{
+				if (this->node.config.logging.network_logging ())
+				{
+					BOOST_LOG (this->node.log) << boost::str (boost::format ("UDP Receive error: %1%") % error.message ());
+				}
+			}
+			if (this->on)
+			{
+				this->node.alarm.add (std::chrono::steady_clock::now () + std::chrono::seconds (5), [this]() { this->receive (); });
+			}
+		}
 	});
 }
 
-void rai::network::stop ()
+void badem::network::process_packets ()
 {
-	on = false;
-	socket.close ();
-	resolver.cancel ();
+	auto local_endpoint (endpoint ());
+	while (on.load ())
+	{
+		auto data (buffer_container.dequeue ());
+		if (data == nullptr)
+		{
+			break;
+		}
+		//std::cerr << data->endpoint.address ().to_string ();
+		receive_action (data, local_endpoint);
+		buffer_container.release (data);
+	}
 }
 
-void rai::network::send_keepalive (rai::endpoint const & endpoint_a)
+void badem::network::stop ()
+{
+	on = false;
+	std::unique_lock<std::mutex> lock (socket_mutex);
+	if (socket.is_open ())
+	{
+		socket.close ();
+	}
+	resolver.cancel ();
+	buffer_container.stop ();
+}
+
+void badem::network::send_keepalive (badem::endpoint const & endpoint_a)
 {
 	assert (endpoint_a.address ().is_v6 ());
-	rai::keepalive message;
+	badem::keepalive message;
 	node.peers.random_fill (message.peers);
-	std::shared_ptr<std::vector<uint8_t>> bytes (new std::vector<uint8_t>);
-	{
-		rai::vectorstream stream (*bytes);
-		message.serialize (stream);
-	}
+	auto bytes = message.to_bytes ();
 	if (node.config.logging.network_keepalive_logging ())
 	{
 		BOOST_LOG (node.log) << boost::str (boost::format ("Keepalive req sent to %1%") % endpoint_a);
 	}
-	std::weak_ptr<rai::node> node_w (node.shared ());
+	std::weak_ptr<badem::node> node_w (node.shared ());
 	send_buffer (bytes->data (), bytes->size (), endpoint_a, [bytes, node_w, endpoint_a](boost::system::error_code const & ec, size_t) {
 		if (auto node_l = node_w.lock ())
 		{
@@ -85,26 +182,26 @@ void rai::network::send_keepalive (rai::endpoint const & endpoint_a)
 			}
 			else
 			{
-				node_l->stats.inc (rai::stat::type::message, rai::stat::detail::keepalive, rai::stat::dir::out);
+				node_l->stats.inc (badem::stat::type::message, badem::stat::detail::keepalive, badem::stat::dir::out);
 			}
 		}
 	});
 }
 
-void rai::node::keepalive (std::string const & address_a, uint16_t port_a)
+void badem::node::keepalive (std::string const & address_a, uint16_t port_a, bool preconfigured_peer_a)
 {
 	auto node_l (shared_from_this ());
-	network.resolver.async_resolve (boost::asio::ip::udp::resolver::query (address_a, std::to_string (port_a)), [node_l, address_a, port_a](boost::system::error_code const & ec, boost::asio::ip::udp::resolver::iterator i_a) {
+	network.resolver.async_resolve (boost::asio::ip::udp::resolver::query (address_a, std::to_string (port_a)), [node_l, address_a, port_a, preconfigured_peer_a](boost::system::error_code const & ec, boost::asio::ip::udp::resolver::iterator i_a) {
 		if (!ec)
 		{
 			for (auto i (i_a), n (boost::asio::ip::udp::resolver::iterator{}); i != n; ++i)
 			{
-				auto endpoint (i->endpoint ());
-				if (endpoint.address ().is_v4 ())
-				{
-					endpoint = rai::endpoint (boost::asio::ip::address_v6::v4_mapped (endpoint.address ().to_v4 ()), endpoint.port ());
-				}
+				auto endpoint (badem::map_endpoint_to_v6 (i->endpoint ()));
 				node_l->send_keepalive (endpoint);
+				if (preconfigured_peer_a)
+				{
+					node_l->peers.insert (endpoint, badem::protocol_version, true);
+				}
 			}
 		}
 		else
@@ -114,14 +211,42 @@ void rai::node::keepalive (std::string const & address_a, uint16_t port_a)
 	});
 }
 
-void rai::network::republish (rai::block_hash const & hash_a, std::shared_ptr<std::vector<uint8_t>> buffer_a, rai::endpoint endpoint_a)
+void badem::network::send_node_id_handshake (badem::endpoint const & endpoint_a, boost::optional<badem::uint256_union> const & query, boost::optional<badem::uint256_union> const & respond_to)
+{
+	assert (endpoint_a.address ().is_v6 ());
+	boost::optional<std::pair<badem::account, badem::signature>> response (boost::none);
+	if (respond_to)
+	{
+		response = std::make_pair (node.node_id.pub, badem::sign_message (node.node_id.prv, node.node_id.pub, *respond_to));
+		assert (!badem::validate_message (response->first, *respond_to, response->second));
+	}
+	badem::node_id_handshake message (query, response);
+	auto bytes = message.to_bytes ();
+	if (node.config.logging.network_node_id_handshake_logging ())
+	{
+		BOOST_LOG (node.log) << boost::str (boost::format ("Node ID handshake sent with node ID %1% to %2%: query %3%, respond_to %4% (signature %5%)") % node.node_id.pub.to_account () % endpoint_a % (query ? query->to_string () : std::string ("[none]")) % (respond_to ? respond_to->to_string () : std::string ("[none]")) % (response ? response->second.to_string () : std::string ("[none]")));
+	}
+	node.stats.inc (badem::stat::type::message, badem::stat::detail::node_id_handshake, badem::stat::dir::out);
+	std::weak_ptr<badem::node> node_w (node.shared ());
+	send_buffer (bytes->data (), bytes->size (), endpoint_a, [bytes, node_w, endpoint_a](boost::system::error_code const & ec, size_t) {
+		if (auto node_l = node_w.lock ())
+		{
+			if (ec && node_l->config.logging.network_node_id_handshake_logging ())
+			{
+				BOOST_LOG (node_l->log) << boost::str (boost::format ("Error sending node ID handshake to %1% %2%") % endpoint_a % ec.message ());
+			}
+		}
+	});
+}
+
+void badem::network::republish (badem::block_hash const & hash_a, std::shared_ptr<std::vector<uint8_t>> buffer_a, badem::endpoint endpoint_a)
 {
 	if (node.config.logging.network_publish_logging ())
 	{
 		BOOST_LOG (node.log) << boost::str (boost::format ("Publishing %1% to %2%") % hash_a.to_string () % endpoint_a);
 	}
-	std::weak_ptr<rai::node> node_w (node.shared ());
-	send_buffer (buffer_a->data (), buffer_a->size (), endpoint_a, [buffer_a, node_w, endpoint_a](boost::system::error_code const & ec, size_t size) {
+	std::weak_ptr<badem::node> node_w (node.shared ());
+	send_buffer (buffer_a->data (), buffer_a->size (), endpoint_a, [node_w, endpoint_a](boost::system::error_code const & ec, size_t size) {
 		if (auto node_l = node_w.lock ())
 		{
 			if (ec && node_l->config.logging.network_logging ())
@@ -130,74 +255,152 @@ void rai::network::republish (rai::block_hash const & hash_a, std::shared_ptr<st
 			}
 			else
 			{
-				node_l->stats.inc (rai::stat::type::message, rai::stat::detail::publish, rai::stat::dir::out);
+				node_l->stats.inc (badem::stat::type::message, badem::stat::detail::publish, badem::stat::dir::out);
 			}
 		}
 	});
 }
 
 template <typename T>
-bool confirm_block (MDB_txn * transaction_a, rai::node & node_a, T & list_a, std::shared_ptr<rai::block> block_a)
+bool confirm_block (badem::transaction const & transaction_a, badem::node & node_a, T & list_a, std::shared_ptr<badem::block> block_a, bool also_publish)
 {
 	bool result (false);
 	if (node_a.config.enable_voting)
 	{
-		node_a.wallets.foreach_representative (transaction_a, [&result, &block_a, &list_a, &node_a, &transaction_a](rai::public_key const & pub_a, rai::raw_key const & prv_a) {
-			result = true;
-			auto vote (node_a.store.vote_generate (transaction_a, pub_a, prv_a, block_a));
-			rai::confirm_ack confirm (vote);
-			std::shared_ptr<std::vector<uint8_t>> bytes (new std::vector<uint8_t>);
+		auto hash (block_a->hash ());
+		// Search in cache
+		auto votes (node_a.votes_cache.find (hash));
+		if (votes.empty ())
+		{
+			// Generate new vote
+			node_a.wallets.foreach_representative (transaction_a, [&result, &list_a, &node_a, &transaction_a, &hash](badem::public_key const & pub_a, badem::raw_key const & prv_a) {
+				result = true;
+				auto vote (node_a.store.vote_generate (transaction_a, pub_a, prv_a, std::vector<badem::block_hash> (1, hash)));
+				badem::confirm_ack confirm (vote);
+				auto vote_bytes = confirm.to_bytes ();
+				for (auto j (list_a.begin ()), m (list_a.end ()); j != m; ++j)
+				{
+					node_a.network.confirm_send (confirm, vote_bytes, *j);
+				}
+				node_a.votes_cache.add (vote);
+			});
+		}
+		else
+		{
+			// Send from cache
+			for (auto & vote : votes)
 			{
-				rai::vectorstream stream (*bytes);
-				confirm.serialize (stream);
+				badem::confirm_ack confirm (vote);
+				auto vote_bytes = confirm.to_bytes ();
+				for (auto j (list_a.begin ()), m (list_a.end ()); j != m; ++j)
+				{
+					node_a.network.confirm_send (confirm, vote_bytes, *j);
+				}
 			}
+		}
+		// Republish if required
+		if (also_publish)
+		{
+			badem::publish publish (block_a);
+			std::shared_ptr<std::vector<uint8_t>> publish_bytes;
+			publish_bytes = publish.to_bytes ();
 			for (auto j (list_a.begin ()), m (list_a.end ()); j != m; ++j)
 			{
-				node_a.network.confirm_send (confirm, bytes, *j);
+				node_a.network.republish (hash, publish_bytes, *j);
 			}
-		});
+		}
 	}
 	return result;
 }
 
-template <>
-bool confirm_block (MDB_txn * transaction_a, rai::node & node_a, rai::endpoint & peer_a, std::shared_ptr<rai::block> block_a)
+bool confirm_block (badem::transaction const & transaction_a, badem::node & node_a, badem::endpoint & peer_a, std::shared_ptr<badem::block> block_a, bool also_publish)
 {
-	std::array<rai::endpoint, 1> endpoints;
+	std::array<badem::endpoint, 1> endpoints;
 	endpoints[0] = peer_a;
-	auto result (confirm_block (transaction_a, node_a, endpoints, std::move (block_a)));
+	auto result (confirm_block (transaction_a, node_a, endpoints, std::move (block_a), also_publish));
 	return result;
 }
 
-void rai::network::republish_block (MDB_txn * transaction, std::shared_ptr<rai::block> block)
+void badem::network::confirm_hashes (badem::transaction const & transaction_a, badem::endpoint const & peer_a, std::vector<badem::block_hash> blocks_bundle_a)
+{
+	if (node.config.enable_voting)
+	{
+		node.wallets.foreach_representative (transaction_a, [this, &blocks_bundle_a, &peer_a, &transaction_a](badem::public_key const & pub_a, badem::raw_key const & prv_a) {
+			auto vote (this->node.store.vote_generate (transaction_a, pub_a, prv_a, blocks_bundle_a));
+			badem::confirm_ack confirm (vote);
+			std::shared_ptr<std::vector<uint8_t>> bytes (new std::vector<uint8_t>);
+			{
+				badem::vectorstream stream (*bytes);
+				confirm.serialize (stream);
+			}
+			this->node.network.confirm_send (confirm, bytes, peer_a);
+			this->node.votes_cache.add (vote);
+		});
+	}
+}
+
+bool badem::network::send_votes_cache (badem::block_hash const & hash_a, badem::endpoint const & peer_a)
+{
+	// Search in cache
+	auto votes (node.votes_cache.find (hash_a));
+	// Send from cache
+	for (auto & vote : votes)
+	{
+		badem::confirm_ack confirm (vote);
+		auto vote_bytes = confirm.to_bytes ();
+		confirm_send (confirm, vote_bytes, peer_a);
+	}
+	// Returns true if votes were sent
+	bool result (!votes.empty ());
+	return result;
+}
+
+void badem::network::republish_block (std::shared_ptr<badem::block> block)
 {
 	auto hash (block->hash ());
 	auto list (node.peers.list_fanout ());
-	// If we're a representative, broadcast a signed confirm, otherwise an unsigned publish
-	if (!confirm_block (transaction, node, list, block))
+	badem::publish message (block);
+	auto bytes = message.to_bytes ();
+	for (auto i (list.begin ()), n (list.end ()); i != n; ++i)
 	{
-		rai::publish message (block);
-		std::shared_ptr<std::vector<uint8_t>> bytes (new std::vector<uint8_t>);
-		{
-			rai::vectorstream stream (*bytes);
-			message.serialize (stream);
-		}
-		auto hash (block->hash ());
-		for (auto i (list.begin ()), n (list.end ()); i != n; ++i)
-		{
-			republish (hash, bytes, *i);
-		}
-		if (node.config.logging.network_logging ())
-		{
-			BOOST_LOG (node.log) << boost::str (boost::format ("Block %1% was republished to peers") % hash.to_string ());
-		}
+		republish (hash, bytes, *i);
 	}
-	else
+	if (node.config.logging.network_logging ())
 	{
-		if (node.config.logging.network_logging ())
-		{
-			BOOST_LOG (node.log) << boost::str (boost::format ("Block %1% was confirmed to peers") % hash.to_string ());
-		}
+		BOOST_LOG (node.log) << boost::str (boost::format ("Block %1% was republished to peers") % hash.to_string ());
+	}
+}
+
+void badem::network::republish_block (std::shared_ptr<badem::block> block, badem::endpoint const & peer_a)
+{
+	auto hash (block->hash ());
+	badem::publish message (block);
+	std::vector<uint8_t> bytes;
+	{
+		badem::vectorstream stream (bytes);
+		message.serialize (stream);
+	}
+	republish (hash, std::make_shared<std::vector<uint8_t>> (bytes), peer_a);
+	if (node.config.logging.network_logging ())
+	{
+		BOOST_LOG (node.log) << boost::str (boost::format ("Block %1% was republished to peer") % hash.to_string ());
+	}
+}
+
+void badem::network::republish_block_batch (std::deque<std::shared_ptr<badem::block>> blocks_a, unsigned delay_a)
+{
+	auto block (blocks_a.front ());
+	blocks_a.pop_front ();
+	republish_block (block);
+	if (!blocks_a.empty ())
+	{
+		std::weak_ptr<badem::node> node_w (node.shared ());
+		node.alarm.add (std::chrono::steady_clock::now () + std::chrono::milliseconds (delay_a + std::rand () % delay_a), [node_w, blocks_a, delay_a]() {
+			if (auto node_l = node_w.lock ())
+			{
+				node_l->network.republish_block_batch (blocks_a, delay_a);
+			}
+		});
 	}
 }
 
@@ -208,14 +411,10 @@ void rai::network::republish_block (MDB_txn * transaction, std::shared_ptr<rai::
 //    This prevents rapid publishing of votes with increasing sequence numbers.
 //
 // These rules are implemented by the caller, not this function.
-void rai::network::republish_vote (std::shared_ptr<rai::vote> vote_a)
+void badem::network::republish_vote (std::shared_ptr<badem::vote> vote_a)
 {
-	rai::confirm_ack confirm (vote_a);
-	std::shared_ptr<std::vector<uint8_t>> bytes (new std::vector<uint8_t>);
-	{
-		rai::vectorstream stream (*bytes);
-		confirm.serialize (stream);
-	}
+	badem::confirm_ack confirm (vote_a);
+	auto bytes = confirm.to_bytes ();
 	auto list (node.peers.list_fanout ());
 	for (auto j (list.begin ()), m (list.end ()); j != m; ++j)
 	{
@@ -223,20 +422,41 @@ void rai::network::republish_vote (std::shared_ptr<rai::vote> vote_a)
 	}
 }
 
-void rai::network::broadcast_confirm_req (std::shared_ptr<rai::block> block_a)
+void badem::network::broadcast_confirm_req (std::shared_ptr<badem::block> block_a)
 {
-	auto list (std::make_shared<std::vector<rai::peer_information>> (node.peers.representatives (std::numeric_limits<size_t>::max ())));
+	auto list (std::make_shared<std::vector<badem::peer_information>> (node.peers.representatives (std::numeric_limits<size_t>::max ())));
+	if (list->empty () || node.peers.total_weight () < node.config.online_weight_minimum.number ())
+	{
+		// broadcast request to all peers (with max limit 2 * sqrt (peers count))
+		list = std::make_shared<std::vector<badem::peer_information>> (node.peers.list_vector (std::min (static_cast<size_t> (100), 2 * node.peers.size_sqrt ())));
+	}
+
+	/*
+	 * In either case (broadcasting to all representatives, or broadcasting to
+	 * all peers because there are not enough connected representatives),
+	 * limit each instance to a single random up-to-32 selection.  The invoker
+	 * of "broadcast_confirm_req" will be responsible for calling it again
+	 * if the votes for a block have not arrived in time.
+	 */
+	const size_t max_endpoints = 32;
+	random_pool::shuffle (list->begin (), list->end ());
+	if (list->size () > max_endpoints)
+	{
+		list->erase (list->begin () + max_endpoints, list->end ());
+	}
+
 	broadcast_confirm_req_base (block_a, list, 0);
 }
 
-void rai::network::broadcast_confirm_req_base (std::shared_ptr<rai::block> block_a, std::shared_ptr<std::vector<rai::peer_information>> endpoints_a, unsigned delay_a)
+void badem::network::broadcast_confirm_req_base (std::shared_ptr<badem::block> block_a, std::shared_ptr<std::vector<badem::peer_information>> endpoints_a, unsigned delay_a, bool resumption)
 {
-	if (node.config.logging.network_logging ())
+	const size_t max_reps = 10;
+	if (!resumption && node.config.logging.network_logging ())
 	{
 		BOOST_LOG (node.log) << boost::str (boost::format ("Broadcasting confirm req for block %1% to %2% representatives") % block_a->hash ().to_string () % endpoints_a->size ());
 	}
 	auto count (0);
-	while (!endpoints_a->empty () && count < 10)
+	while (!endpoints_a->empty () && count < max_reps)
 	{
 		send_confirm_req (endpoints_a->back ().endpoint, block_a);
 		endpoints_a->pop_back ();
@@ -244,30 +464,90 @@ void rai::network::broadcast_confirm_req_base (std::shared_ptr<rai::block> block
 	}
 	if (!endpoints_a->empty ())
 	{
-		std::weak_ptr<rai::node> node_w (node.shared ());
+		delay_a += std::rand () % broadcast_interval_ms;
+
+		std::weak_ptr<badem::node> node_w (node.shared ());
 		node.alarm.add (std::chrono::steady_clock::now () + std::chrono::milliseconds (delay_a), [node_w, block_a, endpoints_a, delay_a]() {
 			if (auto node_l = node_w.lock ())
 			{
-				node_l->network.broadcast_confirm_req_base (block_a, endpoints_a, delay_a + 50);
+				node_l->network.broadcast_confirm_req_base (block_a, endpoints_a, delay_a, true);
 			}
 		});
 	}
 }
 
-void rai::network::send_confirm_req (rai::endpoint const & endpoint_a, std::shared_ptr<rai::block> block)
+void badem::network::broadcast_confirm_req_batch (std::unordered_map<badem::endpoint, std::vector<std::pair<badem::block_hash, badem::block_hash>>> request_bundle_a, unsigned delay_a, bool resumption)
 {
-	rai::confirm_req message (block);
-	std::shared_ptr<std::vector<uint8_t>> bytes (new std::vector<uint8_t>);
+	const size_t max_reps = 10;
+	if (!resumption && node.config.logging.network_logging ())
 	{
-		rai::vectorstream stream (*bytes);
-		message.serialize (stream);
+		BOOST_LOG (node.log) << boost::str (boost::format ("Broadcasting batch confirm req to %1% representatives") % request_bundle_a.size ());
 	}
+	auto count (0);
+	while (!request_bundle_a.empty () && count < max_reps)
+	{
+		auto j (request_bundle_a.begin ());
+		count++;
+		std::vector<std::pair<badem::block_hash, badem::block_hash>> roots_hashes;
+		// Limit max request size hash + root to 6 pairs
+		while (roots_hashes.size () <= confirm_req_hashes_max && !j->second.empty ())
+		{
+			roots_hashes.push_back (j->second.back ());
+			j->second.pop_back ();
+		}
+		send_confirm_req_hashes (j->first, roots_hashes);
+		if (j->second.empty ())
+		{
+			request_bundle_a.erase (j);
+		}
+	}
+	if (!request_bundle_a.empty ())
+	{
+		std::weak_ptr<badem::node> node_w (node.shared ());
+		node.alarm.add (std::chrono::steady_clock::now () + std::chrono::milliseconds (delay_a), [node_w, request_bundle_a, delay_a]() {
+			if (auto node_l = node_w.lock ())
+			{
+				node_l->network.broadcast_confirm_req_batch (request_bundle_a, delay_a + 50, true);
+			}
+		});
+	}
+}
+
+void badem::network::broadcast_confirm_req_batch (std::deque<std::pair<std::shared_ptr<badem::block>, std::shared_ptr<std::vector<badem::peer_information>>>> deque_a, unsigned delay_a)
+{
+	auto pair (deque_a.front ());
+	deque_a.pop_front ();
+	auto block (pair.first);
+	// confirm_req to representatives
+	auto endpoints (pair.second);
+	if (!endpoints->empty ())
+	{
+		broadcast_confirm_req_base (block, endpoints, delay_a);
+	}
+	/* Continue while blocks remain
+	Broadcast with random delay between delay_a & 2*delay_a */
+	if (!deque_a.empty ())
+	{
+		std::weak_ptr<badem::node> node_w (node.shared ());
+		node.alarm.add (std::chrono::steady_clock::now () + std::chrono::milliseconds (delay_a + std::rand () % delay_a), [node_w, deque_a, delay_a]() {
+			if (auto node_l = node_w.lock ())
+			{
+				node_l->network.broadcast_confirm_req_batch (deque_a, delay_a);
+			}
+		});
+	}
+}
+
+void badem::network::send_confirm_req (badem::endpoint const & endpoint_a, std::shared_ptr<badem::block> block)
+{
+	badem::confirm_req message (block);
+	auto bytes = message.to_bytes ();
 	if (node.config.logging.network_message_logging ())
 	{
 		BOOST_LOG (node.log) << boost::str (boost::format ("Sending confirm req to %1%") % endpoint_a);
 	}
-	std::weak_ptr<rai::node> node_w (node.shared ());
-	node.stats.inc (rai::stat::type::message, rai::stat::detail::confirm_req, rai::stat::dir::out);
+	std::weak_ptr<badem::node> node_w (node.shared ());
+	node.stats.inc (badem::stat::type::message, badem::stat::detail::confirm_req, badem::stat::dir::out);
 	send_buffer (bytes->data (), bytes->size (), endpoint_a, [bytes, node_w](boost::system::error_code const & ec, size_t size) {
 		if (auto node_l = node_w.lock ())
 		{
@@ -279,11 +559,36 @@ void rai::network::send_confirm_req (rai::endpoint const & endpoint_a, std::shar
 	});
 }
 
-template <typename T>
-void rep_query (rai::node & node_a, T const & peers_a)
+void badem::network::send_confirm_req_hashes (badem::endpoint const & endpoint_a, std::vector<std::pair<badem::block_hash, badem::block_hash>> const & roots_hashes_a)
 {
-	rai::transaction transaction (node_a.store.environment, nullptr, false);
-	std::shared_ptr<rai::block> block (node_a.store.block_random (transaction));
+	badem::confirm_req message (roots_hashes_a);
+	std::vector<uint8_t> bytes;
+	{
+		badem::vectorstream stream (bytes);
+		message.serialize (stream);
+	}
+	if (node.config.logging.network_message_logging ())
+	{
+		BOOST_LOG (node.log) << boost::str (boost::format ("Sending confirm req hashes to %1%") % endpoint_a);
+	}
+	std::weak_ptr<badem::node> node_w (node.shared ());
+	node.stats.inc (badem::stat::type::message, badem::stat::detail::confirm_req, badem::stat::dir::out);
+	send_buffer (bytes.data (), bytes.size (), endpoint_a, [node_w](boost::system::error_code const & ec, size_t size) {
+		if (auto node_l = node_w.lock ())
+		{
+			if (ec && node_l->config.logging.network_logging ())
+			{
+				BOOST_LOG (node_l->log) << boost::str (boost::format ("Error sending confirm request: %1%") % ec.message ());
+			}
+		}
+	});
+}
+
+template <typename T>
+void rep_query (badem::node & node_a, T const & peers_a)
+{
+	auto transaction (node_a.store.tx_begin_read ());
+	std::shared_ptr<badem::block> block (node_a.store.block_random (transaction));
 	auto hash (block->hash ());
 	node_a.rep_crawler.add (hash);
 	for (auto i (peers_a.begin ()), n (peers_a.end ()); i != n; ++i)
@@ -291,7 +596,7 @@ void rep_query (rai::node & node_a, T const & peers_a)
 		node_a.peers.rep_request (*i);
 		node_a.network.send_confirm_req (*i, block);
 	}
-	std::weak_ptr<rai::node> node_w (node_a.shared ());
+	std::weak_ptr<badem::node> node_w (node_a.shared ());
 	node_a.alarm.add (std::chrono::steady_clock::now () + std::chrono::seconds (5), [node_w, hash]() {
 		if (auto node_l = node_w.lock ())
 		{
@@ -300,200 +605,300 @@ void rep_query (rai::node & node_a, T const & peers_a)
 	});
 }
 
-template <>
-void rep_query (rai::node & node_a, rai::endpoint const & peers_a)
+void rep_query (badem::node & node_a, badem::endpoint const & peers_a)
 {
-	std::array<rai::endpoint, 1> peers;
+	std::array<badem::endpoint, 1> peers;
 	peers[0] = peers_a;
 	rep_query (node_a, peers);
 }
 
 namespace
 {
-class network_message_visitor : public rai::message_visitor
+class network_message_visitor : public badem::message_visitor
 {
 public:
-	network_message_visitor (rai::node & node_a, rai::endpoint const & sender_a) :
+	network_message_visitor (badem::node & node_a, badem::endpoint const & sender_a) :
 	node (node_a),
 	sender (sender_a)
 	{
 	}
 	virtual ~network_message_visitor () = default;
-	void keepalive (rai::keepalive const & message_a) override
+	void keepalive (badem::keepalive const & message_a) override
 	{
 		if (node.config.logging.network_keepalive_logging ())
 		{
 			BOOST_LOG (node.log) << boost::str (boost::format ("Received keepalive message from %1%") % sender);
 		}
-		node.stats.inc (rai::stat::type::message, rai::stat::detail::keepalive, rai::stat::dir::in);
-		node.peers.contacted (sender, message_a.header.version_using);
+		node.stats.inc (badem::stat::type::message, badem::stat::detail::keepalive, badem::stat::dir::in);
+		if (node.peers.contacted (sender, message_a.header.version_using))
+		{
+			auto endpoint_l (badem::map_endpoint_to_v6 (sender));
+			auto cookie (node.peers.assign_syn_cookie (endpoint_l));
+			if (cookie)
+			{
+				node.network.send_node_id_handshake (endpoint_l, *cookie, boost::none);
+			}
+		}
 		node.network.merge_peers (message_a.peers);
 	}
-	void publish (rai::publish const & message_a) override
+	void publish (badem::publish const & message_a) override
 	{
 		if (node.config.logging.network_message_logging ())
 		{
 			BOOST_LOG (node.log) << boost::str (boost::format ("Publish message from %1% for %2%") % sender % message_a.block->hash ().to_string ());
 		}
-		node.stats.inc (rai::stat::type::message, rai::stat::detail::publish, rai::stat::dir::in);
+		node.stats.inc (badem::stat::type::message, badem::stat::detail::publish, badem::stat::dir::in);
 		node.peers.contacted (sender, message_a.header.version_using);
-		node.peers.insert (sender, message_a.header.version_using);
-		node.process_active (message_a.block);
+		if (!node.block_processor.full ())
+		{
+			node.process_active (message_a.block);
+		}
+		node.active.publish (message_a.block);
 	}
-	void confirm_req (rai::confirm_req const & message_a) override
+	void confirm_req (badem::confirm_req const & message_a) override
 	{
 		if (node.config.logging.network_message_logging ())
 		{
-			BOOST_LOG (node.log) << boost::str (boost::format ("Confirm_req message from %1% for %2%") % sender % message_a.block->hash ().to_string ());
-		}
-		node.stats.inc (rai::stat::type::message, rai::stat::detail::confirm_req, rai::stat::dir::in);
-		node.peers.contacted (sender, message_a.header.version_using);
-		node.peers.insert (sender, message_a.header.version_using);
-		node.process_active (message_a.block);
-		rai::transaction transaction_a (node.store.environment, nullptr, false);
-		auto successor (node.ledger.successor (transaction_a, message_a.block->root ()));
-		if (successor != nullptr)
-		{
-			confirm_block (transaction_a, node, sender, std::move (successor));
-		}
-	}
-	void confirm_ack (rai::confirm_ack const & message_a) override
-	{
-		if (node.config.logging.network_message_logging ())
-		{
-			BOOST_LOG (node.log) << boost::str (boost::format ("Received confirm_ack message from %1% for %2% sequence %3%") % sender % message_a.vote->block->hash ().to_string () % std::to_string (message_a.vote->sequence));
-		}
-		node.stats.inc (rai::stat::type::message, rai::stat::detail::confirm_ack, rai::stat::dir::in);
-		node.peers.contacted (sender, message_a.header.version_using);
-		node.peers.insert (sender, message_a.header.version_using);
-		node.process_active (message_a.vote->block);
-		node.vote_processor.vote (message_a.vote, sender);
-	}
-	void bulk_pull (rai::bulk_pull const &) override
-	{
-		assert (false);
-	}
-	void bulk_pull_blocks (rai::bulk_pull_blocks const &) override
-	{
-		assert (false);
-	}
-	void bulk_push (rai::bulk_push const &) override
-	{
-		assert (false);
-	}
-	void frontier_req (rai::frontier_req const &) override
-	{
-		assert (false);
-	}
-	rai::node & node;
-	rai::endpoint sender;
-};
-}
-
-void rai::network::receive_action (boost::system::error_code const & error, size_t size_a)
-{
-	if (!error && on)
-	{
-		if (!rai::reserved_address (remote) && remote != endpoint ())
-		{
-			network_message_visitor visitor (node, remote);
-			rai::message_parser parser (visitor, node.work);
-			parser.deserialize_buffer (buffer.data (), size_a);
-			if (parser.status != rai::message_parser::parse_status::success)
+			if (!message_a.roots_hashes.empty ())
 			{
-				node.stats.inc (rai::stat::type::error);
-
-				if (parser.status == rai::message_parser::parse_status::insufficient_work)
-				{
-					if (node.config.logging.insufficient_work_logging ())
-					{
-						BOOST_LOG (node.log) << "Insufficient work in message";
-					}
-
-					// We've already increment error count, update detail only
-					node.stats.inc_detail_only (rai::stat::type::error, rai::stat::detail::insufficient_work);
-				}
-				else if (parser.status == rai::message_parser::parse_status::invalid_message_type)
-				{
-					if (node.config.logging.network_logging ())
-					{
-						BOOST_LOG (node.log) << "Invalid message type in message";
-					}
-				}
-				else if (parser.status == rai::message_parser::parse_status::invalid_header)
-				{
-					if (node.config.logging.network_logging ())
-					{
-						BOOST_LOG (node.log) << "Invalid header in message";
-					}
-				}
-				else if (parser.status == rai::message_parser::parse_status::invalid_keepalive_message)
-				{
-					if (node.config.logging.network_logging ())
-					{
-						BOOST_LOG (node.log) << "Invalid keepalive message";
-					}
-				}
-				else if (parser.status == rai::message_parser::parse_status::invalid_publish_message)
-				{
-					if (node.config.logging.network_logging ())
-					{
-						BOOST_LOG (node.log) << "Invalid publish message";
-					}
-				}
-				else if (parser.status == rai::message_parser::parse_status::invalid_confirm_req_message)
-				{
-					if (node.config.logging.network_logging ())
-					{
-						BOOST_LOG (node.log) << "Invalid confirm_req message";
-					}
-				}
-				else if (parser.status == rai::message_parser::parse_status::invalid_confirm_ack_message)
-				{
-					if (node.config.logging.network_logging ())
-					{
-						BOOST_LOG (node.log) << "Invalid confirm_ack message";
-					}
-				}
-				else
-				{
-					BOOST_LOG (node.log) << "Could not deserialize buffer";
-				}
+				BOOST_LOG (node.log) << boost::str (boost::format ("Confirm_req message from %1% for hashes:roots %2%") % sender % message_a.roots_string ());
 			}
 			else
 			{
-				node.stats.add (rai::stat::type::traffic, rai::stat::dir::in, size_a);
+				BOOST_LOG (node.log) << boost::str (boost::format ("Confirm_req message from %1% for %2%") % sender % message_a.block->hash ().to_string ());
+			}
+		}
+		node.stats.inc (badem::stat::type::message, badem::stat::detail::confirm_req, badem::stat::dir::in);
+		node.peers.contacted (sender, message_a.header.version_using);
+		// Don't load nodes with disabled voting
+		if (node.config.enable_voting && node.wallets.reps_count)
+		{
+			if (message_a.block != nullptr)
+			{
+				auto hash (message_a.block->hash ());
+				if (!node.network.send_votes_cache (hash, sender))
+				{
+					auto transaction (node.store.tx_begin_read ());
+					auto successor (node.ledger.successor (transaction, badem::uint512_union (message_a.block->previous (), message_a.block->root ())));
+					if (successor != nullptr)
+					{
+						auto same_block (successor->hash () == hash);
+						confirm_block (transaction, node, sender, std::move (successor), !same_block);
+					}
+				}
+			}
+			else if (!message_a.roots_hashes.empty ())
+			{
+				auto transaction (node.store.tx_begin_read ());
+				std::vector<badem::block_hash> blocks_bundle;
+				for (auto & root_hash : message_a.roots_hashes)
+				{
+					if (!node.network.send_votes_cache (root_hash.first, sender) && node.store.block_exists (transaction, root_hash.first))
+					{
+						blocks_bundle.push_back (root_hash.first);
+					}
+					else
+					{
+						badem::block_hash successor (0);
+						// Search for block root
+						successor = node.store.block_successor (transaction, root_hash.second);
+						// Search for account root
+						if (successor.is_zero () && node.store.account_exists (transaction, root_hash.second))
+						{
+							badem::account_info info;
+							auto error (node.store.account_get (transaction, root_hash.second, info));
+							assert (!error);
+							successor = info.open_block;
+						}
+						if (!successor.is_zero ())
+						{
+							if (!node.network.send_votes_cache (successor, sender))
+							{
+								blocks_bundle.push_back (successor);
+							}
+							auto successor_block (node.store.block_get (transaction, successor));
+							assert (successor_block != nullptr);
+							node.network.republish_block (std::move (successor_block), sender);
+						}
+					}
+				}
+				if (!blocks_bundle.empty ())
+				{
+					node.network.confirm_hashes (transaction, sender, blocks_bundle);
+				}
+			}
+		}
+	}
+	void confirm_ack (badem::confirm_ack const & message_a) override
+	{
+		if (node.config.logging.network_message_logging ())
+		{
+			BOOST_LOG (node.log) << boost::str (boost::format ("Received confirm_ack message from %1% for %2%sequence %3%") % sender % message_a.vote->hashes_string () % std::to_string (message_a.vote->sequence));
+		}
+		node.stats.inc (badem::stat::type::message, badem::stat::detail::confirm_ack, badem::stat::dir::in);
+		node.peers.contacted (sender, message_a.header.version_using);
+		for (auto & vote_block : message_a.vote->blocks)
+		{
+			if (!vote_block.which ())
+			{
+				auto block (boost::get<std::shared_ptr<badem::block>> (vote_block));
+				if (!node.block_processor.full ())
+				{
+					node.process_active (block);
+				}
+				node.active.publish (block);
+			}
+		}
+		node.vote_processor.vote (message_a.vote, sender);
+	}
+	void bulk_pull (badem::bulk_pull const &) override
+	{
+		assert (false);
+	}
+	void bulk_pull_account (badem::bulk_pull_account const &) override
+	{
+		assert (false);
+	}
+	void bulk_push (badem::bulk_push const &) override
+	{
+		assert (false);
+	}
+	void frontier_req (badem::frontier_req const &) override
+	{
+		assert (false);
+	}
+	void node_id_handshake (badem::node_id_handshake const & message_a) override
+	{
+		if (node.config.logging.network_node_id_handshake_logging ())
+		{
+			BOOST_LOG (node.log) << boost::str (boost::format ("Received node_id_handshake message from %1% with query %2% and response account %3%") % sender % (message_a.query ? message_a.query->to_string () : std::string ("[none]")) % (message_a.response ? message_a.response->first.to_account () : std::string ("[none]")));
+		}
+		auto endpoint_l (badem::map_endpoint_to_v6 (sender));
+		boost::optional<badem::uint256_union> out_query;
+		boost::optional<badem::uint256_union> out_respond_to;
+		if (message_a.query)
+		{
+			out_respond_to = message_a.query;
+		}
+		auto validated_response (false);
+		if (message_a.response)
+		{
+			if (!node.peers.validate_syn_cookie (endpoint_l, message_a.response->first, message_a.response->second))
+			{
+				validated_response = true;
+				if (message_a.response->first != node.node_id.pub)
+				{
+					node.peers.insert (endpoint_l, message_a.header.version_using, false, message_a.response->first);
+				}
+			}
+			else if (node.config.logging.network_node_id_handshake_logging ())
+			{
+				BOOST_LOG (node.log) << boost::str (boost::format ("Failed to validate syn cookie signature %1% by %2%") % message_a.response->second.to_string () % message_a.response->first.to_account ());
+			}
+		}
+		if (!validated_response && !node.peers.known_peer (endpoint_l))
+		{
+			out_query = node.peers.assign_syn_cookie (endpoint_l);
+		}
+		if (out_query || out_respond_to)
+		{
+			node.network.send_node_id_handshake (sender, out_query, out_respond_to);
+		}
+		node.stats.inc (badem::stat::type::message, badem::stat::detail::node_id_handshake, badem::stat::dir::in);
+	}
+	badem::node & node;
+	badem::endpoint sender;
+};
+}
+
+void badem::network::receive_action (badem::udp_data * data_a, badem::endpoint const & local_endpoint_a)
+{
+	auto allowed_sender (true);
+	if (!on)
+	{
+		allowed_sender = false;
+	}
+	else if (data_a->endpoint == local_endpoint_a)
+	{
+		allowed_sender = false;
+	}
+	else if (badem::reserved_address (data_a->endpoint, false) && !node.config.allow_local_peers)
+	{
+		allowed_sender = false;
+	}
+	if (allowed_sender)
+	{
+		network_message_visitor visitor (node, data_a->endpoint);
+		badem::message_parser parser (node.block_uniquer, node.vote_uniquer, visitor, node.work);
+		parser.deserialize_buffer (data_a->buffer, data_a->size);
+		if (parser.status != badem::message_parser::parse_status::success)
+		{
+			node.stats.inc (badem::stat::type::error);
+
+			switch (parser.status)
+			{
+				case badem::message_parser::parse_status::insufficient_work:
+					// We've already increment error count, update detail only
+					node.stats.inc_detail_only (badem::stat::type::error, badem::stat::detail::insufficient_work);
+					break;
+				case badem::message_parser::parse_status::invalid_magic:
+					node.stats.inc (badem::stat::type::udp, badem::stat::detail::invalid_magic);
+					break;
+				case badem::message_parser::parse_status::invalid_network:
+					node.stats.inc (badem::stat::type::udp, badem::stat::detail::invalid_network);
+					break;
+				case badem::message_parser::parse_status::invalid_header:
+					node.stats.inc (badem::stat::type::udp, badem::stat::detail::invalid_header);
+					break;
+				case badem::message_parser::parse_status::invalid_message_type:
+					node.stats.inc (badem::stat::type::udp, badem::stat::detail::invalid_message_type);
+					break;
+				case badem::message_parser::parse_status::invalid_keepalive_message:
+					node.stats.inc (badem::stat::type::udp, badem::stat::detail::invalid_keepalive_message);
+					break;
+				case badem::message_parser::parse_status::invalid_publish_message:
+					node.stats.inc (badem::stat::type::udp, badem::stat::detail::invalid_publish_message);
+					break;
+				case badem::message_parser::parse_status::invalid_confirm_req_message:
+					node.stats.inc (badem::stat::type::udp, badem::stat::detail::invalid_confirm_req_message);
+					break;
+				case badem::message_parser::parse_status::invalid_confirm_ack_message:
+					node.stats.inc (badem::stat::type::udp, badem::stat::detail::invalid_confirm_ack_message);
+					break;
+				case badem::message_parser::parse_status::invalid_node_id_handshake_message:
+					node.stats.inc (badem::stat::type::udp, badem::stat::detail::invalid_node_id_handshake_message);
+					break;
+				case badem::message_parser::parse_status::outdated_version:
+					node.stats.inc (badem::stat::type::udp, badem::stat::detail::outdated_version);
+					break;
+				case badem::message_parser::parse_status::success:
+					/* Already checked, unreachable */
+					break;
+			}
+
+			if (node.config.logging.network_logging () && parser.status != badem::message_parser::parse_status::outdated_version)
+			{
+				BOOST_LOG (node.log) << "Could not parse message.  Error: " << parser.status_string ();
 			}
 		}
 		else
 		{
-			if (node.config.logging.network_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Reserved sender %1%") % remote.address ().to_string ());
-			}
-
-			node.stats.inc_detail_only (rai::stat::type::error, rai::stat::detail::bad_sender);
+			node.stats.add (badem::stat::type::traffic, badem::stat::dir::in, data_a->size);
 		}
-		receive ();
 	}
 	else
 	{
-		if (error)
+		if (node.config.logging.network_logging ())
 		{
-			if (node.config.logging.network_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("UDP Receive error: %1%") % error.message ());
-			}
+			BOOST_LOG (node.log) << boost::str (boost::format ("Reserved sender %1%") % data_a->endpoint.address ().to_string ());
 		}
-		if (on)
-		{
-			node.alarm.add (std::chrono::steady_clock::now () + std::chrono::seconds (5), [this]() { receive (); });
-		}
+
+		node.stats.inc_detail_only (badem::stat::type::error, badem::stat::detail::bad_sender);
 	}
 }
 
 // Send keepalives to all the peers we've been notified of
-void rai::network::merge_peers (std::array<rai::endpoint, 8> const & peers_a)
+void badem::network::merge_peers (std::array<badem::endpoint, 8> const & peers_a)
 {
 	for (auto i (peers_a.begin ()), j (peers_a.end ()); i != j; ++i)
 	{
@@ -504,24 +909,27 @@ void rai::network::merge_peers (std::array<rai::endpoint, 8> const & peers_a)
 	}
 }
 
-bool rai::operation::operator> (rai::operation const & other_a) const
+bool badem::operation::operator> (badem::operation const & other_a) const
 {
 	return wakeup > other_a.wakeup;
 }
 
-rai::alarm::alarm (boost::asio::io_service & service_a) :
-service (service_a),
-thread ([this]() { run (); })
+badem::alarm::alarm (boost::asio::io_context & io_ctx_a) :
+io_ctx (io_ctx_a),
+thread ([this]() {
+	badem::thread_role::set (badem::thread_role::name::alarm);
+	run ();
+})
 {
 }
 
-rai::alarm::~alarm ()
+badem::alarm::~alarm ()
 {
 	add (std::chrono::steady_clock::now (), nullptr);
 	thread.join ();
 }
 
-void rai::alarm::run ()
+void badem::alarm::run ()
 {
 	std::unique_lock<std::mutex> lock (mutex);
 	auto done (false);
@@ -534,7 +942,7 @@ void rai::alarm::run ()
 			{
 				if (operation.wakeup <= std::chrono::steady_clock::now ())
 				{
-					service.post (operation.function);
+					io_ctx.post (operation.function);
 					operations.pop ();
 				}
 				else
@@ -555,926 +963,501 @@ void rai::alarm::run ()
 	}
 }
 
-void rai::alarm::add (std::chrono::steady_clock::time_point const & wakeup_a, std::function<void()> const & operation)
+void badem::alarm::add (std::chrono::steady_clock::time_point const & wakeup_a, std::function<void()> const & operation)
 {
-	std::lock_guard<std::mutex> lock (mutex);
-	operations.push (rai::operation ({ wakeup_a, operation }));
+	{
+		std::lock_guard<std::mutex> lock (mutex);
+		operations.push (badem::operation ({ wakeup_a, operation }));
+	}
 	condition.notify_all ();
 }
 
-rai::logging::logging () :
-ledger_logging_value (false),
-ledger_duplicate_logging_value (false),
-vote_logging_value (false),
-network_logging_value (true),
-network_message_logging_value (false),
-network_publish_logging_value (false),
-network_packet_logging_value (false),
-network_keepalive_logging_value (false),
-node_lifetime_tracing_value (false),
-insufficient_work_logging_value (true),
-log_rpc_value (true),
-bulk_pull_logging_value (false),
-work_generation_time_value (true),
-log_to_cerr_value (false),
-max_size (16 * 1024 * 1024),
-rotation_size (4 * 1024 * 1024),
-flush (true)
+namespace badem
 {
-}
-
-void rai::logging::init (boost::filesystem::path const & application_path_a)
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (alarm & alarm, const std::string & name)
 {
-	static std::atomic_flag logging_already_added = ATOMIC_FLAG_INIT;
-	if (!logging_already_added.test_and_set ())
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	size_t count = 0;
 	{
-		boost::log::add_common_attributes ();
-		if (log_to_cerr ())
-		{
-			boost::log::add_console_log (std::cerr, boost::log::keywords::format = "[%TimeStamp%]: %Message%");
-		}
-		boost::log::add_file_log (boost::log::keywords::target = application_path_a / "log", boost::log::keywords::file_name = application_path_a / "log" / "log_%Y-%m-%d_%H-%M-%S.%N.log", boost::log::keywords::rotation_size = rotation_size, boost::log::keywords::auto_flush = flush, boost::log::keywords::scan_method = boost::log::sinks::file::scan_method::scan_matching, boost::log::keywords::max_size = max_size, boost::log::keywords::format = "[%TimeStamp%]: %Message%");
+		std::lock_guard<std::mutex> guard (alarm.mutex);
+		count = alarm.operations.size ();
 	}
+	auto sizeof_element = sizeof (decltype (alarm.operations)::value_type);
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "operations", count, sizeof_element }));
+	return composite;
+}
 }
 
-void rai::logging::serialize_json (boost::property_tree::ptree & tree_a) const
-{
-	tree_a.put ("version", "3");
-	tree_a.put ("ledger", ledger_logging_value);
-	tree_a.put ("ledger_duplicate", ledger_duplicate_logging_value);
-	tree_a.put ("vote", vote_logging_value);
-	tree_a.put ("network", network_logging_value);
-	tree_a.put ("network_message", network_message_logging_value);
-	tree_a.put ("network_publish", network_publish_logging_value);
-	tree_a.put ("network_packet", network_packet_logging_value);
-	tree_a.put ("network_keepalive", network_keepalive_logging_value);
-	tree_a.put ("node_lifetime_tracing", node_lifetime_tracing_value);
-	tree_a.put ("insufficient_work", insufficient_work_logging_value);
-	tree_a.put ("log_rpc", log_rpc_value);
-	tree_a.put ("bulk_pull", bulk_pull_logging_value);
-	tree_a.put ("work_generation_time", work_generation_time_value);
-	tree_a.put ("log_to_cerr", log_to_cerr_value);
-	tree_a.put ("max_size", max_size);
-	tree_a.put ("rotation_size", rotation_size);
-	tree_a.put ("flush", flush);
-}
-
-bool rai::logging::upgrade_json (unsigned version_a, boost::property_tree::ptree & tree_a)
-{
-	auto result (false);
-	switch (version_a)
-	{
-		case 1:
-			tree_a.put ("vote", vote_logging_value);
-			tree_a.put ("version", "2");
-			result = true;
-		case 2:
-			tree_a.put ("rotation_size", "4194304");
-			tree_a.put ("flush", "true");
-			tree_a.put ("version", "3");
-			result = true;
-		case 3:
-			break;
-		default:
-			throw std::runtime_error ("Unknown logging_config version");
-			break;
-	}
-	return result;
-}
-
-bool rai::logging::deserialize_json (bool & upgraded_a, boost::property_tree::ptree & tree_a)
-{
-	auto result (false);
-	try
-	{
-		auto version_l (tree_a.get_optional<std::string> ("version"));
-		if (!version_l)
-		{
-			tree_a.put ("version", "1");
-			version_l = "1";
-			auto work_peers_l (tree_a.get_child_optional ("work_peers"));
-			if (!work_peers_l)
-			{
-				tree_a.add_child ("work_peers", boost::property_tree::ptree ());
-			}
-			upgraded_a = true;
-		}
-		upgraded_a |= upgrade_json (std::stoull (version_l.get ()), tree_a);
-		ledger_logging_value = tree_a.get<bool> ("ledger");
-		ledger_duplicate_logging_value = tree_a.get<bool> ("ledger_duplicate");
-		vote_logging_value = tree_a.get<bool> ("vote");
-		network_logging_value = tree_a.get<bool> ("network");
-		network_message_logging_value = tree_a.get<bool> ("network_message");
-		network_publish_logging_value = tree_a.get<bool> ("network_publish");
-		network_packet_logging_value = tree_a.get<bool> ("network_packet");
-		network_keepalive_logging_value = tree_a.get<bool> ("network_keepalive");
-		node_lifetime_tracing_value = tree_a.get<bool> ("node_lifetime_tracing");
-		insufficient_work_logging_value = tree_a.get<bool> ("insufficient_work");
-		log_rpc_value = tree_a.get<bool> ("log_rpc");
-		bulk_pull_logging_value = tree_a.get<bool> ("bulk_pull");
-		work_generation_time_value = tree_a.get<bool> ("work_generation_time");
-		log_to_cerr_value = tree_a.get<bool> ("log_to_cerr");
-		max_size = tree_a.get<uintmax_t> ("max_size");
-		rotation_size = tree_a.get<uintmax_t> ("rotation_size", 4194304);
-		flush = tree_a.get<bool> ("flush", true);
-	}
-	catch (std::runtime_error const &)
-	{
-		result = true;
-	}
-	return result;
-}
-
-bool rai::logging::ledger_logging () const
-{
-	return ledger_logging_value;
-}
-
-bool rai::logging::ledger_duplicate_logging () const
-{
-	return ledger_logging () && ledger_duplicate_logging_value;
-}
-
-bool rai::logging::vote_logging () const
-{
-	return vote_logging_value;
-}
-
-bool rai::logging::network_logging () const
-{
-	return network_logging_value;
-}
-
-bool rai::logging::network_message_logging () const
-{
-	return network_logging () && network_message_logging_value;
-}
-
-bool rai::logging::network_publish_logging () const
-{
-	return network_logging () && network_publish_logging_value;
-}
-
-bool rai::logging::network_packet_logging () const
-{
-	return network_logging () && network_packet_logging_value;
-}
-
-bool rai::logging::network_keepalive_logging () const
-{
-	return network_logging () && network_keepalive_logging_value;
-}
-
-bool rai::logging::node_lifetime_tracing () const
-{
-	return node_lifetime_tracing_value;
-}
-
-bool rai::logging::insufficient_work_logging () const
-{
-	return network_logging () && insufficient_work_logging_value;
-}
-
-bool rai::logging::log_rpc () const
-{
-	return network_logging () && log_rpc_value;
-}
-
-bool rai::logging::bulk_pull_logging () const
-{
-	return network_logging () && bulk_pull_logging_value;
-}
-
-bool rai::logging::callback_logging () const
-{
-	return network_logging ();
-}
-
-bool rai::logging::work_generation_time () const
-{
-	return work_generation_time_value;
-}
-
-bool rai::logging::log_to_cerr () const
-{
-	return log_to_cerr_value;
-}
-
-rai::node_init::node_init () :
+badem::node_init::node_init () :
 block_store_init (false),
 wallet_init (false)
 {
 }
 
-bool rai::node_init::error ()
+bool badem::node_init::error ()
 {
-	return block_store_init || wallet_init;
+	return block_store_init || wallet_init || wallets_store_init;
 }
 
-rai::node_config::node_config () :
-node_config (rai::network::node_port, rai::logging ())
-{
-}
-
-rai::node_config::node_config (uint16_t peering_port_a, rai::logging const & logging_a) :
-peering_port (peering_port_a),
-logging (logging_a),
-bootstrap_fraction_numerator (1),
-receive_minimum (rai::RAW_ratio),
-online_weight_minimum (60000 * rai::kBDM_ratio),
-online_weight_quorum (50),
-password_fanout (1024),
-io_threads (std::max<unsigned> (4, std::thread::hardware_concurrency ())),
-work_threads (std::max<unsigned> (4, std::thread::hardware_concurrency ())),
-enable_voting (true),
-bootstrap_connections (4),
-bootstrap_connections_max (64),
-callback_port (0),
-lmdb_max_dbs (128)
-{
-	switch (rai::badem_network)
-	{
-		case rai::badem_networks::badem_test_network:
-			preconfigured_representatives.push_back (rai::genesis_account);
-			break;
-		case rai::badem_networks::badem_live_network:
-			preconfigured_peers.push_back ("node.badem.io");
-			preconfigured_representatives.push_back (rai::account ("565936F0F5F7A41201FD3F831A52B6B1CDBB74AE2C3E8A590ABA08C048F111FA"));
-			preconfigured_representatives.push_back (rai::account ("499D3E2FC2DB9FC2D0D4C445AD073C713E5634D7B2BBF24F57A727A1BABF68AB"));
-			break;
-		default:
-			assert (false);
-			break;
-	}
-}
-
-void rai::node_config::serialize_json (boost::property_tree::ptree & tree_a) const
-{
-	tree_a.put ("version", "12");
-	tree_a.put ("peering_port", std::to_string (peering_port));
-	tree_a.put ("bootstrap_fraction_numerator", std::to_string (bootstrap_fraction_numerator));
-	tree_a.put ("receive_minimum", receive_minimum.to_string_dec ());
-	boost::property_tree::ptree logging_l;
-	logging.serialize_json (logging_l);
-	tree_a.add_child ("logging", logging_l);
-	boost::property_tree::ptree work_peers_l;
-	for (auto i (work_peers.begin ()), n (work_peers.end ()); i != n; ++i)
-	{
-		boost::property_tree::ptree entry;
-		entry.put ("", boost::str (boost::format ("%1%:%2%") % i->first % i->second));
-		work_peers_l.push_back (std::make_pair ("", entry));
-	}
-	tree_a.add_child ("work_peers", work_peers_l);
-	boost::property_tree::ptree preconfigured_peers_l;
-	for (auto i (preconfigured_peers.begin ()), n (preconfigured_peers.end ()); i != n; ++i)
-	{
-		boost::property_tree::ptree entry;
-		entry.put ("", *i);
-		preconfigured_peers_l.push_back (std::make_pair ("", entry));
-	}
-	tree_a.add_child ("preconfigured_peers", preconfigured_peers_l);
-	boost::property_tree::ptree preconfigured_representatives_l;
-	for (auto i (preconfigured_representatives.begin ()), n (preconfigured_representatives.end ()); i != n; ++i)
-	{
-		boost::property_tree::ptree entry;
-		entry.put ("", i->to_account ());
-		preconfigured_representatives_l.push_back (std::make_pair ("", entry));
-	}
-	tree_a.add_child ("preconfigured_representatives", preconfigured_representatives_l);
-	tree_a.put ("online_weight_minimum", online_weight_minimum.to_string_dec ());
-	tree_a.put ("online_weight_quorum", std::to_string (online_weight_quorum));
-	tree_a.put ("password_fanout", std::to_string (password_fanout));
-	tree_a.put ("io_threads", std::to_string (io_threads));
-	tree_a.put ("work_threads", std::to_string (work_threads));
-	tree_a.put ("enable_voting", enable_voting);
-	tree_a.put ("bootstrap_connections", bootstrap_connections);
-	tree_a.put ("bootstrap_connections_max", bootstrap_connections_max);
-	tree_a.put ("callback_address", callback_address);
-	tree_a.put ("callback_port", std::to_string (callback_port));
-	tree_a.put ("callback_target", callback_target);
-	tree_a.put ("lmdb_max_dbs", lmdb_max_dbs);
-	tree_a.put ("state_block_parse_canary", state_block_parse_canary.to_string ());
-	tree_a.put ("state_block_generate_canary", state_block_generate_canary.to_string ());
-}
-
-bool rai::node_config::upgrade_json (unsigned version, boost::property_tree::ptree & tree_a)
-{
-	auto result (false);
-	switch (version)
-	{
-		case 1:
-		{
-			auto reps_l (tree_a.get_child ("preconfigured_representatives"));
-			boost::property_tree::ptree reps;
-			for (auto i (reps_l.begin ()), n (reps_l.end ()); i != n; ++i)
-			{
-				rai::uint256_union account;
-				account.decode_account (i->second.get<std::string> (""));
-				boost::property_tree::ptree entry;
-				entry.put ("", account.to_account ());
-				reps.push_back (std::make_pair ("", entry));
-			}
-			tree_a.erase ("preconfigured_representatives");
-			tree_a.add_child ("preconfigured_representatives", reps);
-			tree_a.erase ("version");
-			tree_a.put ("version", "2");
-			result = true;
-		}
-		case 2:
-		{
-			tree_a.put ("inactive_supply", rai::uint128_union (0).to_string_dec ());
-			tree_a.put ("password_fanout", std::to_string (1024));
-			tree_a.put ("io_threads", std::to_string (io_threads));
-			tree_a.put ("work_threads", std::to_string (work_threads));
-			tree_a.erase ("version");
-			tree_a.put ("version", "3");
-			result = true;
-		}
-		case 3:
-			tree_a.erase ("receive_minimum");
-			tree_a.put ("receive_minimum", rai::RAW_ratio.convert_to<std::string> ());
-			tree_a.erase ("version");
-			tree_a.put ("version", "4");
-			result = true;
-		case 4:
-			tree_a.erase ("receive_minimum");
-			tree_a.put ("receive_minimum", rai::RAW_ratio.convert_to<std::string> ());
-			tree_a.erase ("version");
-			tree_a.put ("version", "5");
-			result = true;
-		case 5:
-			tree_a.put ("enable_voting", enable_voting);
-			tree_a.erase ("packet_delay_microseconds");
-			tree_a.erase ("rebroadcast_delay");
-			tree_a.erase ("creation_rebroadcast");
-			tree_a.erase ("version");
-			tree_a.put ("version", "6");
-			result = true;
-		case 6:
-			tree_a.put ("bootstrap_connections", 16);
-			tree_a.put ("callback_address", "");
-			tree_a.put ("callback_port", "0");
-			tree_a.put ("callback_target", "");
-			tree_a.erase ("version");
-			tree_a.put ("version", "7");
-			result = true;
-		case 7:
-			tree_a.put ("lmdb_max_dbs", "128");
-			tree_a.erase ("version");
-			tree_a.put ("version", "8");
-			result = true;
-		case 8:
-			tree_a.put ("bootstrap_connections_max", "64");
-			tree_a.erase ("version");
-			tree_a.put ("version", "9");
-			result = true;
-		case 9:
-			tree_a.put ("state_block_parse_canary", state_block_parse_canary.to_string ());
-			tree_a.put ("state_block_generate_canary", state_block_generate_canary.to_string ());
-			tree_a.erase ("version");
-			tree_a.put ("version", "10");
-			result = true;
-		case 10:
-			tree_a.put ("online_weight_minimum", online_weight_minimum.to_string_dec ());
-			tree_a.put ("online_weight_quorom", std::to_string (online_weight_quorum));
-			tree_a.erase ("inactive_supply");
-			tree_a.erase ("version");
-			tree_a.put ("version", "11");
-			result = true;
-		case 11:
-		{
-			auto online_weight_quorum_l (tree_a.get<std::string> ("online_weight_quorom"));
-			tree_a.erase ("online_weight_quorom");
-			tree_a.put ("online_weight_quorum", online_weight_quorum_l);
-			tree_a.erase ("version");
-			tree_a.put ("version", "12");
-			result = true;
-		}
-		case 12:
-			break;
-		default:
-			throw std::runtime_error ("Unknown node_config version");
-	}
-	return result;
-}
-
-bool rai::node_config::deserialize_json (bool & upgraded_a, boost::property_tree::ptree & tree_a)
-{
-	auto result (false);
-	try
-	{
-		auto version_l (tree_a.get_optional<std::string> ("version"));
-		if (!version_l)
-		{
-			tree_a.put ("version", "1");
-			version_l = "1";
-			auto work_peers_l (tree_a.get_child_optional ("work_peers"));
-			if (!work_peers_l)
-			{
-				tree_a.add_child ("work_peers", boost::property_tree::ptree ());
-			}
-			upgraded_a = true;
-		}
-		upgraded_a |= upgrade_json (std::stoull (version_l.get ()), tree_a);
-		auto peering_port_l (tree_a.get<std::string> ("peering_port"));
-		auto bootstrap_fraction_numerator_l (tree_a.get<std::string> ("bootstrap_fraction_numerator"));
-		auto receive_minimum_l (tree_a.get<std::string> ("receive_minimum"));
-		auto & logging_l (tree_a.get_child ("logging"));
-		work_peers.clear ();
-		auto work_peers_l (tree_a.get_child ("work_peers"));
-		for (auto i (work_peers_l.begin ()), n (work_peers_l.end ()); i != n; ++i)
-		{
-			auto work_peer (i->second.get<std::string> (""));
-			auto port_position (work_peer.rfind (':'));
-			result |= port_position == -1;
-			if (!result)
-			{
-				auto port_str (work_peer.substr (port_position + 1));
-				uint16_t port;
-				result |= parse_port (port_str, port);
-				if (!result)
-				{
-					auto address (work_peer.substr (0, port_position));
-					work_peers.push_back (std::make_pair (address, port));
-				}
-			}
-		}
-		auto preconfigured_peers_l (tree_a.get_child ("preconfigured_peers"));
-		preconfigured_peers.clear ();
-		for (auto i (preconfigured_peers_l.begin ()), n (preconfigured_peers_l.end ()); i != n; ++i)
-		{
-			auto bootstrap_peer (i->second.get<std::string> (""));
-			preconfigured_peers.push_back (bootstrap_peer);
-		}
-		auto preconfigured_representatives_l (tree_a.get_child ("preconfigured_representatives"));
-		preconfigured_representatives.clear ();
-		for (auto i (preconfigured_representatives_l.begin ()), n (preconfigured_representatives_l.end ()); i != n; ++i)
-		{
-			rai::account representative (0);
-			result = result || representative.decode_account (i->second.get<std::string> (""));
-			preconfigured_representatives.push_back (representative);
-		}
-		if (preconfigured_representatives.empty ())
-		{
-			result = true;
-		}
-		auto stat_config_l (tree_a.get_child_optional ("statistics"));
-		if (stat_config_l)
-		{
-			result |= stat_config.deserialize_json (stat_config_l.get ());
-		}
-		auto online_weight_minimum_l (tree_a.get<std::string> ("online_weight_minimum"));
-		auto online_weight_quorum_l (tree_a.get<std::string> ("online_weight_quorum"));
-		auto password_fanout_l (tree_a.get<std::string> ("password_fanout"));
-		auto io_threads_l (tree_a.get<std::string> ("io_threads"));
-		auto work_threads_l (tree_a.get<std::string> ("work_threads"));
-		enable_voting = tree_a.get<bool> ("enable_voting");
-		auto bootstrap_connections_l (tree_a.get<std::string> ("bootstrap_connections"));
-		auto bootstrap_connections_max_l (tree_a.get<std::string> ("bootstrap_connections_max"));
-		callback_address = tree_a.get<std::string> ("callback_address");
-		auto callback_port_l (tree_a.get<std::string> ("callback_port"));
-		callback_target = tree_a.get<std::string> ("callback_target");
-		auto lmdb_max_dbs_l = tree_a.get<std::string> ("lmdb_max_dbs");
-		result |= parse_port (callback_port_l, callback_port);
-		auto state_block_parse_canary_l = tree_a.get<std::string> ("state_block_parse_canary");
-		auto state_block_generate_canary_l = tree_a.get<std::string> ("state_block_generate_canary");
-		try
-		{
-			peering_port = std::stoul (peering_port_l);
-			bootstrap_fraction_numerator = std::stoul (bootstrap_fraction_numerator_l);
-			password_fanout = std::stoul (password_fanout_l);
-			io_threads = std::stoul (io_threads_l);
-			work_threads = std::stoul (work_threads_l);
-			bootstrap_connections = std::stoul (bootstrap_connections_l);
-			bootstrap_connections_max = std::stoul (bootstrap_connections_max_l);
-			lmdb_max_dbs = std::stoi (lmdb_max_dbs_l);
-			online_weight_quorum = std::stoul (online_weight_quorum_l);
-			result |= peering_port > std::numeric_limits<uint16_t>::max ();
-			result |= logging.deserialize_json (upgraded_a, logging_l);
-			result |= receive_minimum.decode_dec (receive_minimum_l);
-			result |= online_weight_minimum.decode_dec (online_weight_minimum_l);
-			result |= online_weight_quorum > 100;
-			result |= password_fanout < 16;
-			result |= password_fanout > 1024 * 1024;
-			result |= io_threads == 0;
-			result |= state_block_parse_canary.decode_hex (state_block_parse_canary_l);
-			result |= state_block_generate_canary.decode_hex (state_block_generate_canary_l);
-		}
-		catch (std::logic_error const &)
-		{
-			result = true;
-		}
-	}
-	catch (std::runtime_error const &)
-	{
-		result = true;
-	}
-	return result;
-}
-
-rai::account rai::node_config::random_representative ()
-{
-	assert (preconfigured_representatives.size () > 0);
-	size_t index (rai::random_pool.GenerateWord32 (0, preconfigured_representatives.size () - 1));
-	auto result (preconfigured_representatives[index]);
-	return result;
-}
-
-rai::vote_processor::vote_processor (rai::node & node_a) :
-node (node_a)
-{
-}
-
-rai::vote_code rai::vote_processor::vote (std::shared_ptr<rai::vote> vote_a, rai::endpoint endpoint_a)
-{
-	auto result (rai::vote_code::invalid);
-	if (!vote_a->validate ())
-	{
-		result = rai::vote_code::replay;
-		std::shared_ptr<rai::vote> max_vote;
-		{
-			rai::transaction transaction (node.store.environment, nullptr, false);
-			max_vote = node.store.vote_max (transaction, vote_a);
-		}
-		if (!node.active.vote (vote_a) || max_vote->sequence > vote_a->sequence)
-		{
-			result = rai::vote_code::vote;
-		}
-		switch (result)
-		{
-			case rai::vote_code::vote:
-				node.observers.vote (vote_a, endpoint_a);
-			case rai::vote_code::replay:
-				// This tries to assist rep nodes that have lost track of their highest sequence number by replaying our highest known vote back to them
-				// Only do this if the sequence number is significantly different to account for network reordering
-				// Amplify attack considerations: We're sending out a confirm_ack in response to a confirm_ack for no net traffic increase
-				if (max_vote->sequence > vote_a->sequence + 10000)
-				{
-					rai::confirm_ack confirm (max_vote);
-					std::shared_ptr<std::vector<uint8_t>> bytes (new std::vector<uint8_t>);
-					{
-						rai::vectorstream stream (*bytes);
-						confirm.serialize (stream);
-					}
-					node.network.confirm_send (confirm, bytes, endpoint_a);
-				}
-			case rai::vote_code::invalid:
-				break;
-		}
-	}
-	if (node.config.logging.vote_logging ())
-	{
-		char const * status;
-		switch (result)
-		{
-			case rai::vote_code::invalid:
-				status = "Invalid";
-				node.stats.inc (rai::stat::type::vote, rai::stat::detail::vote_invalid);
-				break;
-			case rai::vote_code::replay:
-				status = "Replay";
-				node.stats.inc (rai::stat::type::vote, rai::stat::detail::vote_replay);
-				break;
-			case rai::vote_code::vote:
-				status = "Vote";
-				node.stats.inc (rai::stat::type::vote, rai::stat::detail::vote_valid);
-				break;
-		}
-		BOOST_LOG (node.log) << boost::str (boost::format ("Vote from: %1% sequence: %2% block: %3% status: %4%") % vote_a->account.to_account () % std::to_string (vote_a->sequence) % vote_a->block->hash ().to_string () % status);
-	}
-	return result;
-}
-
-void rai::rep_crawler::add (rai::block_hash const & hash_a)
-{
-	std::lock_guard<std::mutex> lock (mutex);
-	active.insert (hash_a);
-}
-
-void rai::rep_crawler::remove (rai::block_hash const & hash_a)
-{
-	std::lock_guard<std::mutex> lock (mutex);
-	active.erase (hash_a);
-}
-
-bool rai::rep_crawler::exists (rai::block_hash const & hash_a)
-{
-	std::lock_guard<std::mutex> lock (mutex);
-	return active.count (hash_a) != 0;
-}
-
-rai::block_processor::block_processor (rai::node & node_a) :
+badem::vote_processor::vote_processor (badem::node & node_a) :
+node (node_a),
+started (false),
 stopped (false),
 active (false),
-node (node_a),
-next_log (std::chrono::steady_clock::now ())
-{
-}
-
-rai::block_processor::~block_processor ()
-{
-	stop ();
-}
-
-void rai::block_processor::stop ()
-{
-	std::lock_guard<std::mutex> lock (mutex);
-	stopped = true;
-	condition.notify_all ();
-}
-
-void rai::block_processor::flush ()
+thread ([this]() {
+	badem::thread_role::set (badem::thread_role::name::vote_processing);
+	process_loop ();
+})
 {
 	std::unique_lock<std::mutex> lock (mutex);
-	while (!stopped && (!blocks.empty () || active))
+	while (!started)
 	{
 		condition.wait (lock);
 	}
 }
 
-bool rai::block_processor::full ()
+void badem::vote_processor::process_loop ()
 {
+	std::chrono::steady_clock::time_point start_time, end_time;
+	std::chrono::steady_clock::duration elapsed_time;
+	std::chrono::milliseconds elapsed_time_ms;
+	uint64_t elapsed_time_ms_int;
+	bool log_this_iteration;
+
 	std::unique_lock<std::mutex> lock (mutex);
-	return blocks.size () > 16384;
-}
+	started = true;
 
-void rai::block_processor::add (std::shared_ptr<rai::block> block_a)
-{
-	if (!rai::work_validate (block_a->root (), block_a->block_work ()))
-	{
-		std::lock_guard<std::mutex> lock (mutex);
-		blocks.push_front (block_a);
-		condition.notify_all ();
-	}
-	else
-	{
-		BOOST_LOG (node.log) << "rai::block_processor::add called for hash " << block_a->hash ().to_string () << " with invalid work " << rai::to_string_hex (block_a->block_work ());
-		assert (false && "rai::block_processor::add called with invalid work");
-	}
-}
-
-void rai::block_processor::force (std::shared_ptr<rai::block> block_a)
-{
-	std::lock_guard<std::mutex> lock (mutex);
-	forced.push_front (block_a);
+	lock.unlock ();
 	condition.notify_all ();
-}
+	lock.lock ();
 
-void rai::block_processor::process_blocks ()
-{
-	std::unique_lock<std::mutex> lock (mutex);
 	while (!stopped)
 	{
-		if (have_blocks ())
+		if (!votes.empty ())
 		{
+			std::deque<std::pair<std::shared_ptr<badem::vote>, badem::endpoint>> votes_l;
+			votes_l.swap (votes);
+
+			log_this_iteration = false;
+			if (node.config.logging.network_logging () && votes_l.size () > 50)
+			{
+				/*
+				 * Only log the timing information for this iteration if
+				 * there are a sufficient number of items for it to be relevant
+				 */
+				log_this_iteration = true;
+				start_time = std::chrono::steady_clock::now ();
+			}
 			active = true;
 			lock.unlock ();
-			process_receive_many (lock);
+			verify_votes (votes_l);
+			{
+				std::unique_lock<std::mutex> active_single_lock (node.active.mutex);
+				auto transaction (node.store.tx_begin_read ());
+				uint64_t count (1);
+				for (auto & i : votes_l)
+				{
+					vote_blocking (transaction, i.first, i.second, true);
+					// Free active_transactions mutex each 100 processed votes
+					if (count % 100 == 0)
+					{
+						active_single_lock.unlock ();
+						active_single_lock.lock ();
+					}
+					count++;
+				}
+			}
 			lock.lock ();
 			active = false;
+
+			lock.unlock ();
+			condition.notify_all ();
+			lock.lock ();
+
+			if (log_this_iteration)
+			{
+				end_time = std::chrono::steady_clock::now ();
+				elapsed_time = end_time - start_time;
+				elapsed_time_ms = std::chrono::duration_cast<std::chrono::milliseconds> (elapsed_time);
+				elapsed_time_ms_int = elapsed_time_ms.count ();
+
+				if (elapsed_time_ms_int >= 100)
+				{
+					/*
+					 * If the time spent was less than 100ms then
+					 * the results are probably not useful as well,
+					 * so don't spam the logs.
+					 */
+					BOOST_LOG (node.log) << boost::str (boost::format ("Processed %1% votes in %2% milliseconds (rate of %3% votes per second)") % votes_l.size () % elapsed_time_ms_int % ((votes_l.size () * 1000ULL) / elapsed_time_ms_int));
+				}
+			}
 		}
 		else
 		{
-			condition.notify_all ();
 			condition.wait (lock);
 		}
 	}
 }
 
-bool rai::block_processor::should_log ()
+void badem::vote_processor::vote (std::shared_ptr<badem::vote> vote_a, badem::endpoint endpoint_a)
 {
-	auto result (false);
-	auto now (std::chrono::steady_clock::now ());
-	if (next_log < now)
+	assert (endpoint_a.address ().is_v6 ());
+	std::unique_lock<std::mutex> lock (mutex);
+	if (!stopped)
 	{
-		next_log = now + std::chrono::seconds (15);
-		result = true;
+		bool process (false);
+		/* Random early delection levels
+		Always process votes for test network (process = true)
+		Stop processing with max 144 * 1024 votes */
+		if (!badem::is_test_network)
+		{
+			// Level 0 (< 0.1%)
+			if (votes.size () < 96 * 1024)
+			{
+				process = true;
+			}
+			// Level 1 (0.1-1%)
+			else if (votes.size () < 112 * 1024)
+			{
+				process = (representatives_1.find (vote_a->account) != representatives_1.end ());
+			}
+			// Level 2 (1-5%)
+			else if (votes.size () < 128 * 1024)
+			{
+				process = (representatives_2.find (vote_a->account) != representatives_2.end ());
+			}
+			// Level 3 (> 5%)
+			else if (votes.size () < 144 * 1024)
+			{
+				process = (representatives_3.find (vote_a->account) != representatives_3.end ());
+			}
+		}
+		else
+		{
+			// Process for test network
+			process = true;
+		}
+		if (process)
+		{
+			votes.push_back (std::make_pair (vote_a, endpoint_a));
+
+			lock.unlock ();
+			condition.notify_all ();
+			lock.lock ();
+		}
+		else
+		{
+			node.stats.inc (badem::stat::type::vote, badem::stat::detail::vote_overflow);
+			if (node.config.logging.vote_logging ())
+			{
+				BOOST_LOG (node.log) << "Votes overflow";
+			}
+		}
+	}
+}
+
+void badem::vote_processor::verify_votes (std::deque<std::pair<std::shared_ptr<badem::vote>, badem::endpoint>> & votes_a)
+{
+	auto size (votes_a.size ());
+	std::vector<unsigned char const *> messages;
+	messages.reserve (size);
+	std::vector<badem::uint256_union> hashes;
+	hashes.reserve (size);
+	std::vector<size_t> lengths (size, sizeof (badem::uint256_union));
+	std::vector<unsigned char const *> pub_keys;
+	pub_keys.reserve (size);
+	std::vector<unsigned char const *> signatures;
+	signatures.reserve (size);
+	std::vector<int> verifications;
+	verifications.resize (size);
+	for (auto & vote : votes_a)
+	{
+		hashes.push_back (vote.first->hash ());
+		messages.push_back (hashes.back ().bytes.data ());
+		pub_keys.push_back (vote.first->account.bytes.data ());
+		signatures.push_back (vote.first->signature.bytes.data ());
+	}
+	badem::signature_check_set check = { size, messages.data (), lengths.data (), pub_keys.data (), signatures.data (), verifications.data () };
+	node.checker.verify (check);
+	std::remove_reference_t<decltype (votes_a)> result;
+	auto i (0);
+	for (auto & vote : votes_a)
+	{
+		assert (verifications[i] == 1 || verifications[i] == 0);
+		if (verifications[i] == 1)
+		{
+			result.push_back (vote);
+		}
+		++i;
+	}
+	votes_a.swap (result);
+}
+
+// node.active.mutex lock required
+badem::vote_code badem::vote_processor::vote_blocking (badem::transaction const & transaction_a, std::shared_ptr<badem::vote> vote_a, badem::endpoint endpoint_a, bool validated)
+{
+	assert (endpoint_a.address ().is_v6 ());
+	assert (!node.active.mutex.try_lock ());
+	auto result (badem::vote_code::invalid);
+	if (validated || !vote_a->validate ())
+	{
+		auto max_vote (node.store.vote_max (transaction_a, vote_a));
+		result = badem::vote_code::replay;
+		if (!node.active.vote (vote_a, true))
+		{
+			result = badem::vote_code::vote;
+		}
+		switch (result)
+		{
+			case badem::vote_code::vote:
+				node.observers.vote.notify (transaction_a, vote_a, endpoint_a);
+			case badem::vote_code::replay:
+				// This tries to assist rep nodes that have lost track of their highest sequence number by replaying our highest known vote back to them
+				// Only do this if the sequence number is significantly different to account for network reordering
+				// Amplify attack considerations: We're sending out a confirm_ack in response to a confirm_ack for no net traffic increase
+				if (max_vote->sequence > vote_a->sequence + 10000)
+				{
+					badem::confirm_ack confirm (max_vote);
+					node.network.confirm_send (confirm, confirm.to_bytes (), endpoint_a);
+				}
+				break;
+			case badem::vote_code::invalid:
+				assert (false);
+				break;
+		}
+	}
+	std::string status;
+	switch (result)
+	{
+		case badem::vote_code::invalid:
+			status = "Invalid";
+			node.stats.inc (badem::stat::type::vote, badem::stat::detail::vote_invalid);
+			break;
+		case badem::vote_code::replay:
+			status = "Replay";
+			node.stats.inc (badem::stat::type::vote, badem::stat::detail::vote_replay);
+			break;
+		case badem::vote_code::vote:
+			status = "Vote";
+			node.stats.inc (badem::stat::type::vote, badem::stat::detail::vote_valid);
+			break;
+	}
+	if (node.config.logging.vote_logging ())
+	{
+		BOOST_LOG (node.log) << boost::str (boost::format ("Vote from: %1% sequence: %2% block(s): %3%status: %4%") % vote_a->account.to_account () % std::to_string (vote_a->sequence) % vote_a->hashes_string () % status);
 	}
 	return result;
 }
 
-bool rai::block_processor::have_blocks ()
-{
-	assert (!mutex.try_lock ());
-	return !blocks.empty () || !forced.empty ();
-}
-
-void rai::block_processor::process_receive_many (std::unique_lock<std::mutex> & lock_a)
+void badem::vote_processor::stop ()
 {
 	{
-		rai::transaction transaction (node.store.environment, nullptr, true);
-		auto cutoff (std::chrono::steady_clock::now () + rai::transaction_timeout);
-		lock_a.lock ();
-		auto count (0);
-		while (have_blocks () && count < 16384)
+		std::lock_guard<std::mutex> lock (mutex);
+		stopped = true;
+	}
+	condition.notify_all ();
+	if (thread.joinable ())
+	{
+		thread.join ();
+	}
+}
+
+void badem::vote_processor::flush ()
+{
+	std::unique_lock<std::mutex> lock (mutex);
+	while (active || !votes.empty ())
+	{
+		condition.wait (lock);
+	}
+}
+
+void badem::vote_processor::calculate_weights ()
+{
+	std::unique_lock<std::mutex> lock (mutex);
+	if (!stopped)
+	{
+		representatives_1.clear ();
+		representatives_2.clear ();
+		representatives_3.clear ();
+		auto supply (node.online_reps.online_stake ());
+		auto transaction (node.store.tx_begin_read ());
+		for (auto i (node.store.representation_begin (transaction)), n (node.store.representation_end ()); i != n; ++i)
 		{
-			if (blocks.size () > 64 && should_log ())
+			badem::account representative (i->first);
+			auto weight (node.ledger.weight (transaction, representative));
+			if (weight > supply / 1000) // 0.1% or above (level 1)
 			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("%1% blocks in processing queue") % blocks.size ());
-			}
-			std::shared_ptr<rai::block> block;
-			bool force (false);
-			if (forced.empty ())
-			{
-				block = blocks.front ();
-				blocks.pop_front ();
-			}
-			else
-			{
-				block = forced.front ();
-				forced.pop_front ();
-				force = true;
-			}
-			lock_a.unlock ();
-			auto hash (block->hash ());
-			if (force)
-			{
-				auto successor (node.ledger.successor (transaction, block->root ()));
-				if (successor != nullptr && successor->hash () != hash)
+				representatives_1.insert (representative);
+				if (weight > supply / 100) // 1% or above (level 2)
 				{
-					// Replace our block with the winner and roll back any dependent blocks
-					BOOST_LOG (node.log) << boost::str (boost::format ("Rolling back %1% and replacing with %2%") % successor->hash ().to_string () % hash.to_string ());
-					node.ledger.rollback (transaction, successor->hash ());
+					representatives_2.insert (representative);
+					if (weight > supply / 20) // 5% or above (level 3)
+					{
+						representatives_3.insert (representative);
+					}
 				}
 			}
-			auto process_result (process_receive_one (transaction, block));
-			(void)process_result;
-			lock_a.lock ();
-			++count;
 		}
 	}
-	lock_a.unlock ();
 }
 
-rai::process_return rai::block_processor::process_receive_one (MDB_txn * transaction_a, std::shared_ptr<rai::block> block_a)
+namespace badem
 {
-	rai::process_return result;
-	auto hash (block_a->hash ());
-	result = node.ledger.process (transaction_a, *block_a);
-	switch (result.code)
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (node_observers & node_observers, const std::string & name)
+{
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	composite->add_component (collect_seq_con_info (node_observers.blocks, "blocks"));
+	composite->add_component (collect_seq_con_info (node_observers.wallet, "wallet"));
+	composite->add_component (collect_seq_con_info (node_observers.vote, "vote"));
+	composite->add_component (collect_seq_con_info (node_observers.account_balance, "account_balance"));
+	composite->add_component (collect_seq_con_info (node_observers.endpoint, "endpoint"));
+	composite->add_component (collect_seq_con_info (node_observers.disconnect, "disconnect"));
+	return composite;
+}
+
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (vote_processor & vote_processor, const std::string & name)
+{
+	size_t votes_count = 0;
+	size_t representatives_1_count = 0;
+	size_t representatives_2_count = 0;
+	size_t representatives_3_count = 0;
+
 	{
-		case rai::process_result::progress:
-		{
-			if (node.config.logging.ledger_logging ())
-			{
-				std::string block;
-				block_a->serialize_json (block);
-				BOOST_LOG (node.log) << boost::str (boost::format ("Processing block %1%: %2%") % hash.to_string () % block);
-			}
-			if (node.block_arrival.recent (hash))
-			{
-				node.active.start (block_a);
-			}
-			queue_unchecked (transaction_a, hash);
-			break;
-		}
-		case rai::process_result::gap_previous:
-		{
-			if (node.config.logging.ledger_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Gap previous for: %1%") % hash.to_string ());
-			}
-			node.store.unchecked_put (transaction_a, block_a->previous (), block_a);
-			node.gap_cache.add (transaction_a, block_a);
-			break;
-		}
-		case rai::process_result::gap_source:
-		{
-			if (node.config.logging.ledger_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Gap source for: %1%") % hash.to_string ());
-			}
-			node.store.unchecked_put (transaction_a, node.ledger.block_source (transaction_a, *block_a), block_a);
-			node.gap_cache.add (transaction_a, block_a);
-			break;
-		}
-		case rai::process_result::old:
-		{
-			if (node.config.logging.ledger_duplicate_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Old for: %1%") % block_a->hash ().to_string ());
-			}
-			queue_unchecked (transaction_a, hash);
-			break;
-		}
-		case rai::process_result::bad_signature:
-		{
-			if (node.config.logging.ledger_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Bad signature for: %1%") % hash.to_string ());
-			}
-			break;
-		}
-		case rai::process_result::negative_spend:
-		{
-			if (node.config.logging.ledger_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Negative spend for: %1%") % hash.to_string ());
-			}
-			break;
-		}
-		case rai::process_result::unreceivable:
-		{
-			if (node.config.logging.ledger_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Unreceivable for: %1%") % hash.to_string ());
-			}
-			break;
-		}
-		case rai::process_result::fork:
-		{
-			if (!node.block_arrival.recent (hash))
-			{
-				// Only let the bootstrap attempt know about forked blocks that did not arrive via UDP.
-				node.process_fork (transaction_a, block_a);
-			}
-			if (node.config.logging.ledger_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Fork for: %1% root: %2%") % hash.to_string () % block_a->root ().to_string ());
-			}
-			break;
-		}
-		case rai::process_result::opened_burn_account:
-		{
-			BOOST_LOG (node.log) << boost::str (boost::format ("*** Rejecting open block for burn account ***: %1%") % hash.to_string ());
-			break;
-		}
-		case rai::process_result::balance_mismatch:
-		{
-			if (node.config.logging.ledger_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Balance mismatch for: %1%") % hash.to_string ());
-			}
-			break;
-		}
-		case rai::process_result::block_position:
-		{
-			if (node.config.logging.ledger_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Block %1% cannot follow predecessor %2%") % hash.to_string () % block_a->previous ().to_string ());
-			}
-			break;
-		}
+		std::lock_guard<std::mutex> (vote_processor.mutex);
+		votes_count = vote_processor.votes.size ();
+		representatives_1_count = vote_processor.representatives_1.size ();
+		representatives_2_count = vote_processor.representatives_2.size ();
+		representatives_3_count = vote_processor.representatives_3.size ();
 	}
-	return result;
+
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "votes", votes_count, sizeof (decltype (vote_processor.votes)::value_type) }));
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "representatives_1", representatives_1_count, sizeof (decltype (vote_processor.representatives_1)::value_type) }));
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "representatives_2", representatives_2_count, sizeof (decltype (vote_processor.representatives_2)::value_type) }));
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "representatives_3", representatives_3_count, sizeof (decltype (vote_processor.representatives_3)::value_type) }));
+	return composite;
+}
 }
 
-void rai::block_processor::queue_unchecked (MDB_txn * transaction_a, rai::block_hash const & hash_a)
+void badem::rep_crawler::add (badem::block_hash const & hash_a)
 {
-	auto cached (node.store.unchecked_get (transaction_a, hash_a));
-	for (auto i (cached.begin ()), n (cached.end ()); i != n; ++i)
+	std::lock_guard<std::mutex> lock (mutex);
+	active.insert (hash_a);
+}
+
+void badem::rep_crawler::remove (badem::block_hash const & hash_a)
+{
+	std::lock_guard<std::mutex> lock (mutex);
+	active.erase (hash_a);
+}
+
+bool badem::rep_crawler::exists (badem::block_hash const & hash_a)
+{
+	std::lock_guard<std::mutex> lock (mutex);
+	return active.count (hash_a) != 0;
+}
+
+namespace badem
+{
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (rep_crawler & rep_crawler, const std::string & name)
+{
+	size_t count = 0;
 	{
-		node.store.unchecked_del (transaction_a, hash_a, **i);
-		add (*i);
+		std::lock_guard<std::mutex> guard (rep_crawler.mutex);
+		count = rep_crawler.active.size ();
 	}
-	std::lock_guard<std::mutex> lock (node.gap_cache.mutex);
-	node.gap_cache.blocks.get<1> ().erase (hash_a);
+
+	auto sizeof_element = sizeof (decltype (rep_crawler.active)::value_type);
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "active", count, sizeof_element }));
+	return composite;
+}
 }
 
-rai::node::node (rai::node_init & init_a, boost::asio::io_service & service_a, uint16_t peering_port_a, boost::filesystem::path const & application_path_a, rai::alarm & alarm_a, rai::logging const & logging_a, rai::work_pool & work_a) :
-node (init_a, service_a, application_path_a, alarm_a, rai::node_config (peering_port_a, logging_a), work_a)
+namespace badem
+{
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (block_processor & block_processor, const std::string & name)
+{
+	size_t state_blocks_count = 0;
+	size_t blocks_count = 0;
+	size_t blocks_hashes_count = 0;
+	size_t forced_count = 0;
+	size_t rolled_back_count = 0;
+
+	{
+		std::lock_guard<std::mutex> guard (block_processor.mutex);
+		state_blocks_count = block_processor.state_blocks.size ();
+		blocks_count = block_processor.blocks.size ();
+		blocks_hashes_count = block_processor.blocks_hashes.size ();
+		forced_count = block_processor.forced.size ();
+		rolled_back_count = block_processor.rolled_back.size ();
+	}
+
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "state_blocks", state_blocks_count, sizeof (decltype (block_processor.state_blocks)::value_type) }));
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "blocks", blocks_count, sizeof (decltype (block_processor.blocks)::value_type) }));
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "blocks_hashes", blocks_hashes_count, sizeof (decltype (block_processor.blocks_hashes)::value_type) }));
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "forced", forced_count, sizeof (decltype (block_processor.forced)::value_type) }));
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "rolled_back", rolled_back_count, sizeof (decltype (block_processor.rolled_back)::value_type) }));
+	composite->add_component (collect_seq_con_info (block_processor.generator, "generator"));
+	return composite;
+}
+}
+
+badem::node::node (badem::node_init & init_a, boost::asio::io_context & io_ctx_a, uint16_t peering_port_a, boost::filesystem::path const & application_path_a, badem::alarm & alarm_a, badem::logging const & logging_a, badem::work_pool & work_a) :
+node (init_a, io_ctx_a, application_path_a, alarm_a, badem::node_config (peering_port_a, logging_a), work_a)
 {
 }
 
-rai::node::node (rai::node_init & init_a, boost::asio::io_service & service_a, boost::filesystem::path const & application_path_a, rai::alarm & alarm_a, rai::node_config const & config_a, rai::work_pool & work_a) :
-service (service_a),
+badem::node::node (badem::node_init & init_a, boost::asio::io_context & io_ctx_a, boost::filesystem::path const & application_path_a, badem::alarm & alarm_a, badem::node_config const & config_a, badem::work_pool & work_a, badem::node_flags flags_a) :
+io_ctx (io_ctx_a),
 config (config_a),
+flags (flags_a),
 alarm (alarm_a),
 work (work_a),
-store (init_a.block_store_init, application_path_a / "data.ldb", config_a.lmdb_max_dbs),
+store_impl (std::make_unique<badem::mdb_store> (init_a.block_store_init, config.logging, application_path_a / "data.ldb", config_a.lmdb_max_dbs, !flags.disable_unchecked_drop, flags.sideband_batch_size)),
+store (*store_impl),
+wallets_store_impl (std::make_unique<badem::mdb_wallets_store> (init_a.wallets_store_init, application_path_a / "wallets.ldb", config_a.lmdb_max_dbs)),
+wallets_store (*wallets_store_impl),
 gap_cache (*this),
-ledger (store, stats),
+ledger (store, stats, config.epoch_block_link, config.epoch_block_signer),
 active (*this),
 network (*this, config.peering_port),
 bootstrap_initiator (*this),
-bootstrap (service_a, config.peering_port, *this),
+bootstrap (io_ctx_a, config.peering_port, *this),
 peers (network.endpoint ()),
 application_path (application_path_a),
-wallets (init_a.block_store_init, *this),
+wallets (init_a.wallet_init, *this),
 port_mapping (*this),
+checker (config.signature_checker_threads),
 vote_processor (*this),
 warmed_up (0),
 block_processor (*this),
-block_processor_thread ([this]() { this->block_processor.process_blocks (); }),
-online_reps (*this),
-stats (config.stat_config)
+block_processor_thread ([this]() {
+	badem::thread_role::set (badem::thread_role::name::block_processing);
+	this->block_processor.process_blocks ();
+}),
+online_reps (ledger, config.online_weight_minimum.number ()),
+stats (config.stat_config),
+vote_uniquer (block_uniquer),
+startup_time (std::chrono::steady_clock::now ())
 {
 	wallets.observer = [this](bool active) {
-		observers.wallet (active);
+		observers.wallet.notify (active);
 	};
-	peers.peer_observer = [this](rai::endpoint const & endpoint_a) {
-		observers.endpoint (endpoint_a);
+	peers.peer_observer = [this](badem::endpoint const & endpoint_a) {
+		observers.endpoint.notify (endpoint_a);
 	};
 	peers.disconnect_observer = [this]() {
-		observers.disconnect ();
+		observers.disconnect.notify ();
 	};
-	observers.blocks.add ([this](std::shared_ptr<rai::block> block_a, rai::account const & account_a, rai::amount const & amount_a, bool is_state_send_a) {
-		if (this->block_arrival.recent (block_a->hash ()))
-		{
-			auto node_l (shared_from_this ());
-			background ([node_l, block_a, account_a, amount_a, is_state_send_a]() {
-				if (!node_l->config.callback_address.empty ())
-				{
+	if (!config.callback_address.empty ())
+	{
+		observers.blocks.add ([this](std::shared_ptr<badem::block> block_a, badem::account const & account_a, badem::amount const & amount_a, bool is_state_send_a) {
+			if (this->block_arrival.recent (block_a->hash ()))
+			{
+				auto node_l (shared_from_this ());
+				background ([node_l, block_a, account_a, amount_a, is_state_send_a]() {
 					boost::property_tree::ptree event;
 					event.add ("account", account_a.to_account ());
 					event.add ("hash", block_a->hash ().to_string ());
@@ -1493,72 +1476,11 @@ stats (config.stat_config)
 					auto address (node_l->config.callback_address);
 					auto port (node_l->config.callback_port);
 					auto target (std::make_shared<std::string> (node_l->config.callback_target));
-					auto resolver (std::make_shared<boost::asio::ip::tcp::resolver> (node_l->service));
+					auto resolver (std::make_shared<boost::asio::ip::tcp::resolver> (node_l->io_ctx));
 					resolver->async_resolve (boost::asio::ip::tcp::resolver::query (address, std::to_string (port)), [node_l, address, port, target, body, resolver](boost::system::error_code const & ec, boost::asio::ip::tcp::resolver::iterator i_a) {
 						if (!ec)
 						{
-							for (auto i (i_a), n (boost::asio::ip::tcp::resolver::iterator{}); i != n; ++i)
-							{
-								auto sock (std::make_shared<boost::asio::ip::tcp::socket> (node_l->service));
-								sock->async_connect (i->endpoint (), [node_l, target, body, sock, address, port](boost::system::error_code const & ec) {
-									if (!ec)
-									{
-										auto req (std::make_shared<boost::beast::http::request<boost::beast::http::string_body>> ());
-										req->method (boost::beast::http::verb::post);
-										req->target (*target);
-										req->version (11);
-										req->insert (boost::beast::http::field::host, address);
-										req->insert (boost::beast::http::field::content_type, "application/json");
-										req->body () = *body;
-										//req->prepare (*req);
-										//boost::beast::http::prepare(req);
-										req->prepare_payload ();
-										boost::beast::http::async_write (*sock, *req, [node_l, sock, address, port, req](boost::system::error_code const & ec, size_t bytes_transferred) {
-											if (!ec)
-											{
-												auto sb (std::make_shared<boost::beast::flat_buffer> ());
-												auto resp (std::make_shared<boost::beast::http::response<boost::beast::http::string_body>> ());
-												boost::beast::http::async_read (*sock, *sb, *resp, [node_l, sb, resp, sock, address, port](boost::system::error_code const & ec, size_t bytes_transferred) {
-													if (!ec)
-													{
-														if (resp->result () == boost::beast::http::status::ok)
-														{
-														}
-														else
-														{
-															if (node_l->config.logging.callback_logging ())
-															{
-																BOOST_LOG (node_l->log) << boost::str (boost::format ("Callback to %1%:%2% failed with status: %3%") % address % port % resp->result ());
-															}
-														}
-													}
-													else
-													{
-														if (node_l->config.logging.callback_logging ())
-														{
-															BOOST_LOG (node_l->log) << boost::str (boost::format ("Unable complete callback: %1%:%2%: %3%") % address % port % ec.message ());
-														}
-													};
-												});
-											}
-											else
-											{
-												if (node_l->config.logging.callback_logging ())
-												{
-													BOOST_LOG (node_l->log) << boost::str (boost::format ("Unable to send callback: %1%:%2%: %3%") % address % port % ec.message ());
-												}
-											}
-										});
-									}
-									else
-									{
-										if (node_l->config.logging.callback_logging ())
-										{
-											BOOST_LOG (node_l->log) << boost::str (boost::format ("Unable to connect to callback address: %1%:%2%: %3%") % address % port % ec.message ());
-										}
-									}
-								});
-							}
+							node_l->do_rpc_callback (i_a, address, port, target, body, resolver);
 						}
 						else
 						{
@@ -1566,40 +1488,46 @@ stats (config.stat_config)
 							{
 								BOOST_LOG (node_l->log) << boost::str (boost::format ("Error resolving callback: %1%:%2%: %3%") % address % port % ec.message ());
 							}
+							node_l->stats.inc (badem::stat::type::error, badem::stat::detail::http_callback, badem::stat::dir::out);
 						}
 					});
-				}
-			});
-		}
-	});
-	observers.endpoint.add ([this](rai::endpoint const & endpoint_a) {
+				});
+			}
+		});
+	}
+	observers.endpoint.add ([this](badem::endpoint const & endpoint_a) {
 		this->network.send_keepalive (endpoint_a);
 		rep_query (*this, endpoint_a);
 	});
-	observers.vote.add ([this](std::shared_ptr<rai::vote> vote_a, rai::endpoint const &) {
+	observers.vote.add ([this](badem::transaction const & transaction, std::shared_ptr<badem::vote> vote_a, badem::endpoint const & endpoint_a) {
+		assert (endpoint_a.address ().is_v6 ());
 		this->gap_cache.vote (vote_a);
-	});
-	observers.vote.add ([this](std::shared_ptr<rai::vote> vote_a, rai::endpoint const &) {
-		this->online_reps.vote (vote_a);
-	});
-	observers.vote.add ([this](std::shared_ptr<rai::vote> vote_a, rai::endpoint const & endpoint_a) {
-		rai::uint128_t rep_weight;
-		rai::uint128_t min_rep_weight;
+		this->online_reps.observe (vote_a->account);
+		badem::uint128_t rep_weight;
+		badem::uint128_t min_rep_weight;
 		{
-			rai::transaction transaction (store.environment, nullptr, false);
 			rep_weight = ledger.weight (transaction, vote_a->account);
 			min_rep_weight = online_reps.online_stake () / 1000;
 		}
 		if (rep_weight > min_rep_weight)
 		{
-			if (this->rep_crawler.exists (vote_a->block->hash ()))
+			bool rep_crawler_exists (false);
+			for (auto hash : *vote_a)
+			{
+				if (this->rep_crawler.exists (hash))
+				{
+					rep_crawler_exists = true;
+					break;
+				}
+			}
+			if (rep_crawler_exists)
 			{
 				// We see a valid non-replay vote for a block we requested, this node is probably a representative
-				if (peers.rep_response (endpoint_a, vote_a->account, rep_weight))
+				if (this->peers.rep_response (endpoint_a, vote_a->account, rep_weight))
 				{
 					BOOST_LOG (log) << boost::str (boost::format ("Found a representative at %1%") % endpoint_a);
 					// Rebroadcasting all active votes to new representative
-					auto blocks (active.list_blocks ());
+					auto blocks (this->active.list_blocks (true));
 					for (auto i (blocks.begin ()), n (blocks.end ()); i != n; ++i)
 					{
 						if (*i != nullptr)
@@ -1611,7 +1539,15 @@ stats (config.stat_config)
 			}
 		}
 	});
-	BOOST_LOG (log) << "Node starting, version: " << BADEM_VERSION_MAJOR << "." << BADEM_VERSION_MINOR;
+	if (BADEM_VERSION_PATCH == 0)
+	{
+		BOOST_LOG (log) << "Node starting, version: " << BADEM_MAJOR_MINOR_VERSION;
+	}
+	else
+	{
+		BOOST_LOG (log) << "Node starting, version: " << BADEM_MAJOR_MINOR_RC_VERSION;
+	}
+
 	BOOST_LOG (log) << boost::str (boost::format ("Work pool running %1% threads") % work.threads.size ());
 	if (!init_a.error ())
 	{
@@ -1619,36 +1555,43 @@ stats (config.stat_config)
 		{
 			BOOST_LOG (log) << "Constructing node";
 		}
-		rai::transaction transaction (store.environment, nullptr, true);
+		badem::genesis genesis;
+		auto transaction (store.tx_begin_write ());
 		if (store.latest_begin (transaction) == store.latest_end ())
 		{
 			// Store was empty meaning we just created it, add the genesis block
-			rai::genesis genesis;
-			genesis.initialize (transaction, store);
+			store.initialize (transaction, genesis);
 		}
+		if (!store.block_exists (transaction, genesis.hash ()))
+		{
+			BOOST_LOG (log) << "Genesis block not found. Make sure the node network ID is correct.";
+			std::exit (1);
+		}
+
+		node_id = badem::keypair (store.get_node_id (transaction));
+		BOOST_LOG (log) << "Node ID: " << node_id.pub.to_account ();
 	}
-	if (rai::badem_network == rai::badem_networks::badem_live_network)
+	peers.online_weight_minimum = config.online_weight_minimum.number ();
+	if (badem::is_live_network || badem::is_beta_network)
 	{
-		extern const char badem_bootstrap_weights[];
-		extern const size_t badem_bootstrap_weights_size;
-		rai::bufferstream weight_stream ((const uint8_t *)badem_bootstrap_weights, badem_bootstrap_weights_size);
-		rai::uint128_union block_height;
-		if (!rai::read (weight_stream, block_height))
+		badem::bufferstream weight_stream ((const uint8_t *)badem_bootstrap_weights, badem_bootstrap_weights_size);
+		badem::uint128_union block_height;
+		if (!badem::try_read (weight_stream, block_height))
 		{
 			auto max_blocks = (uint64_t)block_height.number ();
-			rai::transaction transaction (store.environment, nullptr, false);
+			auto transaction (store.tx_begin_read ());
 			if (ledger.store.block_count (transaction).sum () < max_blocks)
 			{
 				ledger.bootstrap_weight_max_blocks = max_blocks;
 				while (true)
 				{
-					rai::account account;
-					if (rai::read (weight_stream, account.bytes))
+					badem::account account;
+					if (badem::try_read (weight_stream, account.bytes))
 					{
 						break;
 					}
-					rai::amount weight;
-					if (rai::read (weight_stream, weight.bytes))
+					badem::amount weight;
+					if (badem::try_read (weight_stream, weight.bytes))
 					{
 						break;
 					}
@@ -1660,7 +1603,7 @@ stats (config.stat_config)
 	}
 }
 
-rai::node::~node ()
+badem::node::~node ()
 {
 	if (config.logging.node_lifetime_tracing ())
 	{
@@ -1669,47 +1612,112 @@ rai::node::~node ()
 	stop ();
 }
 
-bool rai::node::copy_with_compaction (boost::filesystem::path const & destination_file)
+void badem::node::do_rpc_callback (boost::asio::ip::tcp::resolver::iterator i_a, std::string const & address, uint16_t port, std::shared_ptr<std::string> target, std::shared_ptr<std::string> body, std::shared_ptr<boost::asio::ip::tcp::resolver> resolver)
 {
-	return !mdb_env_copy2 (store.environment.environment,
-	destination_file.string ().c_str (), MDB_CP_COMPACT);
-}
-
-void rai::node::send_keepalive (rai::endpoint const & endpoint_a)
-{
-	auto endpoint_l (endpoint_a);
-	if (endpoint_l.address ().is_v4 ())
+	if (i_a != boost::asio::ip::tcp::resolver::iterator{})
 	{
-		endpoint_l = rai::endpoint (boost::asio::ip::address_v6::v4_mapped (endpoint_l.address ().to_v4 ()), endpoint_l.port ());
+		auto node_l (shared_from_this ());
+		auto sock (std::make_shared<boost::asio::ip::tcp::socket> (node_l->io_ctx));
+		sock->async_connect (i_a->endpoint (), [node_l, target, body, sock, address, port, i_a, resolver](boost::system::error_code const & ec) mutable {
+			if (!ec)
+			{
+				auto req (std::make_shared<boost::beast::http::request<boost::beast::http::string_body>> ());
+				req->method (boost::beast::http::verb::post);
+				req->target (*target);
+				req->version (11);
+				req->insert (boost::beast::http::field::host, address);
+				req->insert (boost::beast::http::field::content_type, "application/json");
+				req->body () = *body;
+				req->prepare_payload ();
+				boost::beast::http::async_write (*sock, *req, [node_l, sock, address, port, req, i_a, target, body, resolver](boost::system::error_code const & ec, size_t bytes_transferred) mutable {
+					if (!ec)
+					{
+						auto sb (std::make_shared<boost::beast::flat_buffer> ());
+						auto resp (std::make_shared<boost::beast::http::response<boost::beast::http::string_body>> ());
+						boost::beast::http::async_read (*sock, *sb, *resp, [node_l, sb, resp, sock, address, port, i_a, target, body, resolver](boost::system::error_code const & ec, size_t bytes_transferred) mutable {
+							if (!ec)
+							{
+								if (resp->result () == boost::beast::http::status::ok)
+								{
+									node_l->stats.inc (badem::stat::type::http_callback, badem::stat::detail::initiate, badem::stat::dir::out);
+								}
+								else
+								{
+									if (node_l->config.logging.callback_logging ())
+									{
+										BOOST_LOG (node_l->log) << boost::str (boost::format ("Callback to %1%:%2% failed with status: %3%") % address % port % resp->result ());
+									}
+									node_l->stats.inc (badem::stat::type::error, badem::stat::detail::http_callback, badem::stat::dir::out);
+								}
+							}
+							else
+							{
+								if (node_l->config.logging.callback_logging ())
+								{
+									BOOST_LOG (node_l->log) << boost::str (boost::format ("Unable complete callback: %1%:%2%: %3%") % address % port % ec.message ());
+								}
+								node_l->stats.inc (badem::stat::type::error, badem::stat::detail::http_callback, badem::stat::dir::out);
+							};
+						});
+					}
+					else
+					{
+						if (node_l->config.logging.callback_logging ())
+						{
+							BOOST_LOG (node_l->log) << boost::str (boost::format ("Unable to send callback: %1%:%2%: %3%") % address % port % ec.message ());
+						}
+						node_l->stats.inc (badem::stat::type::error, badem::stat::detail::http_callback, badem::stat::dir::out);
+					}
+				});
+			}
+			else
+			{
+				if (node_l->config.logging.callback_logging ())
+				{
+					BOOST_LOG (node_l->log) << boost::str (boost::format ("Unable to connect to callback address: %1%:%2%: %3%") % address % port % ec.message ());
+				}
+				node_l->stats.inc (badem::stat::type::error, badem::stat::detail::http_callback, badem::stat::dir::out);
+				++i_a;
+				node_l->do_rpc_callback (i_a, address, port, target, body, resolver);
+			}
+		});
 	}
-	assert (endpoint_l.address ().is_v6 ());
-	network.send_keepalive (endpoint_l);
 }
 
-void rai::node::process_fork (MDB_txn * transaction_a, std::shared_ptr<rai::block> block_a)
+bool badem::node::copy_with_compaction (boost::filesystem::path const & destination_file)
+{
+	return !mdb_env_copy2 (boost::polymorphic_downcast<badem::mdb_store *> (store_impl.get ())->env.environment, destination_file.string ().c_str (), MDB_CP_COMPACT);
+}
+
+void badem::node::send_keepalive (badem::endpoint const & endpoint_a)
+{
+	network.send_keepalive (badem::map_endpoint_to_v6 (endpoint_a));
+}
+
+void badem::node::process_fork (badem::transaction const & transaction_a, std::shared_ptr<badem::block> block_a)
 {
 	auto root (block_a->root ());
-	if (!store.block_exists (transaction_a, block_a->hash ()) && store.root_exists (transaction_a, block_a->root ()))
+	if (!store.block_exists (transaction_a, block_a->type (), block_a->hash ()) && store.root_exists (transaction_a, block_a->root ()))
 	{
-		std::shared_ptr<rai::block> ledger_block (ledger.forked_block (transaction_a, *block_a));
+		std::shared_ptr<badem::block> ledger_block (ledger.forked_block (transaction_a, *block_a));
 		if (ledger_block)
 		{
-			std::weak_ptr<rai::node> this_w (shared_from_this ());
-			if (!active.start (std::make_pair (ledger_block, block_a), [this_w, root](std::shared_ptr<rai::block>) {
+			std::weak_ptr<badem::node> this_w (shared_from_this ());
+			if (!active.start (ledger_block, [this_w, root](std::shared_ptr<badem::block>) {
 				    if (auto this_l = this_w.lock ())
 				    {
 					    auto attempt (this_l->bootstrap_initiator.current_attempt ());
-					    if (attempt)
+					    if (attempt && attempt->mode == badem::bootstrap_mode::legacy)
 					    {
-						    rai::transaction transaction (this_l->store.environment, nullptr, false);
+						    auto transaction (this_l->store.tx_begin_read ());
 						    auto account (this_l->ledger.store.frontier_get (transaction, root));
 						    if (!account.is_zero ())
 						    {
-							    attempt->requeue_pull (rai::pull_info (account, root, root));
+							    attempt->requeue_pull (badem::pull_info (account, root, root));
 						    }
 						    else if (this_l->ledger.store.account_exists (transaction, root))
 						    {
-							    attempt->requeue_pull (rai::pull_info (root, rai::block_hash (0), rai::block_hash (0)));
+							    attempt->requeue_pull (badem::pull_info (root, badem::block_hash (0), badem::block_hash (0)));
 						    }
 					    }
 				    }
@@ -1722,25 +1730,51 @@ void rai::node::process_fork (MDB_txn * transaction_a, std::shared_ptr<rai::bloc
 	}
 }
 
-rai::gap_cache::gap_cache (rai::node & node_a) :
+namespace badem
+{
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (node & node, const std::string & name)
+{
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	composite->add_component (collect_seq_con_info (node.alarm, "alarm"));
+	composite->add_component (collect_seq_con_info (node.work, "work"));
+	composite->add_component (collect_seq_con_info (node.gap_cache, "gap_cache"));
+	composite->add_component (collect_seq_con_info (node.ledger, "ledger"));
+	composite->add_component (collect_seq_con_info (node.active, "active"));
+	composite->add_component (collect_seq_con_info (node.bootstrap_initiator, "bootstrap_initiator"));
+	composite->add_component (collect_seq_con_info (node.bootstrap, "bootstrap"));
+	composite->add_component (collect_seq_con_info (node.peers, "peers"));
+	composite->add_component (collect_seq_con_info (node.observers, "observers"));
+	composite->add_component (collect_seq_con_info (node.wallets, "wallets"));
+	composite->add_component (collect_seq_con_info (node.vote_processor, "vote_processor"));
+	composite->add_component (collect_seq_con_info (node.rep_crawler, "rep_crawler"));
+	composite->add_component (collect_seq_con_info (node.block_processor, "block_processor"));
+	composite->add_component (collect_seq_con_info (node.block_arrival, "block_arrival"));
+	composite->add_component (collect_seq_con_info (node.online_reps, "online_reps"));
+	composite->add_component (collect_seq_con_info (node.votes_cache, "votes_cache"));
+	composite->add_component (collect_seq_con_info (node.block_uniquer, "block_uniquer"));
+	composite->add_component (collect_seq_con_info (node.vote_uniquer, "vote_uniquer"));
+	return composite;
+}
+}
+
+badem::gap_cache::gap_cache (badem::node & node_a) :
 node (node_a)
 {
 }
 
-void rai::gap_cache::add (MDB_txn * transaction_a, std::shared_ptr<rai::block> block_a)
+void badem::gap_cache::add (badem::transaction const & transaction_a, badem::block_hash const & hash_a, std::chrono::steady_clock::time_point time_point_a)
 {
-	auto hash (block_a->hash ());
 	std::lock_guard<std::mutex> lock (mutex);
-	auto existing (blocks.get<1> ().find (hash));
+	auto existing (blocks.get<1> ().find (hash_a));
 	if (existing != blocks.get<1> ().end ())
 	{
-		blocks.get<1> ().modify (existing, [](rai::gap_information & info) {
-			info.arrival = std::chrono::steady_clock::now ();
+		blocks.get<1> ().modify (existing, [time_point_a](badem::gap_information & info) {
+			info.arrival = time_point_a;
 		});
 	}
 	else
 	{
-		blocks.insert ({ std::chrono::steady_clock::now (), hash, std::unique_ptr<rai::votes> (new rai::votes (block_a)) });
+		blocks.insert ({ time_point_a, hash_a, std::unordered_set<badem::account> () });
 		if (blocks.size () > max)
 		{
 			blocks.get<0> ().erase (blocks.get<0> ().begin ());
@@ -1748,67 +1782,95 @@ void rai::gap_cache::add (MDB_txn * transaction_a, std::shared_ptr<rai::block> b
 	}
 }
 
-void rai::gap_cache::vote (std::shared_ptr<rai::vote> vote_a)
+void badem::gap_cache::vote (std::shared_ptr<badem::vote> vote_a)
 {
 	std::lock_guard<std::mutex> lock (mutex);
-	rai::transaction transaction (node.store.environment, nullptr, false);
-	auto hash (vote_a->block->hash ());
-	auto existing (blocks.get<1> ().find (hash));
-	if (existing != blocks.get<1> ().end ())
+	auto transaction (node.store.tx_begin_read ());
+	for (auto hash : *vote_a)
 	{
-		existing->votes->vote (vote_a);
-		auto winner (node.ledger.winner (transaction, *existing->votes));
-		if (winner.first > bootstrap_threshold (transaction))
+		auto existing (blocks.get<1> ().find (hash));
+		if (existing != blocks.get<1> ().end ())
 		{
-			auto node_l (node.shared ());
-			auto now (std::chrono::steady_clock::now ());
-			node.alarm.add (rai::badem_network == rai::badem_networks::badem_test_network ? now + std::chrono::milliseconds (5) : now + std::chrono::seconds (5), [node_l, hash]() {
-				rai::transaction transaction (node_l->store.environment, nullptr, false);
-				if (!node_l->store.block_exists (transaction, hash))
+			auto is_new (false);
+			blocks.get<1> ().modify (existing, [&](badem::gap_information & info) { is_new = info.voters.insert (vote_a->account).second; });
+			if (is_new)
+			{
+				uint128_t tally;
+				for (auto & voter : existing->voters)
 				{
-					if (!node_l->bootstrap_initiator.in_progress ())
-					{
-						BOOST_LOG (node_l->log) << boost::str (boost::format ("Missing confirmed block %1%") % hash.to_string ());
-					}
-					node_l->bootstrap_initiator.bootstrap ();
+					tally += node.ledger.weight (transaction, voter);
 				}
-			});
+				bool start_bootstrap (false);
+				if (!node.flags.disable_lazy_bootstrap)
+				{
+					if (tally >= node.config.online_weight_minimum.number ())
+					{
+						start_bootstrap = true;
+					}
+				}
+				else if (!node.flags.disable_legacy_bootstrap && tally > bootstrap_threshold (transaction))
+				{
+					start_bootstrap = true;
+				}
+				if (start_bootstrap)
+				{
+					auto node_l (node.shared ());
+					auto now (std::chrono::steady_clock::now ());
+					node.alarm.add (badem::is_test_network ? now + std::chrono::milliseconds (5) : now + std::chrono::seconds (5), [node_l, hash]() {
+						auto transaction (node_l->store.tx_begin_read ());
+						if (!node_l->store.block_exists (transaction, hash))
+						{
+							if (!node_l->bootstrap_initiator.in_progress ())
+							{
+								BOOST_LOG (node_l->log) << boost::str (boost::format ("Missing block %1% which has enough votes to warrant lazy bootstrapping it") % hash.to_string ());
+							}
+							if (!node_l->flags.disable_lazy_bootstrap)
+							{
+								node_l->bootstrap_initiator.bootstrap_lazy (hash);
+							}
+							else if (!node_l->flags.disable_legacy_bootstrap)
+							{
+								node_l->bootstrap_initiator.bootstrap ();
+							}
+						}
+					});
+				}
+			}
 		}
 	}
 }
 
-rai::uint128_t rai::gap_cache::bootstrap_threshold (MDB_txn * transaction_a)
+badem::uint128_t badem::gap_cache::bootstrap_threshold (badem::transaction const & transaction_a)
 {
 	auto result ((node.online_reps.online_stake () / 256) * node.config.bootstrap_fraction_numerator);
 	return result;
 }
 
-void rai::gap_cache::purge_old ()
+size_t badem::gap_cache::size ()
 {
-	auto cutoff (std::chrono::steady_clock::now () - std::chrono::seconds (10));
 	std::lock_guard<std::mutex> lock (mutex);
-	auto done (false);
-	while (!done && !blocks.empty ())
-	{
-		auto first (blocks.get<1> ().begin ());
-		if (first->arrival < cutoff)
-		{
-			blocks.get<1> ().erase (first);
-		}
-		else
-		{
-			done = true;
-		}
-	}
+	return blocks.size ();
 }
 
-void rai::network::confirm_send (rai::confirm_ack const & confirm_a, std::shared_ptr<std::vector<uint8_t>> bytes_a, rai::endpoint const & endpoint_a)
+namespace badem
+{
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (gap_cache & gap_cache, const std::string & name)
+{
+	auto count = gap_cache.size ();
+	auto sizeof_element = sizeof (decltype (gap_cache.blocks)::value_type);
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "blocks", count, sizeof_element }));
+	return composite;
+}
+}
+
+void badem::network::confirm_send (badem::confirm_ack const & confirm_a, std::shared_ptr<std::vector<uint8_t>> bytes_a, badem::endpoint const & endpoint_a)
 {
 	if (node.config.logging.network_publish_logging ())
 	{
-		BOOST_LOG (node.log) << boost::str (boost::format ("Sending confirm_ack for block %1% to %2% sequence %3%") % confirm_a.vote->block->hash ().to_string () % endpoint_a % std::to_string (confirm_a.vote->sequence));
+		BOOST_LOG (node.log) << boost::str (boost::format ("Sending confirm_ack for block(s) %1%to %2% sequence %3%") % confirm_a.vote->hashes_string () % endpoint_a % std::to_string (confirm_a.vote->sequence));
 	}
-	std::weak_ptr<rai::node> node_w (node.shared ());
+	std::weak_ptr<badem::node> node_w (node.shared ());
 	node.network.send_buffer (bytes_a->data (), bytes_a->size (), endpoint_a, [bytes_a, node_w, endpoint_a](boost::system::error_code const & ec, size_t size_a) {
 		if (auto node_l = node_w.lock ())
 		{
@@ -1818,184 +1880,65 @@ void rai::network::confirm_send (rai::confirm_ack const & confirm_a, std::shared
 			}
 			else
 			{
-				node_l->stats.inc (rai::stat::type::message, rai::stat::detail::confirm_ack, rai::stat::dir::out);
+				node_l->stats.inc (badem::stat::type::message, badem::stat::detail::confirm_ack, badem::stat::dir::out);
 			}
 		}
 	});
 }
 
-void rai::node::process_active (std::shared_ptr<rai::block> incoming)
+void badem::node::process_active (std::shared_ptr<badem::block> incoming)
 {
-	if (!block_arrival.add (incoming->hash ()))
-	{
-		block_processor.add (incoming);
-	}
+	block_arrival.add (incoming->hash ());
+	block_processor.add (incoming, badem::seconds_since_epoch ());
 }
 
-rai::process_return rai::node::process (rai::block const & block_a)
+badem::process_return badem::node::process (badem::block const & block_a)
 {
-	rai::transaction transaction (store.environment, nullptr, true);
+	auto transaction (store.tx_begin_write ());
 	auto result (ledger.process (transaction, block_a));
 	return result;
 }
 
-// Simulating with sqrt_broadcast_simulate shows we only need to broadcast to sqrt(total_peers) random peers in order to successfully publish to everyone with high probability
-std::deque<rai::endpoint> rai::peer_container::list_fanout ()
+void badem::node::start ()
 {
-	auto peers (random_set (size_sqrt ()));
-	std::deque<rai::endpoint> result;
-	for (auto i (peers.begin ()), n (peers.end ()); i != n; ++i)
-	{
-		result.push_back (*i);
-	}
-	return result;
-}
-
-std::deque<rai::endpoint> rai::peer_container::list ()
-{
-	std::deque<rai::endpoint> result;
-	std::lock_guard<std::mutex> lock (mutex);
-	for (auto i (peers.begin ()), j (peers.end ()); i != j; ++i)
-	{
-		result.push_back (i->endpoint);
-	}
-	std::random_shuffle (result.begin (), result.end ());
-	return result;
-}
-
-std::map<rai::endpoint, unsigned> rai::peer_container::list_version ()
-{
-	std::map<rai::endpoint, unsigned> result;
-	std::lock_guard<std::mutex> lock (mutex);
-	for (auto i (peers.begin ()), j (peers.end ()); i != j; ++i)
-	{
-		result.insert (std::pair<rai::endpoint, unsigned> (i->endpoint, i->network_version));
-	}
-	return result;
-}
-
-rai::endpoint rai::peer_container::bootstrap_peer ()
-{
-	rai::endpoint result (boost::asio::ip::address_v6::any (), 0);
-	std::lock_guard<std::mutex> lock (mutex);
-	;
-	for (auto i (peers.get<4> ().begin ()), n (peers.get<4> ().end ()); i != n;)
-	{
-		if (i->network_version >= 0x5)
-		{
-			result = i->endpoint;
-			peers.get<4> ().modify (i, [](rai::peer_information & peer_a) {
-				peer_a.last_bootstrap_attempt = std::chrono::steady_clock::now ();
-			});
-			i = n;
-		}
-		else
-		{
-			++i;
-		}
-	}
-	return result;
-}
-
-bool rai::parse_port (std::string const & string_a, uint16_t & port_a)
-{
-	bool result;
-	size_t converted;
-	try
-	{
-		port_a = std::stoul (string_a, &converted);
-		result = converted != string_a.size () || converted > std::numeric_limits<uint16_t>::max ();
-	}
-	catch (...)
-	{
-		result = true;
-	}
-	return result;
-}
-
-bool rai::parse_address_port (std::string const & string, boost::asio::ip::address & address_a, uint16_t & port_a)
-{
-	auto result (false);
-	auto port_position (string.rfind (':'));
-	if (port_position != std::string::npos && port_position > 0)
-	{
-		std::string port_string (string.substr (port_position + 1));
-		try
-		{
-			uint16_t port;
-			result = parse_port (port_string, port);
-			if (!result)
-			{
-				boost::system::error_code ec;
-				auto address (boost::asio::ip::address_v6::from_string (string.substr (0, port_position), ec));
-				if (!ec)
-				{
-					address_a = address;
-					port_a = port;
-				}
-				else
-				{
-					result = true;
-				}
-			}
-			else
-			{
-				result = true;
-			}
-		}
-		catch (...)
-		{
-			result = true;
-		}
-	}
-	else
-	{
-		result = true;
-	}
-	return result;
-}
-
-bool rai::parse_endpoint (std::string const & string, rai::endpoint & endpoint_a)
-{
-	boost::asio::ip::address address;
-	uint16_t port;
-	auto result (parse_address_port (string, address, port));
-	if (!result)
-	{
-		endpoint_a = rai::endpoint (address, port);
-	}
-	return result;
-}
-
-bool rai::parse_tcp_endpoint (std::string const & string, rai::tcp_endpoint & endpoint_a)
-{
-	boost::asio::ip::address address;
-	uint16_t port;
-	auto result (parse_address_port (string, address, port));
-	if (!result)
-	{
-		endpoint_a = rai::tcp_endpoint (address, port);
-	}
-	return result;
-}
-
-void rai::node::start ()
-{
-	network.receive ();
+	network.start ();
+	add_initial_peers ();
 	ongoing_keepalive ();
-	ongoing_bootstrap ();
+	ongoing_syn_cookie_cleanup ();
+	if (!flags.disable_legacy_bootstrap)
+	{
+		ongoing_bootstrap ();
+	}
+	else if (!flags.disable_unchecked_cleanup)
+	{
+		ongoing_unchecked_cleanup ();
+	}
 	ongoing_store_flush ();
 	ongoing_rep_crawl ();
-	bootstrap.start ();
-	backup_wallet ();
-	active.announce_votes ();
-	online_reps.recalculate_stake ();
+	ongoing_rep_calculation ();
+	ongoing_peer_store ();
+	ongoing_online_weight_calculation_queue ();
+	if (!flags.disable_bootstrap_listener)
+	{
+		bootstrap.start ();
+	}
+	if (!flags.disable_backup)
+	{
+		backup_wallet ();
+	}
+	search_pending ();
+	if (!flags.disable_wallet_bootstrap)
+	{
+		// Delay to start wallet lazy bootstrap
+		auto this_l (shared ());
+		alarm.add (std::chrono::steady_clock::now () + std::chrono::minutes (1), [this_l]() {
+			this_l->bootstrap_wallet ();
+		});
+	}
 	port_mapping.start ();
-	add_initial_peers ();
-	observers.started ();
 }
 
-void rai::node::stop ()
+void badem::node::stop ()
 {
 	BOOST_LOG (log) << "Node stopping";
 	block_processor.stop ();
@@ -2003,60 +1946,62 @@ void rai::node::stop ()
 	{
 		block_processor_thread.join ();
 	}
+	vote_processor.stop ();
 	active.stop ();
 	network.stop ();
 	bootstrap_initiator.stop ();
 	bootstrap.stop ();
 	port_mapping.stop ();
+	checker.stop ();
 	wallets.stop ();
 }
 
-void rai::node::keepalive_preconfigured (std::vector<std::string> const & peers_a)
+void badem::node::keepalive_preconfigured (std::vector<std::string> const & peers_a)
 {
 	for (auto i (peers_a.begin ()), n (peers_a.end ()); i != n; ++i)
 	{
-		keepalive (*i, rai::network::node_port);
+		keepalive (*i, badem::network::node_port, true);
 	}
 }
 
-rai::block_hash rai::node::latest (rai::account const & account_a)
+badem::block_hash badem::node::latest (badem::account const & account_a)
 {
-	rai::transaction transaction (store.environment, nullptr, false);
+	auto transaction (store.tx_begin_read ());
 	return ledger.latest (transaction, account_a);
 }
 
-rai::uint128_t rai::node::balance (rai::account const & account_a)
+badem::uint128_t badem::node::balance (badem::account const & account_a)
 {
-	rai::transaction transaction (store.environment, nullptr, false);
+	auto transaction (store.tx_begin_read ());
 	return ledger.account_balance (transaction, account_a);
 }
 
-std::unique_ptr<rai::block> rai::node::block (rai::block_hash const & hash_a)
+std::shared_ptr<badem::block> badem::node::block (badem::block_hash const & hash_a)
 {
-	rai::transaction transaction (store.environment, nullptr, false);
+	auto transaction (store.tx_begin_read ());
 	return store.block_get (transaction, hash_a);
 }
 
-std::pair<rai::uint128_t, rai::uint128_t> rai::node::balance_pending (rai::account const & account_a)
+std::pair<badem::uint128_t, badem::uint128_t> badem::node::balance_pending (badem::account const & account_a)
 {
-	std::pair<rai::uint128_t, rai::uint128_t> result;
-	rai::transaction transaction (store.environment, nullptr, false);
+	std::pair<badem::uint128_t, badem::uint128_t> result;
+	auto transaction (store.tx_begin_read ());
 	result.first = ledger.account_balance (transaction, account_a);
 	result.second = ledger.account_pending (transaction, account_a);
 	return result;
 }
 
-rai::uint128_t rai::node::weight (rai::account const & account_a)
+badem::uint128_t badem::node::weight (badem::account const & account_a)
 {
-	rai::transaction transaction (store.environment, nullptr, false);
+	auto transaction (store.tx_begin_read ());
 	return ledger.weight (transaction, account_a);
 }
 
-rai::account rai::node::representative (rai::account const & account_a)
+badem::account badem::node::representative (badem::account const & account_a)
 {
-	rai::transaction transaction (store.environment, nullptr, false);
-	rai::account_info info;
-	rai::account result (0);
+	auto transaction (store.tx_begin_read ());
+	badem::account_info info;
+	badem::account result (0);
 	if (!store.account_get (transaction, account_a, info))
 	{
 		result = info.rep_block;
@@ -2064,7 +2009,7 @@ rai::account rai::node::representative (rai::account const & account_a)
 	return result;
 }
 
-void rai::node::ongoing_keepalive ()
+void badem::node::ongoing_keepalive ()
 {
 	keepalive_preconfigured (config.preconfigured_peers);
 	auto peers_l (peers.purge_list (std::chrono::steady_clock::now () - cutoff));
@@ -2072,7 +2017,7 @@ void rai::node::ongoing_keepalive ()
 	{
 		network.send_keepalive (i->endpoint);
 	}
-	std::weak_ptr<rai::node> node_w (shared_from_this ());
+	std::weak_ptr<badem::node> node_w (shared_from_this ());
 	alarm.add (std::chrono::steady_clock::now () + period, [node_w]() {
 		if (auto node_l = node_w.lock ())
 		{
@@ -2081,14 +2026,26 @@ void rai::node::ongoing_keepalive ()
 	});
 }
 
-void rai::node::ongoing_rep_crawl ()
+void badem::node::ongoing_syn_cookie_cleanup ()
+{
+	peers.purge_syn_cookies (std::chrono::steady_clock::now () - syn_cookie_cutoff);
+	std::weak_ptr<badem::node> node_w (shared_from_this ());
+	alarm.add (std::chrono::steady_clock::now () + (syn_cookie_cutoff * 2), [node_w]() {
+		if (auto node_l = node_w.lock ())
+		{
+			node_l->ongoing_syn_cookie_cleanup ();
+		}
+	});
+}
+
+void badem::node::ongoing_rep_crawl ()
 {
 	auto now (std::chrono::steady_clock::now ());
 	auto peers_l (peers.rep_crawl ());
 	rep_query (*this, peers_l);
 	if (network.on)
 	{
-		std::weak_ptr<rai::node> node_w (shared_from_this ());
+		std::weak_ptr<badem::node> node_w (shared_from_this ());
 		alarm.add (now + std::chrono::seconds (4), [node_w]() {
 			if (auto node_l = node_w.lock ())
 			{
@@ -2098,7 +2055,20 @@ void rai::node::ongoing_rep_crawl ()
 	}
 }
 
-void rai::node::ongoing_bootstrap ()
+void badem::node::ongoing_rep_calculation ()
+{
+	auto now (std::chrono::steady_clock::now ());
+	vote_processor.calculate_weights ();
+	std::weak_ptr<badem::node> node_w (shared_from_this ());
+	alarm.add (now + std::chrono::minutes (10), [node_w]() {
+		if (auto node_l = node_w.lock ())
+		{
+			node_l->ongoing_rep_calculation ();
+		}
+	});
+}
+
+void badem::node::ongoing_bootstrap ()
 {
 	auto next_wakeup (300);
 	if (warmed_up < 3)
@@ -2111,7 +2081,7 @@ void rai::node::ongoing_bootstrap ()
 		}
 	}
 	bootstrap_initiator.bootstrap ();
-	std::weak_ptr<rai::node> node_w (shared_from_this ());
+	std::weak_ptr<badem::node> node_w (shared_from_this ());
 	alarm.add (std::chrono::steady_clock::now () + std::chrono::seconds (next_wakeup), [node_w]() {
 		if (auto node_l = node_w.lock ())
 		{
@@ -2120,13 +2090,13 @@ void rai::node::ongoing_bootstrap ()
 	});
 }
 
-void rai::node::ongoing_store_flush ()
+void badem::node::ongoing_store_flush ()
 {
 	{
-		rai::transaction transaction (store.environment, nullptr, true);
+		auto transaction (store.tx_begin_write ());
 		store.flush (transaction);
 	}
-	std::weak_ptr<rai::node> node_w (shared_from_this ());
+	std::weak_ptr<badem::node> node_w (shared_from_this ());
 	alarm.add (std::chrono::steady_clock::now () + std::chrono::seconds (5), [node_w]() {
 		if (auto node_l = node_w.lock ())
 		{
@@ -2135,13 +2105,40 @@ void rai::node::ongoing_store_flush ()
 	});
 }
 
-void rai::node::backup_wallet ()
+void badem::node::ongoing_peer_store ()
 {
-	rai::transaction transaction (store.environment, nullptr, false);
+	auto endpoint_peers = peers.list ();
+	if (!endpoint_peers.empty ())
+	{
+		// Clear all peers then refresh with the current list of peers
+		auto transaction (store.tx_begin_write ());
+		store.peer_clear (transaction);
+		for (const auto & endpoint : endpoint_peers)
+		{
+			badem::endpoint_key endpoint_key (endpoint.address ().to_v6 ().to_bytes (), endpoint.port ());
+			store.peer_put (transaction, std::move (endpoint_key));
+		}
+	}
+
+	std::weak_ptr<badem::node> node_w (shared_from_this ());
+	alarm.add (std::chrono::steady_clock::now () + peer_interval, [node_w]() {
+		if (auto node_l = node_w.lock ())
+		{
+			node_l->ongoing_peer_store ();
+		}
+	});
+}
+
+void badem::node::backup_wallet ()
+{
+	auto transaction (wallets.tx_begin_read ());
 	for (auto i (wallets.items.begin ()), n (wallets.items.end ()); i != n; ++i)
 	{
+		boost::system::error_code error_chmod;
 		auto backup_path (application_path / "backup");
+
 		boost::filesystem::create_directories (backup_path);
+		badem::set_secure_perm_directory (backup_path, error_chmod);
 		i->second->store.write_backup (transaction, backup_path / (i->first.to_string () + ".json"));
 	}
 	auto this_l (shared ());
@@ -2150,15 +2147,91 @@ void rai::node::backup_wallet ()
 	});
 }
 
-int rai::node::price (rai::uint128_t const & balance_a, int amount_a)
+void badem::node::search_pending ()
 {
-	assert (balance_a >= amount_a * rai::kBDM_ratio);
+	// Reload wallets from disk
+	wallets.reload ();
+	// Search pending
+	wallets.search_pending_all ();
+	auto this_l (shared ());
+	alarm.add (std::chrono::steady_clock::now () + search_pending_interval, [this_l]() {
+		this_l->search_pending ();
+	});
+}
+
+void badem::node::bootstrap_wallet ()
+{
+	std::deque<badem::account> accounts;
+	{
+		std::lock_guard<std::mutex> lock (wallets.mutex);
+		auto transaction (wallets.tx_begin_read ());
+		for (auto i (wallets.items.begin ()), n (wallets.items.end ()); i != n && accounts.size () < 128; ++i)
+		{
+			auto & wallet (*i->second);
+			std::lock_guard<std::recursive_mutex> wallet_lock (wallet.store.mutex);
+			for (auto j (wallet.store.begin (transaction)), m (wallet.store.end ()); j != m && accounts.size () < 128; ++j)
+			{
+				badem::account account (j->first);
+				accounts.push_back (account);
+			}
+		}
+	}
+	bootstrap_initiator.bootstrap_wallet (accounts);
+}
+
+void badem::node::unchecked_cleanup ()
+{
+	std::deque<badem::unchecked_key> cleaning_list;
+	// Collect old unchecked keys
+	{
+		auto now (badem::seconds_since_epoch ());
+		auto transaction (store.tx_begin_read ());
+		// Max 128k records to clean, max 2 minutes reading to prevent slow i/o systems start issues
+		for (auto i (store.unchecked_begin (transaction)), n (store.unchecked_end ()); i != n && cleaning_list.size () < 128 * 1024 && badem::seconds_since_epoch () - now < 120; ++i)
+		{
+			badem::unchecked_key key (i->first);
+			badem::unchecked_info info (i->second);
+			if ((now - info.modified) > config.unchecked_cutoff_time.count ())
+			{
+				cleaning_list.push_back (key);
+			}
+		}
+	}
+	// Delete old unchecked keys in batches
+	while (!cleaning_list.empty ())
+	{
+		size_t deleted_count (0);
+		auto transaction (store.tx_begin_write ());
+		while (deleted_count++ < 2 * 1024 && !cleaning_list.empty ())
+		{
+			auto key (cleaning_list.front ());
+			cleaning_list.pop_front ();
+			store.unchecked_del (transaction, key);
+		}
+	}
+}
+
+void badem::node::ongoing_unchecked_cleanup ()
+{
+	if (!bootstrap_initiator.in_progress ())
+	{
+		unchecked_cleanup ();
+	}
+	auto this_l (shared ());
+	alarm.add (std::chrono::steady_clock::now () + unchecked_cleanup_interval, [this_l]() {
+		this_l->ongoing_unchecked_cleanup ();
+	});
+}
+
+int badem::node::price (badem::uint128_t const & balance_a, int amount_a)
+{
+	assert (balance_a >= amount_a * badem::kBDM_ratio);
 	auto balance_l (balance_a);
 	double result (0.0);
 	for (auto i (0); i < amount_a; ++i)
 	{
-		balance_l -= rai::kBDM_ratio;
-		auto balance_scaled ((balance_l / rai::BDM_ratio).convert_to<double> ());
+		balance_l -= badem::kBDM_ratio;
+		auto balance_scaled ((balance_l / badem::BDM_ratio).convert_to<double> ());
 		auto units (balance_scaled / 1000.0);
 		auto unit_price (((free_cutoff - units) / free_cutoff) * price_max);
 		result += std::min (std::max (0.0, unit_price), price_max);
@@ -2171,10 +2244,10 @@ namespace
 class work_request
 {
 public:
-	work_request (boost::asio::io_service & service_a, boost::asio::ip::address address_a, uint16_t port_a) :
+	work_request (boost::asio::io_context & io_ctx_a, boost::asio::ip::address address_a, uint16_t port_a) :
 	address (address_a),
 	port (port_a),
-	socket (service_a)
+	socket (io_ctx_a)
 	{
 	}
 	boost::asio::ip::address address;
@@ -2186,13 +2259,20 @@ public:
 class distributed_work : public std::enable_shared_from_this<distributed_work>
 {
 public:
-	distributed_work (std::shared_ptr<rai::node> const & node_a, rai::block_hash const & root_a, std::function<void(uint64_t)> callback_a, unsigned int backoff_a = 1) :
+	distributed_work (std::shared_ptr<badem::node> const & node_a, badem::block_hash const & root_a, std::function<void(uint64_t)> callback_a, uint64_t difficulty_a) :
+	distributed_work (1, node_a, root_a, callback_a, difficulty_a)
+	{
+		assert (node_a != nullptr);
+	}
+	distributed_work (unsigned int backoff_a, std::shared_ptr<badem::node> const & node_a, badem::block_hash const & root_a, std::function<void(uint64_t)> callback_a, uint64_t difficulty_a) :
 	callback (callback_a),
+	backoff (backoff_a),
 	node (node_a),
 	root (root_a),
-	backoff (backoff_a),
-	need_resolve (node_a->config.work_peers)
+	need_resolve (node_a->config.work_peers),
+	difficulty (difficulty_a)
 	{
+		assert (node_a != nullptr);
 		completed.clear ();
 	}
 	void start ()
@@ -2244,8 +2324,8 @@ public:
 				auto host (i.first);
 				auto service (i.second);
 				node->background ([this_l, host, service]() {
-					auto connection (std::make_shared<work_request> (this_l->node->service, host, service));
-					connection->socket.async_connect (rai::tcp_endpoint (host, service), [this_l, connection](boost::system::error_code const & ec) {
+					auto connection (std::make_shared<work_request> (this_l->node->io_ctx, host, service));
+					connection->socket.async_connect (badem::tcp_endpoint (host, service), [this_l, connection](boost::system::error_code const & ec) {
 						if (!ec)
 						{
 							std::string request_string;
@@ -2314,8 +2394,7 @@ public:
 		for (auto const & i : outstanding)
 		{
 			auto host (i.first);
-			auto service (i.second);
-			node->background ([this_l, host, service]() {
+			node->background ([this_l, host]() {
 				std::string request_string;
 				{
 					boost::property_tree::ptree request;
@@ -2331,7 +2410,7 @@ public:
 				request.version (11);
 				request.body () = request_string;
 				request.prepare_payload ();
-				auto socket (std::make_shared<boost::asio::ip::tcp::socket> (this_l->node->service));
+				auto socket (std::make_shared<boost::asio::ip::tcp::socket> (this_l->node->io_ctx));
 				boost::beast::http::async_write (*socket, request, [socket](boost::system::error_code const & ec, size_t bytes_transferred) {
 				});
 			});
@@ -2348,9 +2427,9 @@ public:
 			boost::property_tree::read_json (istream, result);
 			auto work_text (result.get<std::string> ("work"));
 			uint64_t work;
-			if (!rai::from_string_hex (work_text, work))
+			if (!badem::from_string_hex (work_text, work))
 			{
-				if (!rai::work_validate (root, work))
+				if (!badem::work_validate (root, work))
 				{
 					set_once (work);
 					stop ();
@@ -2394,9 +2473,12 @@ public:
 				if (node->config.work_threads != 0 || node->work.opencl)
 				{
 					auto callback_l (callback);
+					// clang-format off
 					node->work.generate (root, [callback_l](boost::optional<uint64_t> const & work_a) {
 						callback_l (work_a.value ());
-					});
+					},
+					difficulty);
+					// clang-format on
 				}
 				else
 				{
@@ -2407,15 +2489,17 @@ public:
 					auto now (std::chrono::steady_clock::now ());
 					auto root_l (root);
 					auto callback_l (callback);
-					std::weak_ptr<rai::node> node_w (node);
+					std::weak_ptr<badem::node> node_w (node);
 					auto next_backoff (std::min (backoff * 2, (unsigned int)60 * 5));
-					node->alarm.add (now + std::chrono::seconds (backoff), [node_w, root_l, callback_l, next_backoff] {
+					// clang-format off
+					node->alarm.add (now + std::chrono::seconds (backoff), [ node_w, root_l, callback_l, next_backoff, difficulty = difficulty ] {
 						if (auto node_l = node_w.lock ())
 						{
-							auto work_generation (std::make_shared<distributed_work> (node_l, root_l, callback_l, next_backoff));
+							auto work_generation (std::make_shared<distributed_work> (next_backoff, node_l, root_l, callback_l, difficulty));
 							work_generation->start ();
 						}
 					});
+					// clang-format on
 				}
 			}
 		}
@@ -2428,57 +2512,93 @@ public:
 	}
 	std::function<void(uint64_t)> callback;
 	unsigned int backoff; // in seconds
-	std::shared_ptr<rai::node> node;
-	rai::block_hash root;
+	std::shared_ptr<badem::node> node;
+	badem::block_hash root;
 	std::mutex mutex;
 	std::map<boost::asio::ip::address, uint16_t> outstanding;
 	std::vector<std::pair<std::string, uint16_t>> need_resolve;
 	std::atomic_flag completed;
+	uint64_t difficulty;
 };
 }
 
-void rai::node::work_generate_blocking (rai::block & block_a)
+void badem::node::work_generate_blocking (badem::block & block_a, uint64_t difficulty_a)
 {
-	block_a.block_work_set (work_generate_blocking (block_a.root ()));
+	block_a.block_work_set (work_generate_blocking (block_a.root (), difficulty_a));
 }
 
-void rai::node::work_generate (rai::uint256_union const & hash_a, std::function<void(uint64_t)> callback_a)
+void badem::node::work_generate (badem::uint256_union const & hash_a, std::function<void(uint64_t)> callback_a, uint64_t difficulty_a)
 {
-	auto work_generation (std::make_shared<distributed_work> (shared (), hash_a, callback_a));
+	auto work_generation (std::make_shared<distributed_work> (shared (), hash_a, callback_a, difficulty_a));
 	work_generation->start ();
 }
 
-uint64_t rai::node::work_generate_blocking (rai::uint256_union const & hash_a)
+uint64_t badem::node::work_generate_blocking (badem::uint256_union const & hash_a, uint64_t difficulty_a)
 {
 	std::promise<uint64_t> promise;
+	std::future<uint64_t> future = promise.get_future ();
+	// clang-format off
 	work_generate (hash_a, [&promise](uint64_t work_a) {
 		promise.set_value (work_a);
-	});
-	return promise.get_future ().get ();
+	},
+	difficulty_a);
+	// clang-format on
+	return future.get ();
 }
 
-void rai::node::add_initial_peers ()
+void badem::node::add_initial_peers ()
 {
+	auto transaction (store.tx_begin_read ());
+	for (auto i (store.peers_begin (transaction)), n (store.peers_end ()); i != n; ++i)
+	{
+		badem::endpoint endpoint (boost::asio::ip::address_v6 (i->first.address_bytes ()), i->first.port ());
+		if (!peers.reachout (endpoint))
+		{
+			send_keepalive (endpoint);
+		}
+	}
 }
 
-void rai::node::block_confirm (std::shared_ptr<rai::block> block_a)
+void badem::node::block_confirm (std::shared_ptr<badem::block> block_a)
 {
 	active.start (block_a);
 	network.broadcast_confirm_req (block_a);
+	// Calculate votes for local representatives
+	if (config.enable_voting && active.active (*block_a))
+	{
+		block_processor.generator.add (block_a->hash ());
+	}
 }
 
-rai::uint128_t rai::node::delta ()
+badem::uint128_t badem::node::delta ()
 {
 	auto result ((online_reps.online_stake () / 100) * config.online_weight_quorum);
 	return result;
 }
 
+void badem::node::ongoing_online_weight_calculation_queue ()
+{
+	std::weak_ptr<badem::node> node_w (shared_from_this ());
+	alarm.add (std::chrono::steady_clock::now () + (std::chrono::seconds (badem::online_reps::weight_period)), [node_w]() {
+		if (auto node_l = node_w.lock ())
+		{
+			node_l->ongoing_online_weight_calculation ();
+		}
+	});
+}
+
+void badem::node::ongoing_online_weight_calculation ()
+{
+	online_reps.sample ();
+	ongoing_online_weight_calculation_queue ();
+}
+
 namespace
 {
-class confirmed_visitor : public rai::block_visitor
+class confirmed_visitor : public badem::block_visitor
 {
 public:
-	confirmed_visitor (MDB_txn * transaction_a, rai::node & node_a, std::shared_ptr<rai::block> block_a, rai::block_hash const & hash_a) :
+	confirmed_visitor (badem::transaction const & transaction_a, badem::node & node_a, std::shared_ptr<badem::block> block_a, badem::block_hash const & hash_a) :
 	transaction (transaction_a),
 	node (node_a),
 	block (block_a),
@@ -2486,22 +2606,23 @@ public:
 	{
 	}
 	virtual ~confirmed_visitor () = default;
-	void scan_receivable (rai::account const & account_a)
+	void scan_receivable (badem::account const & account_a)
 	{
 		for (auto i (node.wallets.items.begin ()), n (node.wallets.items.end ()); i != n; ++i)
 		{
 			auto wallet (i->second);
-			if (wallet->store.exists (transaction, account_a))
+			auto transaction_l (node.wallets.tx_begin_read ());
+			if (wallet->store.exists (transaction_l, account_a))
 			{
-				rai::account representative;
-				rai::pending_info pending;
-				representative = wallet->store.representative (transaction);
-				auto error (node.store.pending_get (transaction, rai::pending_key (account_a, hash), pending));
+				badem::account representative;
+				badem::pending_info pending;
+				representative = wallet->store.representative (transaction_l);
+				auto error (node.store.pending_get (transaction, badem::pending_key (account_a, hash), pending));
 				if (!error)
 				{
 					auto node_l (node.shared ());
 					auto amount (pending.amount.number ());
-					wallet->receive_async (block, representative, amount, [](std::shared_ptr<rai::block>) {});
+					wallet->receive_async (block, representative, amount, [](std::shared_ptr<badem::block>) {});
 				}
 				else
 				{
@@ -2518,91 +2639,103 @@ public:
 			}
 		}
 	}
-	void state_block (rai::state_block const & block_a) override
+	void state_block (badem::state_block const & block_a) override
 	{
 		scan_receivable (block_a.hashables.link);
 	}
-	void send_block (rai::send_block const & block_a) override
+	void send_block (badem::send_block const & block_a) override
 	{
 		scan_receivable (block_a.hashables.destination);
 	}
-	void receive_block (rai::receive_block const &) override
+	void receive_block (badem::receive_block const &) override
 	{
 	}
-	void open_block (rai::open_block const &) override
+	void open_block (badem::open_block const &) override
 	{
 	}
-	void change_block (rai::change_block const &) override
+	void change_block (badem::change_block const &) override
 	{
 	}
-	MDB_txn * transaction;
-	rai::node & node;
-	std::shared_ptr<rai::block> block;
-	rai::block_hash const & hash;
+	badem::transaction const & transaction;
+	badem::node & node;
+	std::shared_ptr<badem::block> block;
+	badem::block_hash const & hash;
 };
 }
 
-void rai::node::process_confirmed (std::shared_ptr<rai::block> block_a)
+void badem::node::process_confirmed (std::shared_ptr<badem::block> block_a, uint8_t iteration)
 {
-	rai::transaction transaction (store.environment, nullptr, false);
 	auto hash (block_a->hash ());
-	if (store.block_exists (transaction, hash))
+	if (ledger.block_exists (block_a->type (), hash))
 	{
+		auto transaction (store.tx_begin_read ());
 		confirmed_visitor visitor (transaction, *this, block_a, hash);
 		block_a->visit (visitor);
 		auto account (ledger.account (transaction, hash));
 		auto amount (ledger.amount (transaction, hash));
 		bool is_state_send (false);
-		rai::account pending_account (0);
-		if (auto state = dynamic_cast<rai::state_block *> (block_a.get ()))
+		badem::account pending_account (0);
+		if (auto state = dynamic_cast<badem::state_block *> (block_a.get ()))
 		{
-			rai::transaction transaction (store.environment, nullptr, false);
 			is_state_send = ledger.is_send (transaction, *state);
 			pending_account = state->hashables.link;
 		}
-		if (auto send = dynamic_cast<rai::send_block *> (block_a.get ()))
+		if (auto send = dynamic_cast<badem::send_block *> (block_a.get ()))
 		{
 			pending_account = send->hashables.destination;
 		}
-		observers.blocks (block_a, account, amount, is_state_send);
+		observers.blocks.notify (block_a, account, amount, is_state_send);
 		if (amount > 0)
 		{
-			observers.account_balance (account, false);
+			observers.account_balance.notify (account, false);
 			if (!pending_account.is_zero ())
 			{
-				observers.account_balance (pending_account, true);
+				observers.account_balance.notify (pending_account, true);
 			}
 		}
 	}
+	// Limit to 0.5 * 20 = 10 seconds (more than max block_processor::process_batch finish time)
+	else if (iteration < 20)
+	{
+		iteration++;
+		std::weak_ptr<badem::node> node_w (shared ());
+		alarm.add (std::chrono::steady_clock::now () + process_confirmed_interval, [node_w, block_a, iteration]() {
+			if (auto node_l = node_w.lock ())
+			{
+				node_l->process_confirmed (block_a, iteration);
+			}
+		});
+	}
 }
 
-void rai::node::process_message (rai::message & message_a, rai::endpoint const & sender_a)
+void badem::node::process_message (badem::message & message_a, badem::endpoint const & sender_a)
 {
 	network_message_visitor visitor (*this, sender_a);
 	message_a.visit (visitor);
 }
 
-rai::endpoint rai::network::endpoint ()
+badem::endpoint badem::network::endpoint ()
 {
 	boost::system::error_code ec;
+	std::unique_lock<std::mutex> lock (socket_mutex);
 	auto port (socket.local_endpoint (ec).port ());
 	if (ec)
 	{
 		BOOST_LOG (node.log) << "Unable to retrieve port: " << ec.message ();
 	}
-	return rai::endpoint (boost::asio::ip::address_v6::loopback (), port);
+	return badem::endpoint (boost::asio::ip::address_v6::loopback (), port);
 }
 
-bool rai::block_arrival::add (rai::block_hash const & hash_a)
+bool badem::block_arrival::add (badem::block_hash const & hash_a)
 {
 	std::lock_guard<std::mutex> lock (mutex);
 	auto now (std::chrono::steady_clock::now ());
-	auto inserted (arrival.insert (rai::block_arrival_info{ now, hash_a }));
+	auto inserted (arrival.insert (badem::block_arrival_info{ now, hash_a }));
 	auto result (!inserted.second);
 	return result;
 }
 
-bool rai::block_arrival::recent (rai::block_hash const & hash_a)
+bool badem::block_arrival::recent (badem::block_hash const & hash_a)
 {
 	std::lock_guard<std::mutex> lock (mutex);
 	auto now (std::chrono::steady_clock::now ());
@@ -2613,292 +2746,116 @@ bool rai::block_arrival::recent (rai::block_hash const & hash_a)
 	return arrival.get<1> ().find (hash_a) != arrival.get<1> ().end ();
 }
 
-rai::online_reps::online_reps (rai::node & node) :
-node (node)
+namespace badem
 {
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (block_arrival & block_arrival, const std::string & name)
+{
+	size_t count = 0;
+	{
+		std::lock_guard<std::mutex> guard (block_arrival.mutex);
+		count = block_arrival.arrival.size ();
+	}
+
+	auto sizeof_element = sizeof (decltype (block_arrival.arrival)::value_type);
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "arrival", count, sizeof_element }));
+	return composite;
+}
 }
 
-void rai::online_reps::vote (std::shared_ptr<rai::vote> const & vote_a)
+badem::online_reps::online_reps (badem::ledger & ledger_a, badem::uint128_t minimum_a) :
+ledger (ledger_a),
+minimum (minimum_a)
 {
-	auto rep (vote_a->account);
-	std::lock_guard<std::mutex> lock (mutex);
-	auto now (std::chrono::steady_clock::now ());
-	rai::transaction transaction (node.store.environment, nullptr, false);
-	auto current (reps.begin ());
-	while (current != reps.end () && current->last_heard + std::chrono::seconds (rai::node::cutoff) < now)
-	{
-		auto old_stake (online_stake_total);
-		online_stake_total -= node.ledger.weight (transaction, current->representative);
-		if (online_stake_total > old_stake)
-		{
-			// underflow
-			online_stake_total = 0;
-		}
-		current = reps.erase (current);
-	}
-	auto rep_it (reps.get<1> ().find (rep));
-	auto info (rai::rep_last_heard_info{ now, rep });
-	if (rep_it == reps.get<1> ().end ())
-	{
-		auto old_stake (online_stake_total);
-		online_stake_total += node.ledger.weight (transaction, rep);
-		if (online_stake_total < old_stake)
-		{
-			// overflow
-			online_stake_total = std::numeric_limits<rai::uint128_t>::max ();
-		}
-		reps.insert (info);
-	}
-	else
-	{
-		reps.get<1> ().replace (rep_it, info);
-	}
+	auto transaction (ledger_a.store.tx_begin_read ());
+	online = trend (transaction);
 }
 
-void rai::online_reps::recalculate_stake ()
+void badem::online_reps::observe (badem::account const & rep_a)
 {
-	std::lock_guard<std::mutex> lock (mutex);
-	online_stake_total = 0;
-	rai::transaction transaction (node.store.environment, nullptr, false);
-	for (auto it : reps)
-	{
-		online_stake_total += node.ledger.weight (transaction, it.representative);
-	}
-	auto now (std::chrono::steady_clock::now ());
-	std::weak_ptr<rai::node> node_w (node.shared ());
-	node.alarm.add (now + std::chrono::minutes (5), [node_w]() {
-		if (auto node_l = node_w.lock ())
-		{
-			node_l->online_reps.recalculate_stake ();
-		}
-	});
-}
-
-rai::uint128_t rai::online_reps::online_stake ()
-{
-	std::lock_guard<std::mutex> lock (mutex);
-	return std::max (online_stake_total, node.config.online_weight_minimum.number ());
-}
-
-std::deque<rai::account> rai::online_reps::list ()
-{
-	std::deque<rai::account> result;
-	std::lock_guard<std::mutex> lock (mutex);
-	for (auto i (reps.begin ()), n (reps.end ()); i != n; ++i)
-	{
-		result.push_back (i->representative);
-	}
-	return result;
-}
-
-std::unordered_set<rai::endpoint> rai::peer_container::random_set (size_t count_a)
-{
-	std::unordered_set<rai::endpoint> result;
-	result.reserve (count_a);
-	std::lock_guard<std::mutex> lock (mutex);
-	// Stop trying to fill result with random samples after this many attempts
-	auto random_cutoff (count_a * 2);
-	auto peers_size (peers.size ());
-	// Usually count_a will be much smaller than peers.size()
-	// Otherwise make sure we have a cutoff on attempting to randomly fill
-	if (!peers.empty ())
-	{
-		for (auto i (0); i < random_cutoff && result.size () < count_a; ++i)
-		{
-			auto index (random_pool.GenerateWord32 (0, peers_size - 1));
-			result.insert (peers.get<3> ()[index].endpoint);
-		}
-	}
-	// Fill the remainder with most recent contact
-	for (auto i (peers.get<1> ().begin ()), n (peers.get<1> ().end ()); i != n && result.size () < count_a; ++i)
-	{
-		result.insert (i->endpoint);
-	}
-	return result;
-}
-
-void rai::peer_container::random_fill (std::array<rai::endpoint, 8> & target_a)
-{
-	auto peers (random_set (target_a.size ()));
-	assert (peers.size () <= target_a.size ());
-	auto endpoint (rai::endpoint (boost::asio::ip::address_v6{}, 0));
-	assert (endpoint.address ().is_v6 ());
-	std::fill (target_a.begin (), target_a.end (), endpoint);
-	auto j (target_a.begin ());
-	for (auto i (peers.begin ()), n (peers.end ()); i != n; ++i, ++j)
-	{
-		assert (i->address ().is_v6 ());
-		assert (j < target_a.end ());
-		*j = *i;
-	}
-}
-
-// Request a list of the top known representatives
-std::vector<rai::peer_information> rai::peer_container::representatives (size_t count_a)
-{
-	std::vector<peer_information> result;
-	result.reserve (std::min (count_a, size_t (16)));
-	std::lock_guard<std::mutex> lock (mutex);
-	for (auto i (peers.get<6> ().begin ()), n (peers.get<6> ().end ()); i != n && result.size () < count_a; ++i)
-	{
-		if (!i->rep_weight.is_zero ())
-		{
-			result.push_back (*i);
-		}
-	}
-	return result;
-}
-
-std::vector<rai::peer_information> rai::peer_container::purge_list (std::chrono::steady_clock::time_point const & cutoff)
-{
-	std::vector<rai::peer_information> result;
+	auto transaction (ledger.store.tx_begin_read ());
+	if (ledger.weight (transaction, rep_a) > 0)
 	{
 		std::lock_guard<std::mutex> lock (mutex);
-		auto pivot (peers.get<1> ().lower_bound (cutoff));
-		result.assign (pivot, peers.get<1> ().end ());
-		// Remove peers that haven't been heard from past the cutoff
-		peers.get<1> ().erase (peers.get<1> ().begin (), pivot);
-		for (auto i (peers.begin ()), n (peers.end ()); i != n; ++i)
-		{
-			peers.modify (i, [](rai::peer_information & info) { info.last_attempt = std::chrono::steady_clock::now (); });
-		}
-
-		// Remove keepalive attempt tracking for attempts older than cutoff
-		auto attempts_pivot (attempts.get<1> ().lower_bound (cutoff));
-		attempts.get<1> ().erase (attempts.get<1> ().begin (), attempts_pivot);
-	}
-	if (result.empty ())
-	{
-		disconnect_observer ();
-	}
-	return result;
-}
-
-std::vector<rai::endpoint> rai::peer_container::rep_crawl ()
-{
-	std::vector<rai::endpoint> result;
-	result.reserve (10);
-	std::lock_guard<std::mutex> lock (mutex);
-	auto count (0);
-	for (auto i (peers.get<5> ().begin ()), n (peers.get<5> ().end ()); i != n && count < 10; ++i, ++count)
-	{
-		result.push_back (i->endpoint);
-	};
-	return result;
-}
-
-size_t rai::peer_container::size ()
-{
-	std::lock_guard<std::mutex> lock (mutex);
-	return peers.size ();
-}
-
-size_t rai::peer_container::size_sqrt ()
-{
-	auto result (std::ceil (std::sqrt (size ())));
-	return result;
-}
-
-bool rai::peer_container::empty ()
-{
-	return size () == 0;
-}
-
-bool rai::peer_container::not_a_peer (rai::endpoint const & endpoint_a)
-{
-	bool result (false);
-	if (endpoint_a.address ().to_v6 ().is_unspecified ())
-	{
-		result = true;
-	}
-	else if (rai::reserved_address (endpoint_a))
-	{
-		result = true;
-	}
-	else if (endpoint_a == self)
-	{
-		result = true;
-	}
-	return result;
-}
-
-bool rai::peer_container::rep_response (rai::endpoint const & endpoint_a, rai::account const & rep_account_a, rai::amount const & weight_a)
-{
-	auto updated (false);
-	std::lock_guard<std::mutex> lock (mutex);
-	auto existing (peers.find (endpoint_a));
-	if (existing != peers.end ())
-	{
-		peers.modify (existing, [weight_a, &updated, rep_account_a](rai::peer_information & info) {
-			info.last_rep_response = std::chrono::steady_clock::now ();
-			if (info.rep_weight < weight_a)
-			{
-				updated = true;
-				info.rep_weight = weight_a;
-				info.probable_rep_account = rep_account_a;
-			}
-		});
-	}
-	return updated;
-}
-
-void rai::peer_container::rep_request (rai::endpoint const & endpoint_a)
-{
-	std::lock_guard<std::mutex> lock (mutex);
-	auto existing (peers.find (endpoint_a));
-	if (existing != peers.end ())
-	{
-		peers.modify (existing, [](rai::peer_information & info) {
-			info.last_rep_request = std::chrono::steady_clock::now ();
-		});
+		reps.insert (rep_a);
 	}
 }
 
-bool rai::peer_container::reachout (rai::endpoint const & endpoint_a)
+void badem::online_reps::sample ()
 {
-	// Don't contact invalid IPs
-	bool error = not_a_peer (endpoint_a);
-	if (!error)
+	auto transaction (ledger.store.tx_begin_write ());
+	// Discard oldest entries
+	while (ledger.store.online_weight_count (transaction) >= weight_samples)
 	{
-		// Don't keepalive to nodes that already sent us something
-		error |= known_peer (endpoint_a);
+		auto oldest (ledger.store.online_weight_begin (transaction));
+		assert (oldest != ledger.store.online_weight_end ());
+		ledger.store.online_weight_del (transaction, oldest->first);
+	}
+	// Calculate current active rep weight
+	badem::uint128_t current;
+	std::unordered_set<badem::account> reps_copy;
+	{
 		std::lock_guard<std::mutex> lock (mutex);
-		auto existing (attempts.find (endpoint_a));
-		error |= existing != attempts.end ();
-		attempts.insert ({ endpoint_a, std::chrono::steady_clock::now () });
+		reps_copy.swap (reps);
 	}
-	return error;
+	for (auto & i : reps_copy)
+	{
+		current += ledger.weight (transaction, i);
+	}
+	ledger.store.online_weight_put (transaction, std::chrono::system_clock::now ().time_since_epoch ().count (), current);
+	auto trend_l (trend (transaction));
+	std::lock_guard<std::mutex> lock (mutex);
+	online = trend_l;
 }
 
-bool rai::peer_container::insert (rai::endpoint const & endpoint_a, unsigned version_a)
+badem::uint128_t badem::online_reps::trend (badem::transaction & transaction_a)
 {
-	auto unknown (false);
-	auto result (not_a_peer (endpoint_a));
-	if (!result)
+	std::vector<badem::uint128_t> items;
+	items.reserve (weight_samples + 1);
+	items.push_back (minimum);
+	for (auto i (ledger.store.online_weight_begin (transaction_a)), n (ledger.store.online_weight_end ()); i != n; ++i)
 	{
-		if (version_a >= rai::protocol_version_min)
-		{
-			std::lock_guard<std::mutex> lock (mutex);
-			auto existing (peers.find (endpoint_a));
-			if (existing != peers.end ())
-			{
-				peers.modify (existing, [](rai::peer_information & info) {
-					info.last_contact = std::chrono::steady_clock::now ();
-				});
-				result = true;
-			}
-			else
-			{
-				peers.insert (rai::peer_information (endpoint_a, version_a));
-				unknown = true;
-			}
-		}
+		items.push_back (i->second.number ());
 	}
-	if (unknown && !result)
+
+	// Pick median value for our target vote weight
+	auto median_idx = items.size () / 2;
+	nth_element (items.begin (), items.begin () + median_idx, items.end ());
+	return badem::uint128_t{ items[median_idx] };
+}
+
+badem::uint128_t badem::online_reps::online_stake ()
+{
+	std::lock_guard<std::mutex> lock (mutex);
+	return std::max (online, minimum);
+}
+
+std::vector<badem::account> badem::online_reps::list ()
+{
+	std::vector<badem::account> result;
+	std::lock_guard<std::mutex> lock (mutex);
+	for (auto & i : reps)
 	{
-		peer_observer (endpoint_a);
+		result.push_back (i);
 	}
 	return result;
+}
+
+namespace badem
+{
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (online_reps & online_reps, const std::string & name)
+{
+	size_t count = 0;
+	{
+		std::lock_guard<std::mutex> guard (online_reps.mutex);
+		count = online_reps.reps.size ();
+	}
+
+	auto sizeof_element = sizeof (decltype (online_reps.reps)::value_type);
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "arrival", count, sizeof_element }));
+	return composite;
+}
 }
 
 namespace
@@ -2909,7 +2866,7 @@ boost::asio::ip::address_v6 mapped_from_v4_bytes (unsigned long address_a)
 }
 }
 
-bool rai::reserved_address (rai::endpoint const & endpoint_a)
+bool badem::reserved_address (badem::endpoint const & endpoint_a, bool blacklist_loopback)
 {
 	assert (endpoint_a.address ().is_v6 ());
 	auto bytes (endpoint_a.address ().to_v6 ());
@@ -2980,17 +2937,17 @@ bool rai::reserved_address (rai::endpoint const & endpoint_a)
 	{
 		result = true;
 	}
-	else if (rai::badem_network == rai::badem_networks::badem_live_network)
+	else if (blacklist_loopback && bytes.is_loopback ())
 	{
-		if (bytes.is_loopback ())
-		{
-			result = true;
-		}
-		else if (bytes >= ipv4_loopback_min && bytes <= ipv4_loopback_max)
-		{
-			result = true;
-		}
-		else if (bytes >= rfc1918_1_min && bytes <= rfc1918_1_max)
+		result = true;
+	}
+	else if (blacklist_loopback && bytes >= ipv4_loopback_min && bytes <= ipv4_loopback_max)
+	{
+		result = true;
+	}
+	else if (badem::is_live_network)
+	{
+		if (bytes >= rfc1918_1_min && bytes <= rfc1918_1_max)
 		{
 			result = true;
 		}
@@ -3014,119 +2971,77 @@ bool rai::reserved_address (rai::endpoint const & endpoint_a)
 	return result;
 }
 
-rai::peer_information::peer_information (rai::endpoint const & endpoint_a, unsigned network_version_a) :
-endpoint (endpoint_a),
-last_contact (std::chrono::steady_clock::now ()),
-last_attempt (last_contact),
-last_bootstrap_attempt (std::chrono::steady_clock::time_point ()),
-last_rep_request (std::chrono::steady_clock::time_point ()),
-last_rep_response (std::chrono::steady_clock::time_point ()),
-rep_weight (0),
-network_version (network_version_a)
-{
-}
-
-rai::peer_information::peer_information (rai::endpoint const & endpoint_a, std::chrono::steady_clock::time_point const & last_contact_a, std::chrono::steady_clock::time_point const & last_attempt_a) :
-endpoint (endpoint_a),
-last_contact (last_contact_a),
-last_attempt (last_attempt_a),
-last_bootstrap_attempt (std::chrono::steady_clock::time_point ()),
-last_rep_request (std::chrono::steady_clock::time_point ()),
-last_rep_response (std::chrono::steady_clock::time_point ()),
-rep_weight (0)
-{
-}
-
-rai::peer_container::peer_container (rai::endpoint const & self_a) :
-self (self_a),
-peer_observer ([](rai::endpoint const &) {}),
-disconnect_observer ([]() {})
-{
-}
-
-void rai::peer_container::contacted (rai::endpoint const & endpoint_a, unsigned version_a)
-{
-	auto endpoint_l (endpoint_a);
-	if (endpoint_l.address ().is_v4 ())
-	{
-		endpoint_l = rai::endpoint (boost::asio::ip::address_v6::v4_mapped (endpoint_l.address ().to_v4 ()), endpoint_l.port ());
-	}
-	assert (endpoint_l.address ().is_v6 ());
-	insert (endpoint_l, version_a);
-}
-
-void rai::network::send_buffer (uint8_t const * data_a, size_t size_a, rai::endpoint const & endpoint_a, std::function<void(boost::system::error_code const &, size_t)> callback_a)
+void badem::network::send_buffer (uint8_t const * data_a, size_t size_a, badem::endpoint const & endpoint_a, std::function<void(boost::system::error_code const &, size_t)> callback_a)
 {
 	std::unique_lock<std::mutex> lock (socket_mutex);
 	if (node.config.logging.network_packet_logging ())
 	{
 		BOOST_LOG (node.log) << "Sending packet";
 	}
-	socket.async_send_to (boost::asio::buffer (data_a, size_a), endpoint_a, [this, callback_a](boost::system::error_code const & ec, size_t size_a) {
-		callback_a (ec, size_a);
-		this->node.stats.add (rai::stat::type::traffic, rai::stat::dir::out, size_a);
-		if (this->node.config.logging.network_packet_logging ())
-		{
-			BOOST_LOG (this->node.log) << "Packet send complete";
-		}
-	});
+	if (on.load ())
+	{
+		socket.async_send_to (boost::asio::buffer (data_a, size_a), endpoint_a, [this, callback_a](boost::system::error_code const & ec, size_t size_a) {
+			callback_a (ec, size_a);
+			this->node.stats.add (badem::stat::type::traffic, badem::stat::dir::out, size_a);
+			if (ec == boost::system::errc::host_unreachable)
+			{
+				this->node.stats.inc (badem::stat::type::error, badem::stat::detail::unreachable_host, badem::stat::dir::out);
+			}
+			if (this->node.config.logging.network_packet_logging ())
+			{
+				BOOST_LOG (this->node.log) << "Packet send complete";
+			}
+		});
+	}
 }
 
-bool rai::peer_container::known_peer (rai::endpoint const & endpoint_a)
-{
-	std::lock_guard<std::mutex> lock (mutex);
-	auto existing (peers.find (endpoint_a));
-	return existing != peers.end ();
-}
-
-std::shared_ptr<rai::node> rai::node::shared ()
+std::shared_ptr<badem::node> badem::node::shared ()
 {
 	return shared_from_this ();
 }
 
-bool rai::vote_info::operator< (rai::vote const & vote_a) const
+badem::election_vote_result::election_vote_result () :
+replay (false),
+processed (false)
 {
-	return sequence < vote_a.sequence || (sequence == vote_a.sequence && hash < vote_a.block->hash ());
 }
 
-rai::election::election (rai::node & node_a, std::shared_ptr<rai::block> block_a, std::function<void(std::shared_ptr<rai::block>)> const & confirmation_action_a) :
+badem::election_vote_result::election_vote_result (bool replay_a, bool processed_a)
+{
+	replay = replay_a;
+	processed = processed_a;
+}
+
+badem::election::election (badem::node & node_a, std::shared_ptr<badem::block> block_a, std::function<void(std::shared_ptr<badem::block>)> const & confirmation_action_a) :
 confirmation_action (confirmation_action_a),
-votes (block_a),
 node (node_a),
+election_start (std::chrono::steady_clock::now ()),
 status ({ block_a, 0 }),
-confirmed (false)
+confirmed (false),
+stopped (false),
+announcements (0)
 {
+	last_votes.insert (std::make_pair (badem::not_an_account (), badem::vote_info{ std::chrono::steady_clock::now (), 0, block_a->hash () }));
+	blocks.insert (std::make_pair (block_a->hash (), block_a));
 }
 
-void rai::election::compute_rep_votes (MDB_txn * transaction_a, std::shared_ptr<rai::block> block_a)
+void badem::election::compute_rep_votes (badem::transaction const & transaction_a)
 {
 	if (node.config.enable_voting)
 	{
-		node.wallets.foreach_representative (transaction_a, [this, transaction_a, block_a](rai::public_key const & pub_a, rai::raw_key const & prv_a) {
-			auto vote (this->node.store.vote_generate (transaction_a, pub_a, prv_a, block_a));
+		node.wallets.foreach_representative (transaction_a, [this, &transaction_a](badem::public_key const & pub_a, badem::raw_key const & prv_a) {
+			auto vote (this->node.store.vote_generate (transaction_a, pub_a, prv_a, status.winner));
 			this->node.vote_processor.vote (vote, this->node.network.endpoint ());
 		});
 	}
 }
 
-void rai::election::broadcast_winner ()
-{
-	rai::transaction transaction (node.store.environment, nullptr, false);
-	auto tally_l (node.ledger.tally (transaction, votes));
-	auto winner_l (tally_l.begin ());
-	auto block_l (status.winner);
-	if (winner_l != tally_l.end ())
-	{
-		block_l = winner_l->second;
-	}
-	compute_rep_votes (transaction, block_l);
-	node.network.republish_block (transaction, block_l);
-}
-
-void rai::election::confirm_once (MDB_txn * transaction_a)
+void badem::election::confirm_once (badem::transaction const & transaction_a, bool confirmed_back)
 {
 	if (!confirmed.exchange (true))
 	{
+		status.election_end = std::chrono::duration_cast<std::chrono::milliseconds> (std::chrono::system_clock::now ().time_since_epoch ());
+		status.election_duration = std::chrono::duration_cast<std::chrono::milliseconds> (std::chrono::steady_clock::now () - election_start);
 		auto winner_l (status.winner);
 		auto node_l (node.shared ());
 		auto confirmation_action_l (confirmation_action);
@@ -3134,65 +3049,127 @@ void rai::election::confirm_once (MDB_txn * transaction_a)
 			node_l->process_confirmed (winner_l);
 			confirmation_action_l (winner_l);
 		});
+		if (!confirmed_back)
+		{
+			confirm_back (transaction_a);
+		}
 	}
 }
 
-bool rai::election::have_quorum (rai::tally_t const & tally_a)
+void badem::election::confirm_back (badem::transaction const & transaction_a)
 {
-	auto i (tally_a.begin ());
-	auto first (i->first);
-	++i;
-	auto second (i != tally_a.end () ? i->first : 0);
-	auto delta_l (node.delta ());
-	auto result (tally_a.begin ()->first > (second + delta_l));
+	std::deque<badem::block_hash> hashes = { status.winner->previous (), status.winner->source (), status.winner->link () };
+	while (!hashes.empty ())
+	{
+		auto hash (hashes.front ());
+		hashes.pop_front ();
+		if (!hash.is_zero () && !node.ledger.is_epoch_link (hash))
+		{
+			auto existing (node.active.blocks.find (hash));
+			if (existing != node.active.blocks.end () && !existing->second->confirmed && !existing->second->stopped && existing->second->blocks.size () == 1)
+			{
+				release_assert (existing->second->status.winner->hash () == hash);
+				existing->second->confirm_once (transaction_a, true); // Avoid recursive actions
+				hashes.push_back (existing->second->status.winner->previous ());
+				hashes.push_back (existing->second->status.winner->source ());
+				hashes.push_back (existing->second->status.winner->link ());
+			}
+		}
+	}
+}
+
+void badem::election::stop ()
+{
+	stopped = true;
+}
+
+bool badem::election::have_quorum (badem::tally_t const & tally_a, badem::uint128_t tally_sum)
+{
+	bool result = false;
+	if (tally_sum >= node.config.online_weight_minimum.number ())
+	{
+		auto i (tally_a.begin ());
+		auto first (i->first);
+		++i;
+		auto second (i != tally_a.end () ? i->first : 0);
+		auto delta_l (node.delta ());
+		result = tally_a.begin ()->first > (second + delta_l);
+	}
 	return result;
 }
 
-void rai::election::confirm_if_quorum (MDB_txn * transaction_a)
+badem::tally_t badem::election::tally (badem::transaction const & transaction_a)
 {
-	auto tally_l (node.ledger.tally (transaction_a, votes));
+	std::unordered_map<badem::block_hash, badem::uint128_t> block_weights;
+	for (auto vote_info : last_votes)
+	{
+		block_weights[vote_info.second.hash] += node.ledger.weight (transaction_a, vote_info.first);
+	}
+	last_tally = block_weights;
+	badem::tally_t result;
+	for (auto item : block_weights)
+	{
+		auto block (blocks.find (item.first));
+		if (block != blocks.end ())
+		{
+			result.insert (std::make_pair (item.second, block->second));
+		}
+	}
+	return result;
+}
+
+void badem::election::confirm_if_quorum (badem::transaction const & transaction_a)
+{
+	auto tally_l (tally (transaction_a));
 	assert (tally_l.size () > 0);
 	auto winner (tally_l.begin ());
 	auto block_l (winner->second);
 	status.tally = winner->first;
-	rai::uint128_t sum (0);
+	badem::uint128_t sum (0);
 	for (auto & i : tally_l)
 	{
 		sum += i.first;
 	}
-	if (sum >= node.config.online_weight_minimum.number () && !(*block_l == *status.winner))
+	if (sum >= node.config.online_weight_minimum.number () && block_l->hash () != status.winner->hash ())
 	{
 		auto node_l (node.shared ());
 		node_l->block_processor.force (block_l);
 		status.winner = block_l;
 	}
-	if (have_quorum (tally_l))
+	if (have_quorum (tally_l, sum))
 	{
-		if (node.config.logging.vote_logging () || !votes.uncontested ())
+		if (node.config.logging.vote_logging () || blocks.size () > 1)
 		{
-			BOOST_LOG (node.log) << boost::str (boost::format ("Vote tally for root %1%") % status.winner->root ().to_string ());
-			for (auto i (tally_l.begin ()), n (tally_l.end ()); i != n; ++i)
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Block %1% weight %2%") % i->second->hash ().to_string () % i->first.convert_to<std::string> ());
-			}
-			for (auto i (votes.rep_votes.begin ()), n (votes.rep_votes.end ()); i != n; ++i)
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("%1% %2%") % i->first.to_account () % i->second->hash ().to_string ());
-			}
+			log_votes (tally_l);
 		}
 		confirm_once (transaction_a);
 	}
 }
 
-bool rai::election::vote (std::shared_ptr<rai::vote> vote_a)
+void badem::election::log_votes (badem::tally_t const & tally_a)
 {
-	assert (!vote_a->validate ());
+	std::stringstream tally;
+	tally << boost::str (boost::format ("\nVote tally for root %1%") % status.winner->root ().to_string ());
+	for (auto i (tally_a.begin ()), n (tally_a.end ()); i != n; ++i)
+	{
+		tally << boost::str (boost::format ("\nBlock %1% weight %2%") % i->second->hash ().to_string () % i->first.convert_to<std::string> ());
+	}
+	for (auto i (last_votes.begin ()), n (last_votes.end ()); i != n; ++i)
+	{
+		tally << boost::str (boost::format ("\n%1% %2%") % i->first.to_account () % i->second.hash.to_string ());
+	}
+	BOOST_LOG (node.log) << tally.str ();
+}
+
+badem::election_vote_result badem::election::vote (badem::account rep, uint64_t sequence, badem::block_hash block_hash)
+{
 	// see republish_vote documentation for an explanation of these rules
-	rai::transaction transaction (node.store.environment, nullptr, false);
+	auto transaction (node.store.tx_begin_read ());
 	auto replay (false);
 	auto supply (node.online_reps.online_stake ());
-	auto weight (node.ledger.weight (transaction, vote_a->account));
-	if (rai::badem_network == rai::badem_networks::badem_test_network || weight > supply / 1000) // 0.1% or above
+	auto weight (node.ledger.weight (transaction, rep));
+	auto should_process (false);
+	if (badem::is_test_network || weight > supply / 1000) // 0.1% or above
 	{
 		unsigned int cooldown;
 		if (weight < supply / 100) // 0.1% to 1%
@@ -3207,8 +3184,7 @@ bool rai::election::vote (std::shared_ptr<rai::vote> vote_a)
 		{
 			cooldown = 1;
 		}
-		auto should_process (false);
-		auto last_vote_it (last_votes.find (vote_a->account));
+		auto last_vote_it (last_votes.find (rep));
 		if (last_vote_it == last_votes.end ())
 		{
 			should_process = true;
@@ -3216,7 +3192,7 @@ bool rai::election::vote (std::shared_ptr<rai::vote> vote_a)
 		else
 		{
 			auto last_vote (last_vote_it->second);
-			if (last_vote < *vote_a)
+			if (last_vote.sequence < sequence || (last_vote.sequence == sequence && last_vote.hash < block_hash))
 			{
 				if (last_vote.time <= std::chrono::steady_clock::now () - std::chrono::seconds (cooldown))
 				{
@@ -3230,56 +3206,209 @@ bool rai::election::vote (std::shared_ptr<rai::vote> vote_a)
 		}
 		if (should_process)
 		{
-			last_votes[vote_a->account] = { std::chrono::steady_clock::now (), vote_a->sequence, vote_a->block->hash () };
-			node.network.republish_vote (vote_a);
-			votes.vote (vote_a);
-			confirm_if_quorum (transaction);
+			last_votes[rep] = { std::chrono::steady_clock::now (), sequence, block_hash };
+			if (!confirmed)
+			{
+				confirm_if_quorum (transaction);
+			}
 		}
 	}
-	return replay;
+	return badem::election_vote_result (replay, should_process);
 }
 
-void rai::active_transactions::announce_votes ()
+bool badem::node::validate_block_by_previous (badem::transaction const & transaction, std::shared_ptr<badem::block> block_a)
 {
-	std::vector<rai::block_hash> inactive;
-	rai::transaction transaction (node.store.environment, nullptr, false);
-	std::lock_guard<std::mutex> lock (mutex);
+	bool result (false);
+	badem::account account;
+	if (!block_a->previous ().is_zero ())
+	{
+		if (store.block_exists (transaction, block_a->previous ()))
+		{
+			account = ledger.account (transaction, block_a->previous ());
+		}
+		else
+		{
+			result = true;
+		}
+	}
+	else
+	{
+		account = block_a->root ();
+	}
+	if (!result && block_a->type () == badem::block_type::state)
+	{
+		std::shared_ptr<badem::state_block> block_l (std::static_pointer_cast<badem::state_block> (block_a));
+		badem::amount prev_balance (0);
+		if (!block_l->hashables.previous.is_zero ())
+		{
+			if (store.block_exists (transaction, block_l->hashables.previous))
+			{
+				prev_balance = ledger.balance (transaction, block_l->hashables.previous);
+			}
+			else
+			{
+				result = true;
+			}
+		}
+		if (!result)
+		{
+			if (block_l->hashables.balance == prev_balance && !ledger.epoch_link.is_zero () && ledger.is_epoch_link (block_l->hashables.link))
+			{
+				account = ledger.epoch_signer;
+			}
+		}
+	}
+	if (!result && (account.is_zero () || badem::validate_message (account, block_a->hash (), block_a->block_signature ())))
+	{
+		result = true;
+	}
+	return result;
+}
+
+bool badem::election::publish (std::shared_ptr<badem::block> block_a)
+{
+	auto result (false);
+	if (blocks.size () >= 10)
+	{
+		if (last_tally[block_a->hash ()] < node.online_reps.online_stake () / 10)
+		{
+			result = true;
+		}
+	}
+	if (!result)
+	{
+		auto transaction (node.store.tx_begin_read ());
+		result = node.validate_block_by_previous (transaction, block_a);
+		if (!result)
+		{
+			if (blocks.find (block_a->hash ()) == blocks.end ())
+			{
+				blocks.insert (std::make_pair (block_a->hash (), block_a));
+				confirm_if_quorum (transaction);
+				node.network.republish_block (block_a);
+			}
+		}
+	}
+	return result;
+}
+
+size_t badem::election::last_votes_size ()
+{
+	std::lock_guard<std::mutex> lock (node.active.mutex);
+	return last_votes.size ();
+}
+
+void badem::active_transactions::request_confirm (std::unique_lock<std::mutex> & lock_a)
+{
+	std::unordered_set<badem::uint512_union> inactive;
+	auto transaction (node.store.tx_begin_read ());
 	unsigned unconfirmed_count (0);
 	unsigned unconfirmed_announcements (0);
+	std::unordered_map<badem::endpoint, std::vector<std::pair<badem::block_hash, badem::block_hash>>> requests_bundle;
+	std::deque<std::shared_ptr<badem::block>> rebroadcast_bundle;
+	std::deque<std::pair<std::shared_ptr<badem::block>, std::shared_ptr<std::vector<badem::peer_information>>>> confirm_req_bundle;
 
-	for (auto i (roots.begin ()), n (roots.end ()); i != n; ++i)
+	auto roots_size (roots.size ());
+	for (auto i (roots.get<1> ().begin ()), n (roots.get<1> ().end ()); i != n; ++i)
 	{
+		auto root (i->root);
 		auto election_l (i->election);
-		if (!node.store.root_exists (transaction, election_l->votes.id) || (election_l->confirmed && i->announcements >= announcement_min - 1))
+		if ((election_l->confirmed || election_l->stopped) && election_l->announcements >= announcement_min - 1)
 		{
 			if (election_l->confirmed)
 			{
-				confirmed.push_back (i->election->status);
+				confirmed.push_back (election_l->status);
 				if (confirmed.size () > election_history_size)
 				{
 					confirmed.pop_front ();
 				}
 			}
-			inactive.push_back (election_l->votes.id);
+			inactive.insert (root);
 		}
 		else
 		{
-			if (i->announcements > announcement_long)
+			if (election_l->announcements > announcement_long)
 			{
 				++unconfirmed_count;
-				unconfirmed_announcements += i->announcements;
+				unconfirmed_announcements += election_l->announcements;
+				// Log votes for very long unconfirmed elections
+				if (election_l->announcements % 50 == 1)
+				{
+					auto tally_l (election_l->tally (transaction));
+					election_l->log_votes (tally_l);
+				}
+				/* Escalation for long unconfirmed elections
+				Start new elections for previous block & source
+				if there are less than 100 active elections */
+				if (election_l->announcements % announcement_long == 1 && roots_size < 100 && !badem::is_test_network)
+				{
+					std::shared_ptr<badem::block> previous;
+					auto previous_hash (election_l->status.winner->previous ());
+					if (!previous_hash.is_zero ())
+					{
+						previous = node.store.block_get (transaction, previous_hash);
+						if (previous != nullptr)
+						{
+							add (std::move (previous));
+						}
+					}
+					/* If previous block not existing/not commited yet, block_source can cause segfault for state blocks
+					So source check can be done only if previous != nullptr or previous is 0 (open account) */
+					if (previous_hash.is_zero () || previous != nullptr)
+					{
+						auto source_hash (node.ledger.block_source (transaction, *election_l->status.winner));
+						if (!source_hash.is_zero ())
+						{
+							auto source (node.store.block_get (transaction, source_hash));
+							if (source != nullptr)
+							{
+								add (std::move (source));
+							}
+						}
+					}
+				}
 			}
-			node.background ([election_l]() { election_l->broadcast_winner (); });
-			if (i->announcements % announcement_min == 2)
+			if (election_l->announcements < announcement_long || election_l->announcements % announcement_long == 1)
 			{
-				auto reps (std::make_shared<std::vector<rai::peer_information>> (node.peers.representatives (std::numeric_limits<size_t>::max ())));
-
+				if (node.ledger.could_fit (transaction, *election_l->status.winner))
+				{
+					// Broadcast winner
+					if (rebroadcast_bundle.size () < max_broadcast_queue)
+					{
+						rebroadcast_bundle.push_back (election_l->status.winner);
+					}
+				}
+				else
+				{
+					if (election_l->announcements != 0)
+					{
+						election_l->stop ();
+					}
+				}
+			}
+			if (election_l->announcements % 4 == 1)
+			{
+				auto reps (std::make_shared<std::vector<badem::peer_information>> (node.peers.representatives (std::numeric_limits<size_t>::max ())));
+				std::unordered_set<badem::account> probable_reps;
+				badem::uint128_t total_weight (0);
 				for (auto j (reps->begin ()), m (reps->end ()); j != m;)
 				{
-					auto & rep_votes (i->election->votes.rep_votes);
+					auto & rep_votes (election_l->last_votes);
 					auto rep_acct (j->probable_rep_account);
+					// Calculate if representative isn't recorded for several IP addresses
+					if (probable_reps.find (rep_acct) == probable_reps.end ())
+					{
+						total_weight = total_weight + j->rep_weight.number ();
+						probable_reps.insert (rep_acct);
+					}
 					if (rep_votes.find (rep_acct) != rep_votes.end ())
 					{
+						if (j + 1 == reps->end ())
+						{
+							reps->pop_back ();
+							break;
+						}
+
 						std::swap (*j, reps->back ());
 						reps->pop_back ();
 						m = reps->end ();
@@ -3293,98 +3422,238 @@ void rai::active_transactions::announce_votes ()
 						}
 					}
 				}
-				if (!reps->empty ())
+				if ((!reps->empty () && total_weight > node.config.online_weight_minimum.number ()) || roots_size > 5)
 				{
 					// broadcast_confirm_req_base modifies reps, so we clone it once to avoid aliasing
-					node.network.broadcast_confirm_req_base (i->confirm_req_options.first, std::make_shared<std::vector<rai::peer_information>> (*reps), 0);
-					if (i->confirm_req_options.second)
+					if (!badem::is_test_network)
 					{
-						node.network.broadcast_confirm_req_base (i->confirm_req_options.second, reps, 0);
+						if (confirm_req_bundle.size () < max_broadcast_queue)
+						{
+							confirm_req_bundle.push_back (std::make_pair (election_l->status.winner, reps));
+						}
+					}
+					else
+					{
+						for (auto & rep : *reps)
+						{
+							auto rep_request (requests_bundle.find (rep.endpoint));
+							auto block (election_l->status.winner);
+							auto root_hash (std::make_pair (block->hash (), block->root ()));
+							if (rep_request == requests_bundle.end ())
+							{
+								if (requests_bundle.size () < max_broadcast_queue)
+								{
+									std::vector<std::pair<badem::block_hash, badem::block_hash>> insert_vector = { root_hash };
+									requests_bundle.insert (std::make_pair (rep.endpoint, insert_vector));
+								}
+							}
+							else if (rep_request->second.size () < max_broadcast_queue * badem::network::confirm_req_hashes_max)
+							{
+								rep_request->second.push_back (root_hash);
+							}
+						}
+					}
+				}
+				else
+				{
+					if (!badem::is_test_network)
+					{
+						confirm_req_bundle.push_back (std::make_pair (election_l->status.winner, std::make_shared<std::vector<badem::peer_information>> (node.peers.list_vector (100))));
+					}
+					else
+					{
+						for (auto & rep : *reps)
+						{
+							auto rep_request (requests_bundle.find (rep.endpoint));
+							auto block (election_l->status.winner);
+							auto root_hash (std::make_pair (block->hash (), block->root ()));
+							if (rep_request == requests_bundle.end ())
+							{
+								std::vector<std::pair<badem::block_hash, badem::block_hash>> insert_vector = { root_hash };
+								requests_bundle.insert (std::make_pair (rep.endpoint, insert_vector));
+							}
+							else
+							{
+								rep_request->second.push_back (root_hash);
+							}
+						}
 					}
 				}
 			}
 		}
-		roots.modify (i, [](rai::conflict_info & info_a) {
-			++info_a.announcements;
-		});
+		++election_l->announcements;
 	}
+	lock_a.unlock ();
+	// Rebroadcast unconfirmed blocks
+	if (!rebroadcast_bundle.empty ())
+	{
+		node.network.republish_block_batch (rebroadcast_bundle);
+	}
+	// Batch confirmation request
+	if (!badem::is_live_network && !requests_bundle.empty ())
+	{
+		node.network.broadcast_confirm_req_batch (requests_bundle, 50);
+	}
+	//confirm_req broadcast
+	if (!confirm_req_bundle.empty ())
+	{
+		node.network.broadcast_confirm_req_batch (confirm_req_bundle);
+	}
+	lock_a.lock ();
 	for (auto i (inactive.begin ()), n (inactive.end ()); i != n; ++i)
 	{
-		assert (roots.find (*i) != roots.end ());
+		auto root_it (roots.find (*i));
+		assert (root_it != roots.end ());
+		for (auto & block : root_it->election->blocks)
+		{
+			auto erased (blocks.erase (block.first));
+			(void)erased;
+			assert (erased == 1);
+		}
 		roots.erase (*i);
 	}
 	if (unconfirmed_count > 0)
 	{
 		BOOST_LOG (node.log) << boost::str (boost::format ("%1% blocks have been unconfirmed averaging %2% announcements") % unconfirmed_count % (unconfirmed_announcements / unconfirmed_count));
 	}
-	auto now (std::chrono::steady_clock::now ());
-	std::weak_ptr<rai::node> node_w (node.shared ());
-	node.alarm.add (now + std::chrono::milliseconds (announce_interval_ms), [node_w]() {
-		if (auto node_l = node_w.lock ())
-		{
-			node_l->active.announce_votes ();
-		}
-	});
 }
 
-void rai::active_transactions::stop ()
+void badem::active_transactions::request_loop ()
 {
-	std::lock_guard<std::mutex> lock (mutex);
+	std::unique_lock<std::mutex> lock (mutex);
+	started = true;
+
+	lock.unlock ();
+	condition.notify_all ();
+	lock.lock ();
+
+	while (!stopped)
+	{
+		request_confirm (lock);
+		const auto extra_delay (std::min (roots.size (), max_broadcast_queue) * node.network.broadcast_interval_ms * 2);
+		condition.wait_for (lock, std::chrono::milliseconds (request_interval_ms + extra_delay));
+	}
+}
+
+void badem::active_transactions::stop ()
+{
+	std::unique_lock<std::mutex> lock (mutex);
+	while (!started)
+	{
+		condition.wait (lock);
+	}
+	stopped = true;
+	lock.unlock ();
+	condition.notify_all ();
+	if (thread.joinable ())
+	{
+		thread.join ();
+	}
+	lock.lock ();
 	roots.clear ();
 }
 
-bool rai::active_transactions::start (std::shared_ptr<rai::block> block_a, std::function<void(std::shared_ptr<rai::block>)> const & confirmation_action_a)
+bool badem::active_transactions::start (std::shared_ptr<badem::block> block_a, std::function<void(std::shared_ptr<badem::block>)> const & confirmation_action_a)
 {
-	return start (std::make_pair (block_a, nullptr), confirmation_action_a);
+	std::lock_guard<std::mutex> lock (mutex);
+	return add (block_a, confirmation_action_a);
 }
 
-bool rai::active_transactions::start (std::pair<std::shared_ptr<rai::block>, std::shared_ptr<rai::block>> blocks_a, std::function<void(std::shared_ptr<rai::block>)> const & confirmation_action_a)
+bool badem::active_transactions::add (std::shared_ptr<badem::block> block_a, std::function<void(std::shared_ptr<badem::block>)> const & confirmation_action_a)
 {
-	assert (blocks_a.first != nullptr);
-	std::lock_guard<std::mutex> lock (mutex);
-	auto primary_block (blocks_a.first);
-	auto root (primary_block->root ());
-	auto existing (roots.find (root));
-	if (existing == roots.end ())
+	auto error (true);
+	if (!stopped)
 	{
-		auto election (std::make_shared<rai::election> (node, primary_block, confirmation_action_a));
-		roots.insert (rai::conflict_info{ root, election, 0, blocks_a });
+		auto root (badem::uint512_union (block_a->previous (), block_a->root ()));
+		auto existing (roots.find (root));
+		if (existing == roots.end ())
+		{
+			auto election (std::make_shared<badem::election> (node, block_a, confirmation_action_a));
+			uint64_t difficulty (0);
+			auto error (badem::work_validate (*block_a, &difficulty));
+			release_assert (!error);
+			roots.insert (badem::conflict_info{ root, difficulty, election });
+			blocks.insert (std::make_pair (block_a->hash (), election));
+		}
+		error = existing != roots.end ();
 	}
-	return existing != roots.end ();
+	return error;
 }
 
 // Validate a vote and apply it to the current election if one exists
-bool rai::active_transactions::vote (std::shared_ptr<rai::vote> vote_a)
+bool badem::active_transactions::vote (std::shared_ptr<badem::vote> vote_a, bool single_lock)
 {
-	std::shared_ptr<rai::election> election;
+	std::shared_ptr<badem::election> election;
+	bool replay (false);
+	bool processed (false);
 	{
-		std::lock_guard<std::mutex> lock (mutex);
-		auto root (vote_a->block->root ());
-		auto existing (roots.find (root));
-		if (existing != roots.end ())
+		std::unique_lock<std::mutex> lock;
+		if (!single_lock)
 		{
-			election = existing->election;
+			lock = std::unique_lock<std::mutex> (mutex);
+		}
+		for (auto vote_block : vote_a->blocks)
+		{
+			badem::election_vote_result result;
+			if (vote_block.which ())
+			{
+				auto block_hash (boost::get<badem::block_hash> (vote_block));
+				auto existing (blocks.find (block_hash));
+				if (existing != blocks.end ())
+				{
+					result = existing->second->vote (vote_a->account, vote_a->sequence, block_hash);
+				}
+			}
+			else
+			{
+				auto block (boost::get<std::shared_ptr<badem::block>> (vote_block));
+				auto existing (roots.find (badem::uint512_union (block->previous (), block->root ())));
+				if (existing != roots.end ())
+				{
+					result = existing->election->vote (vote_a->account, vote_a->sequence, block->hash ());
+				}
+			}
+			replay = replay || result.replay;
+			processed = processed || result.processed;
 		}
 	}
-	auto result (false);
-	if (election)
+	if (processed)
 	{
-		result = election->vote (vote_a);
+		node.network.republish_vote (vote_a);
 	}
-	return result;
+	return replay;
 }
 
-bool rai::active_transactions::active (rai::block const & block_a)
+bool badem::active_transactions::active (badem::block const & block_a)
 {
 	std::lock_guard<std::mutex> lock (mutex);
-	return roots.find (block_a.root ()) != roots.end ();
+	return roots.find (badem::uint512_union (block_a.previous (), block_a.root ())) != roots.end ();
+}
+
+void badem::active_transactions::update_difficulty (badem::block const & block_a)
+{
+	std::lock_guard<std::mutex> lock (mutex);
+	auto existing (roots.find (badem::uint512_union (block_a.previous (), block_a.root ())));
+	if (existing != roots.end ())
+	{
+		uint64_t difficulty;
+		auto error (badem::work_validate (block_a, &difficulty));
+		assert (!error);
+		roots.modify (existing, [difficulty](badem::conflict_info & info_a) {
+			info_a.difficulty = difficulty;
+		});
+	}
 }
 
 // List of active blocks in elections
-std::deque<std::shared_ptr<rai::block>> rai::active_transactions::list_blocks ()
+std::deque<std::shared_ptr<badem::block>> badem::active_transactions::list_blocks (bool single_lock)
 {
-	std::deque<std::shared_ptr<rai::block>> result;
-	std::lock_guard<std::mutex> lock (mutex);
+	std::deque<std::shared_ptr<badem::block>> result;
+	std::unique_lock<std::mutex> lock;
+	if (!single_lock)
+	{
+		lock = std::unique_lock<std::mutex> (mutex);
+	}
 	for (auto i (roots.begin ()), n (roots.end ()); i != n; ++i)
 	{
 		result.push_back (i->election->status.winner);
@@ -3392,50 +3661,132 @@ std::deque<std::shared_ptr<rai::block>> rai::active_transactions::list_blocks ()
 	return result;
 }
 
-void rai::active_transactions::erase (rai::block const & block_a)
+std::deque<badem::election_status> badem::active_transactions::list_confirmed ()
 {
 	std::lock_guard<std::mutex> lock (mutex);
-	if (roots.find (block_a.root ()) != roots.end ())
+	return confirmed;
+}
+
+void badem::active_transactions::erase (badem::block const & block_a)
+{
+	std::lock_guard<std::mutex> lock (mutex);
+	if (roots.find (badem::uint512_union (block_a.previous (), block_a.root ())) != roots.end ())
 	{
-		roots.erase (block_a.root ());
+		roots.erase (badem::uint512_union (block_a.previous (), block_a.root ()));
 		BOOST_LOG (node.log) << boost::str (boost::format ("Election erased for block block %1% root %2%") % block_a.hash ().to_string () % block_a.root ().to_string ());
 	}
 }
 
-rai::active_transactions::active_transactions (rai::node & node_a) :
-node (node_a)
+bool badem::active_transactions::empty ()
 {
+	std::lock_guard<std::mutex> lock (mutex);
+	return roots.empty ();
 }
 
-int rai::node::store_version ()
+size_t badem::active_transactions::size ()
 {
-	rai::transaction transaction (store.environment, nullptr, false);
+	std::lock_guard<std::mutex> lock (mutex);
+	return roots.size ();
+}
+
+badem::active_transactions::active_transactions (badem::node & node_a) :
+node (node_a),
+started (false),
+stopped (false),
+thread ([this]() {
+	badem::thread_role::set (badem::thread_role::name::request_loop);
+	request_loop ();
+})
+{
+	std::unique_lock<std::mutex> lock (mutex);
+	while (!started)
+	{
+		condition.wait (lock);
+	}
+}
+
+badem::active_transactions::~active_transactions ()
+{
+	stop ();
+}
+
+bool badem::active_transactions::publish (std::shared_ptr<badem::block> block_a)
+{
+	std::lock_guard<std::mutex> lock (mutex);
+	auto existing (roots.find (badem::uint512_union (block_a->previous (), block_a->root ())));
+	auto result (true);
+	if (existing != roots.end ())
+	{
+		result = existing->election->publish (block_a);
+		if (!result)
+		{
+			blocks.insert (std::make_pair (block_a->hash (), existing->election));
+		}
+	}
+	return result;
+}
+
+namespace badem
+{
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (active_transactions & active_transactions, const std::string & name)
+{
+	size_t roots_count = 0;
+	size_t blocks_count = 0;
+	size_t confirmed_count = 0;
+
+	{
+		std::lock_guard<std::mutex> guard (active_transactions.mutex);
+		roots_count = active_transactions.roots.size ();
+		blocks_count = active_transactions.blocks.size ();
+		confirmed_count = active_transactions.confirmed.size ();
+	}
+
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "roots", roots_count, sizeof (decltype (active_transactions.roots)::value_type) }));
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "blocks", blocks_count, sizeof (decltype (active_transactions.blocks)::value_type) }));
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "confirmed", confirmed_count, sizeof (decltype (active_transactions.confirmed)::value_type) }));
+	return composite;
+}
+}
+int badem::node::store_version ()
+{
+	auto transaction (store.tx_begin_read ());
 	return store.version_get (transaction);
 }
 
-rai::thread_runner::thread_runner (boost::asio::io_service & service_a, unsigned service_threads_a)
+badem::thread_runner::thread_runner (boost::asio::io_context & io_ctx_a, unsigned service_threads_a)
 {
-	for (auto i (0); i < service_threads_a; ++i)
+	boost::thread::attributes attrs;
+	badem::thread_attributes::set (attrs);
+	for (auto i (0u); i < service_threads_a; ++i)
 	{
-		threads.push_back (std::thread ([&service_a]() {
+		threads.push_back (boost::thread (attrs, [&io_ctx_a]() {
+			badem::thread_role::set (badem::thread_role::name::io);
 			try
 			{
-				service_a.run ();
+				io_ctx_a.run ();
 			}
 			catch (...)
 			{
-				assert (false && "Unhandled service exception");
+#ifndef NDEBUG
+				/*
+				 * In a release build, catch and swallow the
+				 * io_context exception, in debug mode pass it
+				 * on
+				 */
+				throw;
+#endif
 			}
 		}));
 	}
 }
 
-rai::thread_runner::~thread_runner ()
+badem::thread_runner::~thread_runner ()
 {
 	join ();
 }
 
-void rai::thread_runner::join ()
+void badem::thread_runner::join ()
 {
 	for (auto & i : threads)
 	{
@@ -3446,847 +3797,108 @@ void rai::thread_runner::join ()
 	}
 }
 
-void rai::add_node_options (boost::program_options::options_description & description_a)
-{
-	// clang-format off
-	description_a.add_options ()
-		("account_create", "Insert next deterministic key in to <wallet>")
-		("account_get", "Get account number for the <key>")
-		("account_key", "Get the public key for <account>")
-		("vacuum", "Compact database. If data_path is missing, the database in data directory is compacted.")
-		("snapshot", "Compact database and create snapshot, functions similar to vacuum but does not replace the existing database")
-		("data_path", boost::program_options::value<std::string> (), "Use the supplied path as the data directory")
-		("diagnostics", "Run internal diagnostics")
-		("key_create", "Generates a adhoc random keypair and prints it to stdout")
-		("key_expand", "Derive public key and account number from <key>")
-		("wallet_add_adhoc", "Insert <key> in to <wallet>")
-		("wallet_create", "Creates a new wallet and prints the ID")
-		("wallet_change_seed", "Changes seed for <wallet> to <key>")
-		("wallet_decrypt_unsafe", "Decrypts <wallet> using <password>, !!THIS WILL PRINT YOUR PRIVATE KEY TO STDOUT!!")
-		("wallet_destroy", "Destroys <wallet> and all keys it contains")
-		("wallet_import", "Imports keys in <file> using <password> in to <wallet>")
-		("wallet_list", "Dumps wallet IDs and public keys")
-		("wallet_remove", "Remove <account> from <wallet>")
-		("wallet_representative_get", "Prints default representative for <wallet>")
-		("wallet_representative_set", "Set <account> as default representative for <wallet>")
-		("vote_dump", "Dump most recent votes from representatives")
-		("account", boost::program_options::value<std::string> (), "Defines <account> for other commands")
-		("file", boost::program_options::value<std::string> (), "Defines <file> for other commands")
-		("key", boost::program_options::value<std::string> (), "Defines the <key> for other commands, hex")
-		("password", boost::program_options::value<std::string> (), "Defines <password> for other commands")
-		("wallet", boost::program_options::value<std::string> (), "Defines <wallet> for other commands");
-	// clang-format on
-}
-
-bool rai::handle_node_options (boost::program_options::variables_map & vm)
-{
-	auto result (false);
-	boost::filesystem::path data_path = vm.count ("data_path") ? boost::filesystem::path (vm["data_path"].as<std::string> ()) : rai::working_path ();
-	if (vm.count ("account_create"))
-	{
-		if (vm.count ("wallet") == 1)
-		{
-			rai::uint256_union wallet_id;
-			if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
-			{
-				std::string password;
-				if (vm.count ("password") > 0)
-				{
-					password = vm["password"].as<std::string> ();
-				}
-				inactive_node node (data_path);
-				auto wallet (node.node->wallets.open (wallet_id));
-				if (wallet != nullptr)
-				{
-					if (!wallet->enter_password (password))
-					{
-						rai::transaction transaction (wallet->store.environment, nullptr, true);
-						auto pub (wallet->store.deterministic_insert (transaction));
-						std::cout << boost::str (boost::format ("Account: %1%\n") % pub.to_account ());
-					}
-					else
-					{
-						std::cerr << "Invalid password\n";
-						result = true;
-					}
-				}
-				else
-				{
-					std::cerr << "Wallet doesn't exist\n";
-					result = true;
-				}
-			}
-			else
-			{
-				std::cerr << "Invalid wallet id\n";
-				result = true;
-			}
-		}
-		else
-		{
-			std::cerr << "wallet_add command requires one <wallet> option and one <key> option and optionally one <password> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("account_get") > 0)
-	{
-		if (vm.count ("key") == 1)
-		{
-			rai::uint256_union pub;
-			pub.decode_hex (vm["key"].as<std::string> ());
-			std::cout << "Account: " << pub.to_account () << std::endl;
-		}
-		else
-		{
-			std::cerr << "account comand requires one <key> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("account_key") > 0)
-	{
-		if (vm.count ("account") == 1)
-		{
-			rai::uint256_union account;
-			account.decode_account (vm["account"].as<std::string> ());
-			std::cout << "Hex: " << account.to_string () << std::endl;
-		}
-		else
-		{
-			std::cerr << "account_key command requires one <account> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("vacuum") > 0)
-	{
-		try
-		{
-			auto vacuum_path = data_path / "vacuumed.ldb";
-			auto source_path = data_path / "data.ldb";
-			auto backup_path = data_path / "backup.vacuum.ldb";
-
-			std::cout << "Vacuuming database copy in " << data_path << std::endl;
-			std::cout << "This may take a while..." << std::endl;
-
-			// Scope the node so the mdb environment gets cleaned up properly before
-			// the original file is replaced with the vacuumed file.
-			bool success = false;
-			{
-				inactive_node node (data_path);
-				success = node.node->copy_with_compaction (vacuum_path);
-			}
-
-			if (success)
-			{
-				// Note that these throw on failure
-				std::cout << "Finalizing" << std::endl;
-				boost::filesystem::remove (backup_path);
-				boost::filesystem::rename (source_path, backup_path);
-				boost::filesystem::rename (vacuum_path, source_path);
-				std::cout << "Vacuum completed" << std::endl;
-			}
-		}
-		catch (const boost::filesystem::filesystem_error & ex)
-		{
-			std::cerr << "Vacuum failed during a file operation: " << ex.what () << std::endl;
-		}
-		catch (...)
-		{
-			std::cerr << "Vacuum failed" << std::endl;
-		}
-	}
-	else if (vm.count ("snapshot"))
-	{
-		try
-		{
-			boost::filesystem::path data_path = vm.count ("data_path") ? boost::filesystem::path (vm["data_path"].as<std::string> ()) : rai::working_path ();
-
-			auto source_path = data_path / "data.ldb";
-			auto snapshot_path = data_path / "snapshot.ldb";
-
-			std::cout << "Database snapshot of " << source_path << " to " << snapshot_path << " in progress" << std::endl;
-			std::cout << "This may take a while..." << std::endl;
-
-			bool success = false;
-			{
-				inactive_node node (data_path);
-				success = node.node->copy_with_compaction (snapshot_path);
-			}
-			if (success)
-			{
-				std::cout << "Snapshot completed, This can be found at " << snapshot_path << std::endl;
-			}
-		}
-		catch (const boost::filesystem::filesystem_error & ex)
-		{
-			std::cerr << "Snapshot failed during a file operation: " << ex.what () << std::endl;
-		}
-		catch (...)
-		{
-			std::cerr << "Snapshot Failed" << std::endl;
-		}
-	}
-	else if (vm.count ("diagnostics"))
-	{
-		inactive_node node (data_path);
-		std::cout << "Testing hash function" << std::endl;
-		rai::raw_key key;
-		key.data.clear ();
-		rai::send_block send (0, 0, 0, key, 0, 0);
-		std::cout << "Testing key derivation function" << std::endl;
-		rai::raw_key junk1;
-		junk1.data.clear ();
-		rai::uint256_union junk2 (0);
-		rai::kdf kdf;
-		kdf.phs (junk1, "", junk2);
-		std::cout << "Dumping OpenCL information" << std::endl;
-		bool error (false);
-		rai::opencl_environment environment (error);
-		if (!error)
-		{
-			environment.dump (std::cout);
-			std::stringstream stream;
-			environment.dump (stream);
-			BOOST_LOG (node.logging.log) << stream.str ();
-		}
-		else
-		{
-			std::cout << "Error initializing OpenCL" << std::endl;
-		}
-	}
-	else if (vm.count ("key_create"))
-	{
-		rai::keypair pair;
-		std::cout << "Private: " << pair.prv.data.to_string () << std::endl
-		          << "Public: " << pair.pub.to_string () << std::endl
-		          << "Account: " << pair.pub.to_account () << std::endl;
-	}
-	else if (vm.count ("key_expand"))
-	{
-		if (vm.count ("key") == 1)
-		{
-			rai::uint256_union prv;
-			prv.decode_hex (vm["key"].as<std::string> ());
-			rai::uint256_union pub;
-			ed25519_publickey (prv.bytes.data (), pub.bytes.data ());
-			std::cout << "Private: " << prv.to_string () << std::endl
-			          << "Public: " << pub.to_string () << std::endl
-			          << "Account: " << pub.to_account () << std::endl;
-		}
-		else
-		{
-			std::cerr << "key_expand command requires one <key> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("wallet_add_adhoc"))
-	{
-		if (vm.count ("wallet") == 1 && vm.count ("key") == 1)
-		{
-			rai::uint256_union wallet_id;
-			if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
-			{
-				std::string password;
-				if (vm.count ("password") > 0)
-				{
-					password = vm["password"].as<std::string> ();
-				}
-				inactive_node node (data_path);
-				auto wallet (node.node->wallets.open (wallet_id));
-				if (wallet != nullptr)
-				{
-					if (!wallet->enter_password (password))
-					{
-						rai::raw_key key;
-						if (!key.data.decode_hex (vm["key"].as<std::string> ()))
-						{
-							rai::transaction transaction (wallet->store.environment, nullptr, true);
-							wallet->store.insert_adhoc (transaction, key);
-						}
-						else
-						{
-							std::cerr << "Invalid key\n";
-							result = true;
-						}
-					}
-					else
-					{
-						std::cerr << "Invalid password\n";
-						result = true;
-					}
-				}
-				else
-				{
-					std::cerr << "Wallet doesn't exist\n";
-					result = true;
-				}
-			}
-			else
-			{
-				std::cerr << "Invalid wallet id\n";
-				result = true;
-			}
-		}
-		else
-		{
-			std::cerr << "wallet_add command requires one <wallet> option and one <key> option and optionally one <password> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("wallet_change_seed"))
-	{
-		if (vm.count ("wallet") == 1 && vm.count ("key") == 1)
-		{
-			rai::uint256_union wallet_id;
-			if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
-			{
-				std::string password;
-				if (vm.count ("password") > 0)
-				{
-					password = vm["password"].as<std::string> ();
-				}
-				inactive_node node (data_path);
-				auto wallet (node.node->wallets.open (wallet_id));
-				if (wallet != nullptr)
-				{
-					if (!wallet->enter_password (password))
-					{
-						rai::raw_key key;
-						if (!key.data.decode_hex (vm["key"].as<std::string> ()))
-						{
-							rai::transaction transaction (wallet->store.environment, nullptr, true);
-							wallet->change_seed (transaction, key);
-						}
-						else
-						{
-							std::cerr << "Invalid key\n";
-							result = true;
-						}
-					}
-					else
-					{
-						std::cerr << "Invalid password\n";
-						result = true;
-					}
-				}
-				else
-				{
-					std::cerr << "Wallet doesn't exist\n";
-					result = true;
-				}
-			}
-			else
-			{
-				std::cerr << "Invalid wallet id\n";
-				result = true;
-			}
-		}
-		else
-		{
-			std::cerr << "wallet_add command requires one <wallet> option and one <key> option and optionally one <password> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("wallet_create"))
-	{
-		inactive_node node (data_path);
-		rai::keypair key;
-		std::cout << key.pub.to_string () << std::endl;
-		auto wallet (node.node->wallets.create (key.pub));
-		wallet->enter_initial_password ();
-	}
-	else if (vm.count ("wallet_decrypt_unsafe"))
-	{
-		if (vm.count ("wallet") == 1)
-		{
-			std::string password;
-			if (vm.count ("password") == 1)
-			{
-				password = vm["password"].as<std::string> ();
-			}
-			rai::uint256_union wallet_id;
-			if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
-			{
-				inactive_node node (data_path);
-				auto existing (node.node->wallets.items.find (wallet_id));
-				if (existing != node.node->wallets.items.end ())
-				{
-					if (!existing->second->enter_password (password))
-					{
-						rai::transaction transaction (existing->second->store.environment, nullptr, false);
-						rai::raw_key seed;
-						existing->second->store.seed (seed, transaction);
-						std::cout << boost::str (boost::format ("Seed: %1%\n") % seed.data.to_string ());
-						for (auto i (existing->second->store.begin (transaction)), m (existing->second->store.end ()); i != m; ++i)
-						{
-							rai::account account (i->first.uint256 ());
-							rai::raw_key key;
-							auto error (existing->second->store.fetch (transaction, account, key));
-							assert (!error);
-							std::cout << boost::str (boost::format ("Pub: %1% Prv: %2%\n") % account.to_account () % key.data.to_string ());
-						}
-					}
-					else
-					{
-						std::cerr << "Invalid password\n";
-						result = true;
-					}
-				}
-				else
-				{
-					std::cerr << "Wallet doesn't exist\n";
-					result = true;
-				}
-			}
-			else
-			{
-				std::cerr << "Invalid wallet id\n";
-				result = true;
-			}
-		}
-		else
-		{
-			std::cerr << "wallet_decrypt_unsafe requires one <wallet> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("wallet_destroy"))
-	{
-		if (vm.count ("wallet") == 1)
-		{
-			rai::uint256_union wallet_id;
-			if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
-			{
-				inactive_node node (data_path);
-				if (node.node->wallets.items.find (wallet_id) != node.node->wallets.items.end ())
-				{
-					node.node->wallets.destroy (wallet_id);
-				}
-				else
-				{
-					std::cerr << "Wallet doesn't exist\n";
-					result = true;
-				}
-			}
-			else
-			{
-				std::cerr << "Invalid wallet id\n";
-				result = true;
-			}
-		}
-		else
-		{
-			std::cerr << "wallet_destroy requires one <wallet> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("wallet_import"))
-	{
-		if (vm.count ("file") == 1)
-		{
-			std::string filename (vm["file"].as<std::string> ());
-			std::ifstream stream;
-			stream.open (filename.c_str ());
-			if (!stream.fail ())
-			{
-				std::stringstream contents;
-				contents << stream.rdbuf ();
-				std::string password;
-				if (vm.count ("password") == 1)
-				{
-					password = vm["password"].as<std::string> ();
-				}
-				if (vm.count ("wallet") == 1)
-				{
-					rai::uint256_union wallet_id;
-					if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
-					{
-						inactive_node node (data_path);
-						auto existing (node.node->wallets.items.find (wallet_id));
-						if (existing != node.node->wallets.items.end ())
-						{
-							if (!existing->second->import (contents.str (), password))
-							{
-								result = false;
-							}
-							else
-							{
-								std::cerr << "Unable to import wallet\n";
-								result = true;
-							}
-						}
-						else
-						{
-							std::cerr << "Wallet doesn't exist\n";
-							result = true;
-						}
-					}
-					else
-					{
-						std::cerr << "Invalid wallet id\n";
-						result = true;
-					}
-				}
-				else
-				{
-					std::cerr << "wallet_import requires one <wallet> option\n";
-					result = true;
-				}
-			}
-			else
-			{
-				std::cerr << "Unable to open <file>\n";
-				result = true;
-			}
-		}
-		else
-		{
-			std::cerr << "wallet_import requires one <file> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("wallet_list"))
-	{
-		inactive_node node (data_path);
-		for (auto i (node.node->wallets.items.begin ()), n (node.node->wallets.items.end ()); i != n; ++i)
-		{
-			std::cout << boost::str (boost::format ("Wallet ID: %1%\n") % i->first.to_string ());
-			rai::transaction transaction (i->second->store.environment, nullptr, false);
-			for (auto j (i->second->store.begin (transaction)), m (i->second->store.end ()); j != m; ++j)
-			{
-				std::cout << rai::uint256_union (j->first.uint256 ()).to_account () << '\n';
-			}
-		}
-	}
-	else if (vm.count ("wallet_remove"))
-	{
-		if (vm.count ("wallet") == 1 && vm.count ("account") == 1)
-		{
-			inactive_node node (data_path);
-			rai::uint256_union wallet_id;
-			if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
-			{
-				auto wallet (node.node->wallets.items.find (wallet_id));
-				if (wallet != node.node->wallets.items.end ())
-				{
-					rai::account account_id;
-					if (!account_id.decode_account (vm["account"].as<std::string> ()))
-					{
-						rai::transaction transaction (wallet->second->store.environment, nullptr, true);
-						auto account (wallet->second->store.find (transaction, account_id));
-						if (account != wallet->second->store.end ())
-						{
-							wallet->second->store.erase (transaction, account_id);
-						}
-						else
-						{
-							std::cerr << "Account not found in wallet\n";
-							result = true;
-						}
-					}
-					else
-					{
-						std::cerr << "Invalid account id\n";
-						result = true;
-					}
-				}
-				else
-				{
-					std::cerr << "Wallet not found\n";
-					result = true;
-				}
-			}
-			else
-			{
-				std::cerr << "Invalid wallet id\n";
-				result = true;
-			}
-		}
-		else
-		{
-			std::cerr << "wallet_remove command requires one <wallet> and one <account> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("wallet_representative_get"))
-	{
-		if (vm.count ("wallet") == 1)
-		{
-			rai::uint256_union wallet_id;
-			if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
-			{
-				inactive_node node (data_path);
-				auto wallet (node.node->wallets.items.find (wallet_id));
-				if (wallet != node.node->wallets.items.end ())
-				{
-					rai::transaction transaction (wallet->second->store.environment, nullptr, false);
-					auto representative (wallet->second->store.representative (transaction));
-					std::cout << boost::str (boost::format ("Representative: %1%\n") % representative.to_account ());
-				}
-				else
-				{
-					std::cerr << "Wallet not found\n";
-					result = true;
-				}
-			}
-			else
-			{
-				std::cerr << "Invalid wallet id\n";
-				result = true;
-			}
-		}
-		else
-		{
-			std::cerr << "wallet_representative_get requires one <wallet> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("wallet_representative_set"))
-	{
-		if (vm.count ("wallet") == 1)
-		{
-			if (vm.count ("account") == 1)
-			{
-				rai::uint256_union wallet_id;
-				if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
-				{
-					rai::account account;
-					if (!account.decode_account (vm["account"].as<std::string> ()))
-					{
-						inactive_node node (data_path);
-						auto wallet (node.node->wallets.items.find (wallet_id));
-						if (wallet != node.node->wallets.items.end ())
-						{
-							rai::transaction transaction (wallet->second->store.environment, nullptr, true);
-							wallet->second->store.representative_set (transaction, account);
-						}
-						else
-						{
-							std::cerr << "Wallet not found\n";
-							result = true;
-						}
-					}
-					else
-					{
-						std::cerr << "Invalid account\n";
-						result = true;
-					}
-				}
-				else
-				{
-					std::cerr << "Invalid wallet id\n";
-					result = true;
-				}
-			}
-			else
-			{
-				std::cerr << "wallet_representative_set requires one <account> option\n";
-				result = true;
-			}
-		}
-		else
-		{
-			std::cerr << "wallet_representative_set requires one <wallet> option\n";
-			result = true;
-		}
-	}
-	else if (vm.count ("vote_dump") == 1)
-	{
-		inactive_node node (data_path);
-		rai::transaction transaction (node.node->store.environment, nullptr, false);
-		for (auto i (node.node->store.vote_begin (transaction)), n (node.node->store.vote_end ()); i != n; ++i)
-		{
-			bool error (false);
-			rai::bufferstream stream (reinterpret_cast<uint8_t const *> (i->second.data ()), i->second.size ());
-			auto vote (std::make_shared<rai::vote> (error, stream));
-			assert (!error);
-			std::cerr << boost::str (boost::format ("%1%\n") % vote->to_json ());
-		}
-	}
-	else
-	{
-		result = true;
-	}
-	return result;
-}
-
-rai::inactive_node::inactive_node (boost::filesystem::path const & path) :
+badem::inactive_node::inactive_node (boost::filesystem::path const & path, uint16_t peering_port_a) :
 path (path),
-service (boost::make_shared<boost::asio::io_service> ()),
-alarm (*service),
-work (1, nullptr)
+io_context (std::make_shared<boost::asio::io_context> ()),
+alarm (*io_context),
+work (1, nullptr),
+peering_port (peering_port_a)
 {
+	boost::system::error_code error_chmod;
+
+	/*
+	 * @warning May throw a filesystem exception
+	 */
 	boost::filesystem::create_directories (path);
+	badem::set_secure_perm_directory (path, error_chmod);
 	logging.max_size = std::numeric_limits<std::uintmax_t>::max ();
 	logging.init (path);
-	node = std::make_shared<rai::node> (init, *service, 24000, path, alarm, logging, work);
+	node = std::make_shared<badem::node> (init, *io_context, peering_port, path, alarm, logging, work);
 }
 
-rai::inactive_node::~inactive_node ()
+badem::inactive_node::~inactive_node ()
 {
 	node->stop ();
 }
 
-rai::port_mapping::port_mapping (rai::node & node_a) :
-node (node_a),
-devices (nullptr),
-protocols ({ { { "TCP", 0, boost::asio::ip::address_v4::any (), 0 }, { "UDP", 0, boost::asio::ip::address_v4::any (), 0 } } }),
-check_count (0),
-on (false)
+badem::udp_buffer::udp_buffer (badem::stat & stats, size_t size, size_t count) :
+stats (stats),
+free (count),
+full (count),
+slab (size * count),
+entries (count),
+stopped (false)
 {
-	urls = { 0 };
-	data = { { 0 } };
-}
-
-void rai::port_mapping::start ()
-{
-	check_mapping_loop ();
-}
-
-void rai::port_mapping::refresh_devices ()
-{
-	if (rai::badem_network != rai::badem_networks::badem_test_network)
+	assert (count > 0);
+	assert (size > 0);
+	auto slab_data (slab.data ());
+	auto entry_data (entries.data ());
+	for (auto i (0); i < count; ++i, ++entry_data)
 	{
-		std::lock_guard<std::mutex> lock (mutex);
-		int discover_error = 0;
-		freeUPNPDevlist (devices);
-		devices = upnpDiscover (2000, nullptr, nullptr, UPNP_LOCAL_PORT_ANY, false, 2, &discover_error);
-		std::array<char, 64> local_address;
-		local_address.fill (0);
-		auto igd_error (UPNP_GetValidIGD (devices, &urls, &data, local_address.data (), sizeof (local_address)));
-		if (igd_error == 1 || igd_error == 2)
-		{
-			boost::system::error_code ec;
-			address = boost::asio::ip::address_v4::from_string (local_address.data (), ec);
-		}
-		if (check_count % 15 == 0)
-		{
-			BOOST_LOG (node.log) << boost::str (boost::format ("UPnP local address: %1%, discovery: %2%, IGD search: %3%") % local_address.data () % discover_error % igd_error);
-			for (auto i (devices); i != nullptr; i = i->pNext)
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("UPnP device url: %1% st: %2% usn: %3%") % i->descURL % i->st % i->usn);
-			}
-		}
+		*entry_data = { slab_data + i * size, 0, badem::endpoint () };
+		free.push_back (entry_data);
 	}
 }
-
-void rai::port_mapping::refresh_mapping ()
+badem::udp_data * badem::udp_buffer::allocate ()
 {
-	if (rai::badem_network != rai::badem_networks::badem_test_network)
+	std::unique_lock<std::mutex> lock (mutex);
+	while (!stopped && free.empty () && full.empty ())
 	{
-		std::lock_guard<std::mutex> lock (mutex);
-		auto node_port (std::to_string (node.network.endpoint ().port ()));
-
-		// Intentionally omitted: we don't map the RPC port because, unless RPC authentication was added, this would almost always be a security risk
-		for (auto & protocol : protocols)
-		{
-			std::array<char, 6> actual_external_port;
-			actual_external_port.fill (0);
-			auto add_port_mapping_error (UPNP_AddAnyPortMapping (urls.controlURL, data.first.servicetype, node_port.c_str (), node_port.c_str (), address.to_string ().c_str (), nullptr, protocol.name, nullptr, std::to_string (mapping_timeout).c_str (), actual_external_port.data ()));
-			if (check_count % 15 == 0)
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("UPnP %1% port mapping response: %2%, actual external port %3%") % protocol.name % add_port_mapping_error % actual_external_port.data ());
-			}
-			if (add_port_mapping_error == UPNPCOMMAND_SUCCESS)
-			{
-				protocol.external_port = std::atoi (actual_external_port.data ());
-			}
-			else
-			{
-				protocol.external_port = 0;
-			}
-		}
+		stats.inc (badem::stat::type::udp, badem::stat::detail::blocking, badem::stat::dir::in);
+		condition.wait (lock);
 	}
-}
-
-int rai::port_mapping::check_mapping ()
-{
-	int result (3600);
-	if (rai::badem_network != rai::badem_networks::badem_test_network)
+	badem::udp_data * result (nullptr);
+	if (!free.empty ())
 	{
-		// Long discovery time and fast setup/teardown make this impractical for testing
-		std::lock_guard<std::mutex> lock (mutex);
-		auto node_port (std::to_string (node.network.endpoint ().port ()));
-		for (auto & protocol : protocols)
-		{
-			std::array<char, 64> int_client;
-			std::array<char, 6> int_port;
-			std::array<char, 16> remaining_mapping_duration;
-			remaining_mapping_duration.fill (0);
-			auto verify_port_mapping_error (UPNP_GetSpecificPortMappingEntry (urls.controlURL, data.first.servicetype, node_port.c_str (), protocol.name, nullptr, int_client.data (), int_port.data (), nullptr, nullptr, remaining_mapping_duration.data ()));
-			if (verify_port_mapping_error == UPNPCOMMAND_SUCCESS)
-			{
-				protocol.remaining = result;
-			}
-			else
-			{
-				protocol.remaining = 0;
-			}
-			result = std::min (result, protocol.remaining);
-			std::array<char, 64> external_address;
-			external_address.fill (0);
-			auto external_ip_error (UPNP_GetExternalIPAddress (urls.controlURL, data.first.servicetype, external_address.data ()));
-			if (external_ip_error == UPNPCOMMAND_SUCCESS)
-			{
-				boost::system::error_code ec;
-				protocol.external_address = boost::asio::ip::address_v4::from_string (external_address.data (), ec);
-			}
-			else
-			{
-				protocol.external_address = boost::asio::ip::address_v4::any ();
-			}
-			if (check_count % 15 == 0)
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("UPnP %1% mapping verification response: %2%, external ip response: %3%, external ip: %4%, internal ip: %5%, remaining lease: %6%") % protocol.name % verify_port_mapping_error % external_ip_error % external_address.data () % address.to_string () % remaining_mapping_duration.data ());
-			}
-		}
+		result = free.front ();
+		free.pop_front ();
+	}
+	if (result == nullptr)
+	{
+		result = full.front ();
+		full.pop_front ();
+		stats.inc (badem::stat::type::udp, badem::stat::detail::overflow, badem::stat::dir::in);
 	}
 	return result;
 }
-
-void rai::port_mapping::check_mapping_loop ()
+void badem::udp_buffer::enqueue (badem::udp_data * data_a)
 {
-	int wait_duration = check_timeout;
-	refresh_devices ();
-	if (devices != nullptr)
+	assert (data_a != nullptr);
 	{
-		auto remaining (check_mapping ());
-		// If the mapping is lost, refresh it
-		if (remaining == 0)
-		{
-			refresh_mapping ();
-		}
+		std::lock_guard<std::mutex> lock (mutex);
+		full.push_back (data_a);
 	}
-	else
-	{
-		wait_duration = 300;
-		if (check_count < 10)
-		{
-			BOOST_LOG (node.log) << boost::str (boost::format ("UPnP No IGD devices found"));
-		}
-	}
-	++check_count;
-	if (on)
-	{
-		auto node_l (node.shared ());
-		node.alarm.add (std::chrono::steady_clock::now () + std::chrono::seconds (wait_duration), [node_l]() {
-			node_l->port_mapping.check_mapping_loop ();
-		});
-	}
+	condition.notify_all ();
 }
-
-void rai::port_mapping::stop ()
+badem::udp_data * badem::udp_buffer::dequeue ()
 {
-	on = false;
-	std::lock_guard<std::mutex> lock (mutex);
-	for (auto & protocol : protocols)
+	std::unique_lock<std::mutex> lock (mutex);
+	while (!stopped && full.empty ())
 	{
-		if (protocol.external_port != 0)
-		{
-			// Be a good citizen for the router and shut down our mapping
-			auto delete_error (UPNP_DeletePortMapping (urls.controlURL, data.first.servicetype, std::to_string (protocol.external_port).c_str (), protocol.name, address.to_string ().c_str ()));
-			BOOST_LOG (node.log) << boost::str (boost::format ("Shutdown port mapping response: %1%") % delete_error);
-		}
+		condition.wait (lock);
 	}
-	freeUPNPDevlist (devices);
-	devices = nullptr;
+	badem::udp_data * result (nullptr);
+	if (!full.empty ())
+	{
+		result = full.front ();
+		full.pop_front ();
+	}
+	return result;
+}
+void badem::udp_buffer::release (badem::udp_data * data_a)
+{
+	assert (data_a != nullptr);
+	{
+		std::lock_guard<std::mutex> lock (mutex);
+		free.push_back (data_a);
+	}
+	condition.notify_all ();
+}
+void badem::udp_buffer::stop ()
+{
+	{
+		std::lock_guard<std::mutex> lock (mutex);
+		stopped = true;
+	}
+	condition.notify_all ();
 }

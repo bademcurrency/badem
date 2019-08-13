@@ -1,10 +1,10 @@
 #include <badem/lib/interface.h>
 
-#include <xxhash/xxhash.h>
+#include <crypto/xxhash/xxhash.h>
 
-#include <ed25519-donna/ed25519.h>
+#include <crypto/ed25519-donna/ed25519.h>
 
-#include <blake2/blake2.h>
+#include <crypto/blake2/blake2.h>
 
 #include <boost/property_tree/json_parser.hpp>
 
@@ -17,67 +17,67 @@
 extern "C" {
 void bdm_uint128_to_dec (bdm_uint128 source, char * destination)
 {
-	auto const & number (*reinterpret_cast<rai::uint128_union *> (source));
-	strncpy (destination, number.to_string_dec ().c_str (), 32);
+	auto const & number (*reinterpret_cast<badem::uint128_union *> (source));
+	strncpy (destination, number.to_string_dec ().c_str (), 40);
 }
 
 void bdm_uint256_to_string (bdm_uint256 source, char * destination)
 {
-	auto const & number (*reinterpret_cast<rai::uint256_union *> (source));
-	strncpy (destination, number.to_string ().c_str (), 64);
+	auto const & number (*reinterpret_cast<badem::uint256_union *> (source));
+	strncpy (destination, number.to_string ().c_str (), 65);
 }
 
 void bdm_uint256_to_address (bdm_uint256 source, char * destination)
 {
-	auto const & number (*reinterpret_cast<rai::uint256_union *> (source));
+	auto const & number (*reinterpret_cast<badem::uint256_union *> (source));
 	strncpy (destination, number.to_account ().c_str (), 65);
 }
 
 void bdm_uint512_to_string (bdm_uint512 source, char * destination)
 {
-	auto const & number (*reinterpret_cast<rai::uint512_union *> (source));
-	strncpy (destination, number.to_string ().c_str (), 128);
+	auto const & number (*reinterpret_cast<badem::uint512_union *> (source));
+	strncpy (destination, number.to_string ().c_str (), 129);
 }
 
 int bdm_uint128_from_dec (const char * source, bdm_uint128 destination)
 {
-	auto & number (*reinterpret_cast<rai::uint128_union *> (destination));
+	auto & number (*reinterpret_cast<badem::uint128_union *> (destination));
 	auto error (number.decode_dec (source));
 	return error ? 1 : 0;
 }
 
 int bdm_uint256_from_string (const char * source, bdm_uint256 destination)
 {
-	auto & number (*reinterpret_cast<rai::uint256_union *> (destination));
+	auto & number (*reinterpret_cast<badem::uint256_union *> (destination));
 	auto error (number.decode_hex (source));
 	return error ? 1 : 0;
 }
 
 int bdm_uint512_from_string (const char * source, bdm_uint512 destination)
 {
-	auto & number (*reinterpret_cast<rai::uint512_union *> (destination));
+	auto & number (*reinterpret_cast<badem::uint512_union *> (destination));
 	auto error (number.decode_hex (source));
 	return error ? 1 : 0;
 }
 
 int bdm_valid_address (const char * account_a)
 {
-	rai::uint256_union account;
+	badem::uint256_union account;
 	auto error (account.decode_account (account_a));
 	return error ? 1 : 0;
 }
 
 void bdm_generate_random (bdm_uint256 seed)
 {
-	auto & number (*reinterpret_cast<rai::uint256_union *> (seed));
-	rai::random_pool.GenerateBlock (number.bytes.data (), number.bytes.size ());
+	auto & number (*reinterpret_cast<badem::uint256_union *> (seed));
+	badem::random_pool::generate_block (number.bytes.data (), number.bytes.size ());
 }
 
 void bdm_seed_key (bdm_uint256 seed, int index, bdm_uint256 destination)
 {
-	auto & seed_l (*reinterpret_cast<rai::uint256_union *> (seed));
-	auto & destination_l (*reinterpret_cast<rai::uint256_union *> (destination));
-	rai::deterministic_key (seed_l, index, destination_l);
+	auto & seed_l (*reinterpret_cast<badem::uint256_union *> (seed));
+	auto & destination_l (*reinterpret_cast<badem::uint256_union *> (destination));
+	badem::deterministic_key (seed_l, index, destination_l);
 }
 
 void bdm_key_account (const bdm_uint256 key, bdm_uint256 pub)
@@ -94,20 +94,20 @@ char * bdm_sign_transaction (const char * transaction, const bdm_uint256 private
 		std::string transaction_l (transaction);
 		std::stringstream block_stream (transaction_l);
 		boost::property_tree::read_json (block_stream, block_l);
-		auto block (rai::deserialize_block_json (block_l));
+		auto block (badem::deserialize_block_json (block_l));
 		if (block != nullptr)
 		{
-			rai::uint256_union pub;
+			badem::uint256_union pub;
 			ed25519_publickey (private_key, pub.bytes.data ());
-			rai::raw_key prv;
-			prv.data = *reinterpret_cast<rai::uint256_union *> (private_key);
-			block->signature_set (rai::sign_message (prv, pub, block->hash ()));
+			badem::raw_key prv;
+			prv.data = *reinterpret_cast<badem::uint256_union *> (private_key);
+			block->signature_set (badem::sign_message (prv, pub, block->hash ()));
 			auto json (block->to_json ());
 			result = reinterpret_cast<char *> (malloc (json.size () + 1));
 			strncpy (result, json.c_str (), json.size () + 1);
 		}
 	}
-	catch (std::runtime_error const & err)
+	catch (std::runtime_error const &)
 	{
 	}
 	return result;
@@ -122,10 +122,10 @@ char * bdm_work_transaction (const char * transaction)
 		std::string transaction_l (transaction);
 		std::stringstream block_stream (transaction_l);
 		boost::property_tree::read_json (block_stream, block_l);
-		auto block (rai::deserialize_block_json (block_l));
+		auto block (badem::deserialize_block_json (block_l));
 		if (block != nullptr)
 		{
-			rai::work_pool pool (std::thread::hardware_concurrency ());
+			badem::work_pool pool (boost::thread::hardware_concurrency ());
 			auto work (pool.generate (block->root ()));
 			block->block_work_set (work);
 			auto json (block->to_json ());
@@ -133,16 +133,16 @@ char * bdm_work_transaction (const char * transaction)
 			strncpy (result, json.c_str (), json.size () + 1);
 		}
 	}
-	catch (std::runtime_error const & err)
+	catch (std::runtime_error const &)
 	{
 	}
 	return result;
 }
 
-#include <ed25519-donna/ed25519-hash-custom.h>
+#include <crypto/ed25519-donna/ed25519-hash-custom.h>
 void ed25519_randombytes_unsafe (void * out, size_t outlen)
 {
-	rai::random_pool.GenerateBlock (reinterpret_cast<uint8_t *> (out), outlen);
+	badem::random_pool::generate_block (reinterpret_cast<uint8_t *> (out), outlen);
 }
 void ed25519_hash_init (ed25519_hash_context * ctx)
 {

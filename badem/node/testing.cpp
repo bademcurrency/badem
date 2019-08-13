@@ -4,30 +4,48 @@
 #include <badem/node/common.hpp>
 #include <badem/node/testing.hpp>
 
-rai::system::system (uint16_t port_a, size_t count_a) :
-alarm (service),
+std::string badem::error_system_messages::message (int ev) const
+{
+	switch (static_cast<badem::error_system> (ev))
+	{
+		case badem::error_system::generic:
+			return "Unknown error";
+		case badem::error_system::deadline_expired:
+			return "Deadline expired";
+	}
+
+	return "Invalid error code";
+}
+
+badem::system::system (uint16_t port_a, uint16_t count_a) :
+alarm (io_ctx),
 work (1, nullptr)
 {
-	logging.init (rai::unique_path ());
-	nodes.reserve (count_a);
-	for (size_t i (0); i < count_a; ++i)
+	auto scale_str = std::getenv ("DEADLINE_SCALE_FACTOR");
+	if (scale_str)
 	{
-		rai::node_init init;
-		rai::node_config config (port_a + i, logging);
-		auto node (std::make_shared<rai::node> (init, service, rai::unique_path (), alarm, config, work));
+		deadline_scaling_factor = std::stod (scale_str);
+	}
+	logging.init (badem::unique_path ());
+	nodes.reserve (count_a);
+	for (uint16_t i (0); i < count_a; ++i)
+	{
+		badem::node_init init;
+		badem::node_config config (port_a + i, logging);
+		auto node (std::make_shared<badem::node> (init, io_ctx, badem::unique_path (), alarm, config, work));
 		assert (!init.error ());
 		node->start ();
-		rai::uint256_union wallet;
-		rai::random_pool.GenerateBlock (wallet.bytes.data (), wallet.bytes.size ());
+		badem::uint256_union wallet;
+		badem::random_pool::generate_block (wallet.bytes.data (), wallet.bytes.size ());
 		node->wallets.create (wallet);
 		nodes.push_back (node);
 	}
 	for (auto i (nodes.begin ()), j (nodes.begin () + 1), n (nodes.end ()); j != n; ++i, ++j)
 	{
 		auto starting1 ((*i)->peers.size ());
-		auto new1 (starting1);
+		decltype (starting1) new1;
 		auto starting2 ((*j)->peers.size ());
-		auto new2 (starting2);
+		decltype (starting2) new2;
 		(*j)->network.send_keepalive ((*i)->network.endpoint ());
 		do
 		{
@@ -37,7 +55,7 @@ work (1, nullptr)
 		} while (new1 == starting1 || new2 == starting2);
 	}
 	auto iterations1 (0);
-	while (std::any_of (nodes.begin (), nodes.end (), [](std::shared_ptr<rai::node> const & node_a) { return node_a->bootstrap_initiator.in_progress (); }))
+	while (std::any_of (nodes.begin (), nodes.end (), [](std::shared_ptr<badem::node> const & node_a) { return node_a->bootstrap_initiator.in_progress (); }))
 	{
 		poll ();
 		++iterations1;
@@ -45,7 +63,7 @@ work (1, nullptr)
 	}
 }
 
-rai::system::~system ()
+badem::system::~system ()
 {
 	for (auto & i : nodes)
 	{
@@ -57,35 +75,44 @@ rai::system::~system ()
 	// retain the files.
 	if (std::getenv ("TEST_KEEP_TMPDIRS") == nullptr)
 	{
-		rai::remove_temporary_directories ();
+		badem::remove_temporary_directories ();
 	}
 }
 
-std::shared_ptr<rai::wallet> rai::system::wallet (size_t index_a)
+std::shared_ptr<badem::wallet> badem::system::wallet (size_t index_a)
 {
 	assert (nodes.size () > index_a);
 	auto size (nodes[index_a]->wallets.items.size ());
-	assert (size >= 1);
+	assert (size == 1);
 	return nodes[index_a]->wallets.items.begin ()->second;
 }
 
-rai::account rai::system::account (MDB_txn * transaction_a, size_t index_a)
+badem::account badem::system::account (badem::transaction const & transaction_a, size_t index_a)
 {
 	auto wallet_l (wallet (index_a));
 	auto keys (wallet_l->store.begin (transaction_a));
 	assert (keys != wallet_l->store.end ());
 	auto result (keys->first);
 	assert (++keys == wallet_l->store.end ());
-	return result.uint256 ();
+	return badem::account (result);
 }
 
-void rai::system::poll ()
+void badem::system::deadline_set (std::chrono::duration<double, std::badem> const & delta_a)
 {
-	auto polled1 (service.poll_one ());
-	if (polled1 == 0)
+	deadline = std::chrono::steady_clock::now () + delta_a * deadline_scaling_factor;
+}
+
+std::error_code badem::system::poll (std::chrono::nanoseconds const & wait_time)
+{
+	std::error_code ec;
+	io_ctx.run_one_for (wait_time);
+
+	if (std::chrono::steady_clock::now () > deadline)
 	{
-		std::this_thread::sleep_for (std::chrono::milliseconds (50));
+		ec = badem::error_system::deadline_expired;
+		stop ();
 	}
+	return ec;
 }
 
 namespace
@@ -93,7 +120,7 @@ namespace
 class traffic_generator : public std::enable_shared_from_this<traffic_generator>
 {
 public:
-	traffic_generator (uint32_t count_a, uint32_t wait_a, std::shared_ptr<rai::node> node_a, rai::system & system_a) :
+	traffic_generator (uint32_t count_a, uint32_t wait_a, std::shared_ptr<badem::node> node_a, badem::system & system_a) :
 	count (count_a),
 	wait (wait_a),
 	node (node_a),
@@ -111,15 +138,15 @@ public:
 			node->alarm.add (std::chrono::steady_clock::now () + std::chrono::milliseconds (wait), [this_l]() { this_l->run (); });
 		}
 	}
-	std::vector<rai::account> accounts;
+	std::vector<badem::account> accounts;
 	uint32_t count;
 	uint32_t wait;
-	std::shared_ptr<rai::node> node;
-	rai::system & system;
+	std::shared_ptr<badem::node> node;
+	badem::system & system;
 };
 }
 
-void rai::system::generate_usage_traffic (uint32_t count_a, uint32_t wait_a)
+void badem::system::generate_usage_traffic (uint32_t count_a, uint32_t wait_a)
 {
 	for (size_t i (0), n (nodes.size ()); i != n; ++i)
 	{
@@ -127,7 +154,7 @@ void rai::system::generate_usage_traffic (uint32_t count_a, uint32_t wait_a)
 	}
 }
 
-void rai::system::generate_usage_traffic (uint32_t count_a, uint32_t wait_a, size_t index_a)
+void badem::system::generate_usage_traffic (uint32_t count_a, uint32_t wait_a, size_t index_a)
 {
 	assert (nodes.size () > index_a);
 	assert (count_a > 0);
@@ -135,17 +162,18 @@ void rai::system::generate_usage_traffic (uint32_t count_a, uint32_t wait_a, siz
 	generate->run ();
 }
 
-void rai::system::generate_rollback (rai::node & node_a, std::vector<rai::account> & accounts_a)
+void badem::system::generate_rollback (badem::node & node_a, std::vector<badem::account> & accounts_a)
 {
-	rai::transaction transaction (node_a.store.environment, nullptr, true);
-	auto index (random_pool.GenerateWord32 (0, accounts_a.size () - 1));
+	auto transaction (node_a.store.tx_begin_write ());
+	assert (std::numeric_limits<CryptoPP::word32>::max () > accounts_a.size ());
+	auto index (random_pool::generate_word32 (0, static_cast<CryptoPP::word32> (accounts_a.size () - 1)));
 	auto account (accounts_a[index]);
-	rai::account_info info;
+	badem::account_info info;
 	auto error (node_a.store.account_get (transaction, account, info));
 	if (!error)
 	{
 		auto hash (info.open_block);
-		rai::genesis genesis;
+		badem::genesis genesis;
 		if (hash != genesis.hash ())
 		{
 			accounts_a[index] = accounts_a[accounts_a.size () - 1];
@@ -155,31 +183,30 @@ void rai::system::generate_rollback (rai::node & node_a, std::vector<rai::accoun
 	}
 }
 
-void rai::system::generate_receive (rai::node & node_a)
+void badem::system::generate_receive (badem::node & node_a)
 {
-	std::shared_ptr<rai::block> send_block;
+	std::shared_ptr<badem::block> send_block;
 	{
-		rai::transaction transaction (node_a.store.environment, nullptr, false);
-		rai::uint256_union random_block;
-		random_pool.GenerateBlock (random_block.bytes.data (), sizeof (random_block.bytes));
-		auto i (node_a.store.pending_begin (transaction, rai::pending_key (random_block, 0)));
+		auto transaction (node_a.store.tx_begin_read ());
+		badem::uint256_union random_block;
+		random_pool::generate_block (random_block.bytes.data (), sizeof (random_block.bytes));
+		auto i (node_a.store.pending_begin (transaction, badem::pending_key (random_block, 0)));
 		if (i != node_a.store.pending_end ())
 		{
-			rai::pending_key send_hash (i->first);
-			rai::pending_info info (i->second);
+			badem::pending_key send_hash (i->first);
 			send_block = node_a.store.block_get (transaction, send_hash.hash);
 		}
 	}
 	if (send_block != nullptr)
 	{
-		auto receive_error (wallet (0)->receive_sync (send_block, rai::genesis_account, std::numeric_limits<rai::uint128_t>::max ()));
+		auto receive_error (wallet (0)->receive_sync (send_block, badem::genesis_account, std::numeric_limits<badem::uint128_t>::max ()));
 		(void)receive_error;
 	}
 }
 
-void rai::system::generate_activity (rai::node & node_a, std::vector<rai::account> & accounts_a)
+void badem::system::generate_activity (badem::node & node_a, std::vector<badem::account> & accounts_a)
 {
-	auto what (random_pool.GenerateByte ());
+	auto what (random_pool::generate_byte ());
 	if (what < 0x1)
 	{
 		generate_rollback (node_a, accounts_a);
@@ -206,40 +233,41 @@ void rai::system::generate_activity (rai::node & node_a, std::vector<rai::accoun
 	}
 }
 
-rai::account rai::system::get_random_account (std::vector<rai::account> & accounts_a)
+badem::account badem::system::get_random_account (std::vector<badem::account> & accounts_a)
 {
-	auto index (random_pool.GenerateWord32 (0, accounts_a.size () - 1));
+	assert (std::numeric_limits<CryptoPP::word32>::max () > accounts_a.size ());
+	auto index (random_pool::generate_word32 (0, static_cast<CryptoPP::word32> (accounts_a.size () - 1)));
 	auto result (accounts_a[index]);
 	return result;
 }
 
-rai::uint128_t rai::system::get_random_amount (MDB_txn * transaction_a, rai::node & node_a, rai::account const & account_a)
+badem::uint128_t badem::system::get_random_amount (badem::transaction const & transaction_a, badem::node & node_a, badem::account const & account_a)
 {
-	rai::uint128_t balance (node_a.ledger.account_balance (transaction_a, account_a));
+	badem::uint128_t balance (node_a.ledger.account_balance (transaction_a, account_a));
 	std::string balance_text (balance.convert_to<std::string> ());
-	rai::uint128_union random_amount;
-	random_pool.GenerateBlock (random_amount.bytes.data (), sizeof (random_amount.bytes));
-	auto result (((rai::uint256_t{ random_amount.number () } * balance) / rai::uint256_t{ std::numeric_limits<rai::uint128_t>::max () }).convert_to<rai::uint128_t> ());
+	badem::uint128_union random_amount;
+	badem::random_pool::generate_block (random_amount.bytes.data (), sizeof (random_amount.bytes));
+	auto result (((badem::uint256_t{ random_amount.number () } * balance) / badem::uint256_t{ std::numeric_limits<badem::uint128_t>::max () }).convert_to<badem::uint128_t> ());
 	std::string text (result.convert_to<std::string> ());
 	return result;
 }
 
-void rai::system::generate_send_existing (rai::node & node_a, std::vector<rai::account> & accounts_a)
+void badem::system::generate_send_existing (badem::node & node_a, std::vector<badem::account> & accounts_a)
 {
-	rai::uint128_t amount;
-	rai::account destination;
-	rai::account source;
+	badem::uint128_t amount;
+	badem::account destination;
+	badem::account source;
 	{
-		rai::account account;
-		random_pool.GenerateBlock (account.bytes.data (), sizeof (account.bytes));
-		rai::transaction transaction (node_a.store.environment, nullptr, false);
-		rai::store_iterator entry (node_a.store.latest_begin (transaction, account));
+		badem::account account;
+		random_pool::generate_block (account.bytes.data (), sizeof (account.bytes));
+		auto transaction (node_a.store.tx_begin_read ());
+		badem::store_iterator<badem::account, badem::account_info> entry (node_a.store.latest_begin (transaction, account));
 		if (entry == node_a.store.latest_end ())
 		{
 			entry = node_a.store.latest_begin (transaction);
 		}
 		assert (entry != node_a.store.latest_end ());
-		destination = rai::account (entry->first.uint256 ());
+		destination = badem::account (entry->first);
 		source = get_random_account (accounts_a);
 		amount = get_random_amount (transaction, node_a, source);
 	}
@@ -250,36 +278,36 @@ void rai::system::generate_send_existing (rai::node & node_a, std::vector<rai::a
 	}
 }
 
-void rai::system::generate_change_known (rai::node & node_a, std::vector<rai::account> & accounts_a)
+void badem::system::generate_change_known (badem::node & node_a, std::vector<badem::account> & accounts_a)
 {
-	rai::account source (get_random_account (accounts_a));
+	badem::account source (get_random_account (accounts_a));
 	if (!node_a.latest (source).is_zero ())
 	{
-		rai::account destination (get_random_account (accounts_a));
+		badem::account destination (get_random_account (accounts_a));
 		auto change_error (wallet (0)->change_sync (source, destination));
 		assert (!change_error);
 	}
 }
 
-void rai::system::generate_change_unknown (rai::node & node_a, std::vector<rai::account> & accounts_a)
+void badem::system::generate_change_unknown (badem::node & node_a, std::vector<badem::account> & accounts_a)
 {
-	rai::account source (get_random_account (accounts_a));
+	badem::account source (get_random_account (accounts_a));
 	if (!node_a.latest (source).is_zero ())
 	{
-		rai::keypair key;
-		rai::account destination (key.pub);
+		badem::keypair key;
+		badem::account destination (key.pub);
 		auto change_error (wallet (0)->change_sync (source, destination));
 		assert (!change_error);
 	}
 }
 
-void rai::system::generate_send_new (rai::node & node_a, std::vector<rai::account> & accounts_a)
+void badem::system::generate_send_new (badem::node & node_a, std::vector<badem::account> & accounts_a)
 {
 	assert (node_a.wallets.items.size () == 1);
-	rai::uint128_t amount;
-	rai::account source;
+	badem::uint128_t amount;
+	badem::account source;
 	{
-		rai::transaction transaction (node_a.store.environment, nullptr, false);
+		auto transaction (node_a.store.tx_begin_read ());
 		source = get_random_account (accounts_a);
 		amount = get_random_amount (transaction, node_a, source);
 	}
@@ -292,11 +320,11 @@ void rai::system::generate_send_new (rai::node & node_a, std::vector<rai::accoun
 	}
 }
 
-void rai::system::generate_mass_activity (uint32_t count_a, rai::node & node_a)
+void badem::system::generate_mass_activity (uint32_t count_a, badem::node & node_a)
 {
-	std::vector<rai::account> accounts;
-	wallet (0)->insert_adhoc (rai::test_genesis_key.prv);
-	accounts.push_back (rai::test_genesis_key.pub);
+	std::vector<badem::account> accounts;
+	wallet (0)->insert_adhoc (badem::test_genesis_key.prv);
+	accounts.push_back (badem::test_genesis_key.pub);
 	auto previous (std::chrono::steady_clock::now ());
 	for (uint32_t i (0); i < count_a; ++i)
 	{
@@ -307,10 +335,10 @@ void rai::system::generate_mass_activity (uint32_t count_a, rai::node & node_a)
 			uint64_t count (0);
 			uint64_t state (0);
 			{
-				rai::transaction transaction (node_a.store.environment, nullptr, false);
+				auto transaction (node_a.store.tx_begin_read ());
 				auto block_counts (node_a.store.block_count (transaction));
 				count = block_counts.sum ();
-				state = block_counts.state;
+				state = block_counts.state_v0 + block_counts.state_v1;
 			}
 			std::cerr << boost::str (boost::format ("Mass activity iteration %1% us %2% us/t %3% state: %4% old: %5%\n") % i % us % (us / 256) % state % (count - state));
 			previous = now;
@@ -319,7 +347,7 @@ void rai::system::generate_mass_activity (uint32_t count_a, rai::node & node_a)
 	}
 }
 
-void rai::system::stop ()
+void badem::system::stop ()
 {
 	for (auto i : nodes)
 	{
@@ -328,11 +356,11 @@ void rai::system::stop ()
 	work.stop ();
 }
 
-rai::landing_store::landing_store ()
+badem::landing_store::landing_store ()
 {
 }
 
-rai::landing_store::landing_store (rai::account const & source_a, rai::account const & destination_a, uint64_t start_a, uint64_t last_a) :
+badem::landing_store::landing_store (badem::account const & source_a, badem::account const & destination_a, uint64_t start_a, uint64_t last_a) :
 source (source_a),
 destination (destination_a),
 start (start_a),
@@ -340,12 +368,12 @@ last (last_a)
 {
 }
 
-rai::landing_store::landing_store (bool & error_a, std::istream & stream_a)
+badem::landing_store::landing_store (bool & error_a, std::istream & stream_a)
 {
 	error_a = deserialize (stream_a);
 }
 
-bool rai::landing_store::deserialize (std::istream & stream_a)
+bool badem::landing_store::deserialize (std::istream & stream_a)
 {
 	bool result;
 	try
@@ -378,7 +406,7 @@ bool rai::landing_store::deserialize (std::istream & stream_a)
 	return result;
 }
 
-void rai::landing_store::serialize (std::ostream & stream_a) const
+void badem::landing_store::serialize (std::ostream & stream_a) const
 {
 	boost::property_tree::ptree tree;
 	tree.put ("source", source.to_account ());
@@ -388,12 +416,12 @@ void rai::landing_store::serialize (std::ostream & stream_a) const
 	boost::property_tree::write_json (stream_a, tree);
 }
 
-bool rai::landing_store::operator== (rai::landing_store const & other_a) const
+bool badem::landing_store::operator== (badem::landing_store const & other_a) const
 {
 	return source == other_a.source && destination == other_a.destination && start == other_a.start && last == other_a.last;
 }
 
-rai::landing::landing (rai::node & node_a, std::shared_ptr<rai::wallet> wallet_a, rai::landing_store & store_a, boost::filesystem::path const & path_a) :
+badem::landing::landing (badem::node & node_a, std::shared_ptr<badem::wallet> wallet_a, badem::landing_store & store_a, boost::filesystem::path const & path_a) :
 path (path_a),
 store (store_a),
 wallet (wallet_a),
@@ -401,7 +429,7 @@ node (node_a)
 {
 }
 
-void rai::landing::write_store ()
+void badem::landing::write_store ()
 {
 	std::ofstream store_file;
 	store_file.open (path.string ());
@@ -417,45 +445,45 @@ void rai::landing::write_store ()
 	}
 }
 
-rai::uint128_t rai::landing::distribution_amount (uint64_t interval)
+badem::uint128_t badem::landing::distribution_amount (uint64_t interval)
 {
 	// Halving period ~= Exponent of 2 in seconds approximately 1 year = 2^25 = 33554432
 	// Interval = Exponent of 2 in seconds approximately 1 minute = 2^10 = 64
 	uint64_t intervals_per_period (1 << (25 - interval_exponent));
-	rai::uint128_t result;
+	badem::uint128_t result;
 	if (interval < intervals_per_period * 1)
 	{
 		// Total supply / 2^halving period / intervals per period
 		// 2^128 / 2^1 / (2^25 / 2^10)
-		result = rai::uint128_t (1) << (127 - (25 - interval_exponent)); // 50%
+		result = badem::uint128_t (1) << (127 - (25 - interval_exponent)); // 50%
 	}
 	else if (interval < intervals_per_period * 2)
 	{
-		result = rai::uint128_t (1) << (126 - (25 - interval_exponent)); // 25%
+		result = badem::uint128_t (1) << (126 - (25 - interval_exponent)); // 25%
 	}
 	else if (interval < intervals_per_period * 3)
 	{
-		result = rai::uint128_t (1) << (125 - (25 - interval_exponent)); // 13%
+		result = badem::uint128_t (1) << (125 - (25 - interval_exponent)); // 13%
 	}
 	else if (interval < intervals_per_period * 4)
 	{
-		result = rai::uint128_t (1) << (124 - (25 - interval_exponent)); // 6.3%
+		result = badem::uint128_t (1) << (124 - (25 - interval_exponent)); // 6.3%
 	}
 	else if (interval < intervals_per_period * 5)
 	{
-		result = rai::uint128_t (1) << (123 - (25 - interval_exponent)); // 3.1%
+		result = badem::uint128_t (1) << (123 - (25 - interval_exponent)); // 3.1%
 	}
 	else if (interval < intervals_per_period * 6)
 	{
-		result = rai::uint128_t (1) << (122 - (25 - interval_exponent)); // 1.6%
+		result = badem::uint128_t (1) << (122 - (25 - interval_exponent)); // 1.6%
 	}
 	else if (interval < intervals_per_period * 7)
 	{
-		result = rai::uint128_t (1) << (121 - (25 - interval_exponent)); // 0.8%
+		result = badem::uint128_t (1) << (121 - (25 - interval_exponent)); // 0.8%
 	}
 	else if (interval < intervals_per_period * 8)
 	{
-		result = rai::uint128_t (1) << (121 - (25 - interval_exponent)); // 0.8*
+		result = badem::uint128_t (1) << (121 - (25 - interval_exponent)); // 0.8*
 	}
 	else
 	{
@@ -464,10 +492,10 @@ rai::uint128_t rai::landing::distribution_amount (uint64_t interval)
 	return result;
 }
 
-void rai::landing::distribute_one ()
+void badem::landing::distribute_one ()
 {
-	auto now (rai::seconds_since_epoch ());
-	rai::block_hash last (1);
+	auto now (badem::seconds_since_epoch ());
+	badem::block_hash last (1);
 	while (!last.is_zero () && store.last + distribution_interval.count () < now)
 	{
 		auto amount (distribution_amount ((store.last - store.start) >> interval_exponent));
@@ -485,12 +513,12 @@ void rai::landing::distribute_one ()
 	}
 }
 
-void rai::landing::distribute_ongoing ()
+void badem::landing::distribute_ongoing ()
 {
 	distribute_one ();
 	BOOST_LOG (node.log) << "Waiting for next distribution cycle";
 	node.alarm.add (std::chrono::steady_clock::now () + sleep_seconds, [this]() { distribute_ongoing (); });
 }
 
-std::chrono::seconds constexpr rai::landing::distribution_interval;
-std::chrono::seconds constexpr rai::landing::sleep_seconds;
+std::chrono::seconds constexpr badem::landing::distribution_interval;
+std::chrono::seconds constexpr badem::landing::sleep_seconds;

@@ -1,13 +1,16 @@
 #pragma once
 
+#include <badem/lib/errors.hpp>
 #include <badem/lib/numbers.hpp>
+#include <badem/lib/utility.hpp>
 
-#include <assert.h>
-#include <blake2/blake2.h>
 #include <boost/property_tree/json_parser.hpp>
+#include <cassert>
+#include <crypto/blake2/blake2.h>
 #include <streambuf>
+#include <unordered_map>
 
-namespace rai
+namespace badem
 {
 std::string to_string_hex (uint64_t);
 bool from_string_hex (std::string const &, uint64_t &);
@@ -15,16 +18,27 @@ bool from_string_hex (std::string const &, uint64_t &);
 using stream = std::basic_streambuf<uint8_t>;
 // Read a raw byte stream the size of `T' and fill value.
 template <typename T>
-bool read (rai::stream & stream_a, T & value)
+bool try_read (badem::stream & stream_a, T & value)
 {
-	static_assert (std::is_pod<T>::value, "Can't stream read non-standard layout types");
+	static_assert (std::is_standard_layout<T>::value, "Can't stream read non-standard layout types");
 	auto amount_read (stream_a.sgetn (reinterpret_cast<uint8_t *> (&value), sizeof (value)));
 	return amount_read != sizeof (value);
 }
+// A wrapper of try_read which throws if there is an error
 template <typename T>
-void write (rai::stream & stream_a, T const & value)
+void read (badem::stream & stream_a, T & value)
 {
-	static_assert (std::is_pod<T>::value, "Can't stream write non-standard layout types");
+	auto error = try_read (stream_a, value);
+	if (error)
+	{
+		throw std::runtime_error ("Failed to read type");
+	}
+}
+
+template <typename T>
+void write (badem::stream & stream_a, T const & value)
+{
+	static_assert (std::is_standard_layout<T>::value, "Can't stream write non-standard layout types");
 	auto amount_written (stream_a.sputn (reinterpret_cast<uint8_t const *> (&value), sizeof (value)));
 	assert (amount_written == sizeof (value));
 }
@@ -43,260 +57,299 @@ class block
 {
 public:
 	// Return a digest of the hashables in this block.
-	rai::block_hash hash () const;
-	std::string to_json ();
+	badem::block_hash hash () const;
+	// Return a digest of hashables and non-hashables in this block.
+	badem::block_hash full_hash () const;
+	std::string to_json () const;
 	virtual void hash (blake2b_state &) const = 0;
 	virtual uint64_t block_work () const = 0;
 	virtual void block_work_set (uint64_t) = 0;
+	virtual badem::account account () const;
 	// Previous block in account's chain, zero for open block
-	virtual rai::block_hash previous () const = 0;
+	virtual badem::block_hash previous () const = 0;
 	// Source block for open/receive blocks, zero otherwise.
-	virtual rai::block_hash source () const = 0;
+	virtual badem::block_hash source () const;
 	// Previous block or account number for open blocks
-	virtual rai::block_hash root () const = 0;
-	virtual rai::account representative () const = 0;
-	virtual void serialize (rai::stream &) const = 0;
+	virtual badem::block_hash root () const = 0;
+	// Link field for state blocks, zero otherwise.
+	virtual badem::block_hash link () const;
+	virtual badem::account representative () const;
+	virtual void serialize (badem::stream &) const = 0;
 	virtual void serialize_json (std::string &) const = 0;
-	virtual void visit (rai::block_visitor &) const = 0;
-	virtual bool operator== (rai::block const &) const = 0;
-	virtual rai::block_type type () const = 0;
-	virtual rai::signature block_signature () const = 0;
-	virtual void signature_set (rai::uint512_union const &) = 0;
+	virtual void visit (badem::block_visitor &) const = 0;
+	virtual bool operator== (badem::block const &) const = 0;
+	virtual badem::block_type type () const = 0;
+	virtual badem::signature block_signature () const = 0;
+	virtual void signature_set (badem::uint512_union const &) = 0;
 	virtual ~block () = default;
-	virtual bool valid_predecessor (rai::block const &) const = 0;
+	virtual bool valid_predecessor (badem::block const &) const = 0;
+	static size_t size (badem::block_type);
 };
 class send_hashables
 {
 public:
-	send_hashables (rai::account const &, rai::block_hash const &, rai::amount const &);
-	send_hashables (bool &, rai::stream &);
+	send_hashables () = default;
+	send_hashables (badem::account const &, badem::block_hash const &, badem::amount const &);
+	send_hashables (bool &, badem::stream &);
 	send_hashables (bool &, boost::property_tree::ptree const &);
 	void hash (blake2b_state &) const;
-	rai::block_hash previous;
-	rai::account destination;
-	rai::amount balance;
+	badem::block_hash previous;
+	badem::account destination;
+	badem::amount balance;
+	static size_t constexpr size = sizeof (previous) + sizeof (destination) + sizeof (balance);
 };
-class send_block : public rai::block
+class send_block : public badem::block
 {
 public:
-	send_block (rai::block_hash const &, rai::account const &, rai::amount const &, rai::raw_key const &, rai::public_key const &, uint64_t);
-	send_block (bool &, rai::stream &);
+	send_block () = default;
+	send_block (badem::block_hash const &, badem::account const &, badem::amount const &, badem::raw_key const &, badem::public_key const &, uint64_t);
+	send_block (bool &, badem::stream &);
 	send_block (bool &, boost::property_tree::ptree const &);
 	virtual ~send_block () = default;
-	using rai::block::hash;
+	using badem::block::hash;
 	void hash (blake2b_state &) const override;
 	uint64_t block_work () const override;
 	void block_work_set (uint64_t) override;
-	rai::block_hash previous () const override;
-	rai::block_hash source () const override;
-	rai::block_hash root () const override;
-	rai::account representative () const override;
-	void serialize (rai::stream &) const override;
+	badem::block_hash previous () const override;
+	badem::block_hash root () const override;
+	void serialize (badem::stream &) const override;
+	bool deserialize (badem::stream &);
 	void serialize_json (std::string &) const override;
-	bool deserialize (rai::stream &);
 	bool deserialize_json (boost::property_tree::ptree const &);
-	void visit (rai::block_visitor &) const override;
-	rai::block_type type () const override;
-	rai::signature block_signature () const override;
-	void signature_set (rai::uint512_union const &) override;
-	bool operator== (rai::block const &) const override;
-	bool operator== (rai::send_block const &) const;
-	bool valid_predecessor (rai::block const &) const override;
-	static size_t constexpr size = sizeof (rai::account) + sizeof (rai::block_hash) + sizeof (rai::amount) + sizeof (rai::signature) + sizeof (uint64_t);
+	void visit (badem::block_visitor &) const override;
+	badem::block_type type () const override;
+	badem::signature block_signature () const override;
+	void signature_set (badem::uint512_union const &) override;
+	bool operator== (badem::block const &) const override;
+	bool operator== (badem::send_block const &) const;
+	bool valid_predecessor (badem::block const &) const override;
 	send_hashables hashables;
-	rai::signature signature;
+	badem::signature signature;
 	uint64_t work;
+	static size_t constexpr size = badem::send_hashables::size + sizeof (signature) + sizeof (work);
 };
 class receive_hashables
 {
 public:
-	receive_hashables (rai::block_hash const &, rai::block_hash const &);
-	receive_hashables (bool &, rai::stream &);
+	receive_hashables () = default;
+	receive_hashables (badem::block_hash const &, badem::block_hash const &);
+	receive_hashables (bool &, badem::stream &);
 	receive_hashables (bool &, boost::property_tree::ptree const &);
 	void hash (blake2b_state &) const;
-	rai::block_hash previous;
-	rai::block_hash source;
+	badem::block_hash previous;
+	badem::block_hash source;
+	static size_t constexpr size = sizeof (previous) + sizeof (source);
 };
-class receive_block : public rai::block
+class receive_block : public badem::block
 {
 public:
-	receive_block (rai::block_hash const &, rai::block_hash const &, rai::raw_key const &, rai::public_key const &, uint64_t);
-	receive_block (bool &, rai::stream &);
+	receive_block () = default;
+	receive_block (badem::block_hash const &, badem::block_hash const &, badem::raw_key const &, badem::public_key const &, uint64_t);
+	receive_block (bool &, badem::stream &);
 	receive_block (bool &, boost::property_tree::ptree const &);
 	virtual ~receive_block () = default;
-	using rai::block::hash;
+	using badem::block::hash;
 	void hash (blake2b_state &) const override;
 	uint64_t block_work () const override;
 	void block_work_set (uint64_t) override;
-	rai::block_hash previous () const override;
-	rai::block_hash source () const override;
-	rai::block_hash root () const override;
-	rai::account representative () const override;
-	void serialize (rai::stream &) const override;
+	badem::block_hash previous () const override;
+	badem::block_hash source () const override;
+	badem::block_hash root () const override;
+	void serialize (badem::stream &) const override;
+	bool deserialize (badem::stream &);
 	void serialize_json (std::string &) const override;
-	bool deserialize (rai::stream &);
 	bool deserialize_json (boost::property_tree::ptree const &);
-	void visit (rai::block_visitor &) const override;
-	rai::block_type type () const override;
-	rai::signature block_signature () const override;
-	void signature_set (rai::uint512_union const &) override;
-	bool operator== (rai::block const &) const override;
-	bool operator== (rai::receive_block const &) const;
-	bool valid_predecessor (rai::block const &) const override;
-	static size_t constexpr size = sizeof (rai::block_hash) + sizeof (rai::block_hash) + sizeof (rai::signature) + sizeof (uint64_t);
+	void visit (badem::block_visitor &) const override;
+	badem::block_type type () const override;
+	badem::signature block_signature () const override;
+	void signature_set (badem::uint512_union const &) override;
+	bool operator== (badem::block const &) const override;
+	bool operator== (badem::receive_block const &) const;
+	bool valid_predecessor (badem::block const &) const override;
 	receive_hashables hashables;
-	rai::signature signature;
+	badem::signature signature;
 	uint64_t work;
+	static size_t constexpr size = badem::receive_hashables::size + sizeof (signature) + sizeof (work);
 };
 class open_hashables
 {
 public:
-	open_hashables (rai::block_hash const &, rai::account const &, rai::account const &);
-	open_hashables (bool &, rai::stream &);
+	open_hashables () = default;
+	open_hashables (badem::block_hash const &, badem::account const &, badem::account const &);
+	open_hashables (bool &, badem::stream &);
 	open_hashables (bool &, boost::property_tree::ptree const &);
 	void hash (blake2b_state &) const;
-	rai::block_hash source;
-	rai::account representative;
-	rai::account account;
+	badem::block_hash source;
+	badem::account representative;
+	badem::account account;
+	static size_t constexpr size = sizeof (source) + sizeof (representative) + sizeof (account);
 };
-class open_block : public rai::block
+class open_block : public badem::block
 {
 public:
-	open_block (rai::block_hash const &, rai::account const &, rai::account const &, rai::raw_key const &, rai::public_key const &, uint64_t);
-	open_block (rai::block_hash const &, rai::account const &, rai::account const &, std::nullptr_t);
-	open_block (bool &, rai::stream &);
+	open_block () = default;
+	open_block (badem::block_hash const &, badem::account const &, badem::account const &, badem::raw_key const &, badem::public_key const &, uint64_t);
+	open_block (badem::block_hash const &, badem::account const &, badem::account const &, std::nullptr_t);
+	open_block (bool &, badem::stream &);
 	open_block (bool &, boost::property_tree::ptree const &);
 	virtual ~open_block () = default;
-	using rai::block::hash;
+	using badem::block::hash;
 	void hash (blake2b_state &) const override;
 	uint64_t block_work () const override;
 	void block_work_set (uint64_t) override;
-	rai::block_hash previous () const override;
-	rai::block_hash source () const override;
-	rai::block_hash root () const override;
-	rai::account representative () const override;
-	void serialize (rai::stream &) const override;
+	badem::block_hash previous () const override;
+	badem::account account () const override;
+	badem::block_hash source () const override;
+	badem::block_hash root () const override;
+	badem::account representative () const override;
+	void serialize (badem::stream &) const override;
+	bool deserialize (badem::stream &);
 	void serialize_json (std::string &) const override;
-	bool deserialize (rai::stream &);
 	bool deserialize_json (boost::property_tree::ptree const &);
-	void visit (rai::block_visitor &) const override;
-	rai::block_type type () const override;
-	rai::signature block_signature () const override;
-	void signature_set (rai::uint512_union const &) override;
-	bool operator== (rai::block const &) const override;
-	bool operator== (rai::open_block const &) const;
-	bool valid_predecessor (rai::block const &) const override;
-	static size_t constexpr size = sizeof (rai::block_hash) + sizeof (rai::account) + sizeof (rai::account) + sizeof (rai::signature) + sizeof (uint64_t);
-	rai::open_hashables hashables;
-	rai::signature signature;
+	void visit (badem::block_visitor &) const override;
+	badem::block_type type () const override;
+	badem::signature block_signature () const override;
+	void signature_set (badem::uint512_union const &) override;
+	bool operator== (badem::block const &) const override;
+	bool operator== (badem::open_block const &) const;
+	bool valid_predecessor (badem::block const &) const override;
+	badem::open_hashables hashables;
+	badem::signature signature;
 	uint64_t work;
+	static size_t constexpr size = badem::open_hashables::size + sizeof (signature) + sizeof (work);
 };
 class change_hashables
 {
 public:
-	change_hashables (rai::block_hash const &, rai::account const &);
-	change_hashables (bool &, rai::stream &);
+	change_hashables () = default;
+	change_hashables (badem::block_hash const &, badem::account const &);
+	change_hashables (bool &, badem::stream &);
 	change_hashables (bool &, boost::property_tree::ptree const &);
 	void hash (blake2b_state &) const;
-	rai::block_hash previous;
-	rai::account representative;
+	badem::block_hash previous;
+	badem::account representative;
+	static size_t constexpr size = sizeof (previous) + sizeof (representative);
 };
-class change_block : public rai::block
+class change_block : public badem::block
 {
 public:
-	change_block (rai::block_hash const &, rai::account const &, rai::raw_key const &, rai::public_key const &, uint64_t);
-	change_block (bool &, rai::stream &);
+	change_block () = default;
+	change_block (badem::block_hash const &, badem::account const &, badem::raw_key const &, badem::public_key const &, uint64_t);
+	change_block (bool &, badem::stream &);
 	change_block (bool &, boost::property_tree::ptree const &);
 	virtual ~change_block () = default;
-	using rai::block::hash;
+	using badem::block::hash;
 	void hash (blake2b_state &) const override;
 	uint64_t block_work () const override;
 	void block_work_set (uint64_t) override;
-	rai::block_hash previous () const override;
-	rai::block_hash source () const override;
-	rai::block_hash root () const override;
-	rai::account representative () const override;
-	void serialize (rai::stream &) const override;
+	badem::block_hash previous () const override;
+	badem::block_hash root () const override;
+	badem::account representative () const override;
+	void serialize (badem::stream &) const override;
+	bool deserialize (badem::stream &);
 	void serialize_json (std::string &) const override;
-	bool deserialize (rai::stream &);
 	bool deserialize_json (boost::property_tree::ptree const &);
-	void visit (rai::block_visitor &) const override;
-	rai::block_type type () const override;
-	rai::signature block_signature () const override;
-	void signature_set (rai::uint512_union const &) override;
-	bool operator== (rai::block const &) const override;
-	bool operator== (rai::change_block const &) const;
-	bool valid_predecessor (rai::block const &) const override;
-	static size_t constexpr size = sizeof (rai::block_hash) + sizeof (rai::account) + sizeof (rai::signature) + sizeof (uint64_t);
-	rai::change_hashables hashables;
-	rai::signature signature;
+	void visit (badem::block_visitor &) const override;
+	badem::block_type type () const override;
+	badem::signature block_signature () const override;
+	void signature_set (badem::uint512_union const &) override;
+	bool operator== (badem::block const &) const override;
+	bool operator== (badem::change_block const &) const;
+	bool valid_predecessor (badem::block const &) const override;
+	badem::change_hashables hashables;
+	badem::signature signature;
 	uint64_t work;
+	static size_t constexpr size = badem::change_hashables::size + sizeof (signature) + sizeof (work);
 };
 class state_hashables
 {
 public:
-	state_hashables (rai::account const &, rai::block_hash const &, rai::account const &, rai::amount const &, rai::uint256_union const &);
-	state_hashables (bool &, rai::stream &);
+	state_hashables () = default;
+	state_hashables (badem::account const &, badem::block_hash const &, badem::account const &, badem::amount const &, badem::uint256_union const &);
+	state_hashables (bool &, badem::stream &);
 	state_hashables (bool &, boost::property_tree::ptree const &);
 	void hash (blake2b_state &) const;
 	// Account# / public key that operates this account
 	// Uses:
 	// Bulk signature validation in advance of further ledger processing
 	// Arranging uncomitted transactions by account
-	rai::account account;
+	badem::account account;
 	// Previous transaction in this chain
-	rai::block_hash previous;
+	badem::block_hash previous;
 	// Representative of this account
-	rai::account representative;
+	badem::account representative;
 	// Current balance of this account
 	// Allows lookup of account balance simply by looking at the head block
-	rai::amount balance;
+	badem::amount balance;
 	// Link field contains source block_hash if receiving, destination account if sending
-	rai::uint256_union link;
+	badem::uint256_union link;
+	// Serialized size
+	static size_t constexpr size = sizeof (account) + sizeof (previous) + sizeof (representative) + sizeof (balance) + sizeof (link);
 };
-class state_block : public rai::block
+class state_block : public badem::block
 {
 public:
-	state_block (rai::account const &, rai::block_hash const &, rai::account const &, rai::amount const &, rai::uint256_union const &, rai::raw_key const &, rai::public_key const &, uint64_t);
-	state_block (bool &, rai::stream &);
+	state_block () = default;
+	state_block (badem::account const &, badem::block_hash const &, badem::account const &, badem::amount const &, badem::uint256_union const &, badem::raw_key const &, badem::public_key const &, uint64_t);
+	state_block (bool &, badem::stream &);
 	state_block (bool &, boost::property_tree::ptree const &);
 	virtual ~state_block () = default;
-	using rai::block::hash;
+	using badem::block::hash;
 	void hash (blake2b_state &) const override;
 	uint64_t block_work () const override;
 	void block_work_set (uint64_t) override;
-	rai::block_hash previous () const override;
-	rai::block_hash source () const override;
-	rai::block_hash root () const override;
-	rai::account representative () const override;
-	void serialize (rai::stream &) const override;
+	badem::block_hash previous () const override;
+	badem::account account () const override;
+	badem::block_hash root () const override;
+	badem::block_hash link () const override;
+	badem::account representative () const override;
+	void serialize (badem::stream &) const override;
+	bool deserialize (badem::stream &);
 	void serialize_json (std::string &) const override;
-	bool deserialize (rai::stream &);
 	bool deserialize_json (boost::property_tree::ptree const &);
-	void visit (rai::block_visitor &) const override;
-	rai::block_type type () const override;
-	rai::signature block_signature () const override;
-	void signature_set (rai::uint512_union const &) override;
-	bool operator== (rai::block const &) const override;
-	bool operator== (rai::state_block const &) const;
-	bool valid_predecessor (rai::block const &) const override;
-	static size_t constexpr size = sizeof (rai::account) + sizeof (rai::block_hash) + sizeof (rai::account) + sizeof (rai::amount) + sizeof (rai::uint256_union) + sizeof (rai::signature) + sizeof (uint64_t);
-	rai::state_hashables hashables;
-	rai::signature signature;
+	void visit (badem::block_visitor &) const override;
+	badem::block_type type () const override;
+	badem::signature block_signature () const override;
+	void signature_set (badem::uint512_union const &) override;
+	bool operator== (badem::block const &) const override;
+	bool operator== (badem::state_block const &) const;
+	bool valid_predecessor (badem::block const &) const override;
+	badem::state_hashables hashables;
+	badem::signature signature;
 	uint64_t work;
+	static size_t constexpr size = badem::state_hashables::size + sizeof (signature) + sizeof (work);
 };
 class block_visitor
 {
 public:
-	virtual void send_block (rai::send_block const &) = 0;
-	virtual void receive_block (rai::receive_block const &) = 0;
-	virtual void open_block (rai::open_block const &) = 0;
-	virtual void change_block (rai::change_block const &) = 0;
-	virtual void state_block (rai::state_block const &) = 0;
+	virtual void send_block (badem::send_block const &) = 0;
+	virtual void receive_block (badem::receive_block const &) = 0;
+	virtual void open_block (badem::open_block const &) = 0;
+	virtual void change_block (badem::change_block const &) = 0;
+	virtual void state_block (badem::state_block const &) = 0;
 	virtual ~block_visitor () = default;
 };
-std::unique_ptr<rai::block> deserialize_block (rai::stream &);
-std::unique_ptr<rai::block> deserialize_block (rai::stream &, rai::block_type);
-std::unique_ptr<rai::block> deserialize_block_json (boost::property_tree::ptree const &);
-void serialize_block (rai::stream &, rai::block const &);
+/**
+ * This class serves to find and return unique variants of a block in order to minimize memory usage
+ */
+class block_uniquer
+{
+public:
+	using value_type = std::pair<const badem::uint256_union, std::weak_ptr<badem::block>>;
+
+	std::shared_ptr<badem::block> unique (std::shared_ptr<badem::block>);
+	size_t size ();
+
+private:
+	std::mutex mutex;
+	std::unordered_map<std::remove_const_t<value_type::first_type>, value_type::second_type> blocks;
+	static unsigned constexpr cleanup_count = 2;
+};
+
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (block_uniquer & block_uniquer, const std::string & name);
+
+std::shared_ptr<badem::block> deserialize_block (badem::stream &, badem::block_uniquer * = nullptr);
+std::shared_ptr<badem::block> deserialize_block (badem::stream &, badem::block_type, badem::block_uniquer * = nullptr);
+std::shared_ptr<badem::block> deserialize_block_json (boost::property_tree::ptree const &, badem::block_uniquer * = nullptr);
+void serialize_block (badem::stream &, badem::block const &);
 }

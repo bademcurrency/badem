@@ -56,7 +56,7 @@ action (action_a)
 {
 }
 
-badem_qt::self_pane::self_pane (badem_qt::wallet & wallet_a, rai::account const & account_a) :
+badem_qt::self_pane::self_pane (badem_qt::wallet & wallet_a, badem::account const & account_a) :
 window (new QWidget),
 layout (new QVBoxLayout),
 self_layout (new QHBoxLayout),
@@ -72,7 +72,23 @@ balance_label (new QLabel),
 wallet (wallet_a)
 {
 	your_account_label->setStyleSheet ("font-weight: bold;");
-	version = new QLabel (boost::str (boost::format ("Version %1%.%2%") % BADEM_VERSION_MAJOR % BADEM_VERSION_MINOR).c_str ());
+	std::string network = "Live";
+	if (badem::is_beta_network)
+	{
+		network = "Beta";
+	}
+	else if (badem::is_test_network)
+	{
+		network = "Test";
+	}
+	if (BADEM_VERSION_PATCH == 0)
+	{
+		version = new QLabel (boost::str (boost::format ("Version %1% %2% network") % BADEM_MAJOR_MINOR_VERSION % network).c_str ());
+	}
+	else
+	{
+		version = new QLabel (boost::str (boost::format ("Version %1% %2% network") % BADEM_MAJOR_MINOR_RC_VERSION % network).c_str ());
+	}
 	self_layout->addWidget (your_account_label);
 	self_layout->addStretch ();
 	self_layout->addWidget (version);
@@ -106,20 +122,19 @@ wallet (wallet_a)
 	});
 }
 
-void badem_qt::self_pane::refresh_balance ()
+void badem_qt::self_pane::set_balance_text (std::pair<badem::uint128_t, badem::uint128_t> balance_a)
 {
-	auto balance (wallet.node.balance_pending (wallet.account));
-	auto final_text (std::string ("Balance: ") + wallet.format_balance (balance.first));
-	if (!balance.second.is_zero ())
+	auto final_text (std::string ("Balance: ") + wallet.format_balance (balance_a.first));
+	if (!balance_a.second.is_zero ())
 	{
-		final_text += "\nPending: " + wallet.format_balance (balance.second);
+		final_text += "\nPending: " + wallet.format_balance (balance_a.second);
 	}
 	wallet.self.balance_label->setText (QString (final_text.c_str ()));
 }
 
 badem_qt::accounts::accounts (badem_qt::wallet & wallet_a) :
-window (new QWidget),
 wallet_balance_label (new QLabel),
+window (new QWidget),
 layout (new QVBoxLayout),
 model (new QStandardItemModel),
 view (new QTableView),
@@ -153,6 +168,7 @@ wallet (wallet_a)
 	layout->addWidget (account_key_button);
 	layout->addWidget (back);
 	window->setLayout (layout);
+
 	QObject::connect (use_account, &QPushButton::released, [this]() {
 		auto selection (view->selectionModel ()->selection ().indexes ());
 		if (selection.size () == 1)
@@ -165,7 +181,7 @@ wallet (wallet_a)
 	QObject::connect (account_key_button, &QPushButton::released, [this]() {
 		QString key_text_wide (account_key_line->text ());
 		std::string key_text (key_text_wide.toLocal8Bit ());
-		rai::raw_key key;
+		badem::raw_key key;
 		if (!key.data.decode_hex (key_text))
 		{
 			show_line_ok (*account_key_line);
@@ -184,7 +200,7 @@ wallet (wallet_a)
 		this->wallet.pop_main_stack ();
 	});
 	QObject::connect (create_account, &QPushButton::released, [this]() {
-		rai::transaction transaction (this->wallet.wallet_m->store.environment, nullptr, true);
+		auto transaction (this->wallet.wallet_m->wallets.tx_begin_write ());
 		if (this->wallet.wallet_m->store.valid_password (transaction))
 		{
 			this->wallet.wallet_m->deterministic_insert (transaction);
@@ -214,8 +230,8 @@ wallet (wallet_a)
 		this->wallet.push_main_stack (this->wallet.import.window);
 	});
 	QObject::connect (backup_seed, &QPushButton::released, [this]() {
-		rai::raw_key seed;
-		rai::transaction transaction (this->wallet.wallet_m->store.environment, nullptr, false);
+		badem::raw_key seed;
+		auto transaction (this->wallet.wallet_m->wallets.tx_begin_read ());
 		if (this->wallet.wallet_m->store.valid_password (transaction))
 		{
 			this->wallet.wallet_m->store.seed (seed, transaction);
@@ -242,19 +258,25 @@ wallet (wallet_a)
 			});
 		}
 	});
+	QObject::connect (account_key_line, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = account_key_line->cursorPosition ();
+		account_key_line->setText (value.trimmed ());
+		account_key_line->setCursorPosition (pos);
+	});
 	refresh_wallet_balance ();
 }
 
 void badem_qt::accounts::refresh_wallet_balance ()
 {
-	rai::transaction transaction (this->wallet.wallet_m->store.environment, nullptr, false);
-	rai::uint128_t balance (0);
-	rai::uint128_t pending (0);
+	auto transaction (this->wallet.wallet_m->wallets.tx_begin_read ());
+	auto block_transaction (this->wallet.node.store.tx_begin_read ());
+	badem::uint128_t balance (0);
+	badem::uint128_t pending (0);
 	for (auto i (this->wallet.wallet_m->store.begin (transaction)), j (this->wallet.wallet_m->store.end ()); i != j; ++i)
 	{
-		rai::public_key key (i->first.uint256 ());
-		balance = balance + (this->wallet.node.ledger.account_balance (transaction, key));
-		pending = pending + (this->wallet.node.ledger.account_pending (transaction, key));
+		badem::public_key key (i->first);
+		balance = balance + (this->wallet.node.ledger.account_balance (block_transaction, key));
+		pending = pending + (this->wallet.node.ledger.account_pending (block_transaction, key));
 	}
 	auto final_text (std::string ("Balance: ") + wallet.format_balance (balance));
 	if (!pending.is_zero ())
@@ -272,16 +294,17 @@ void badem_qt::accounts::refresh_wallet_balance ()
 void badem_qt::accounts::refresh ()
 {
 	model->removeRows (0, model->rowCount ());
-	rai::transaction transaction (wallet.wallet_m->store.environment, nullptr, false);
+	auto transaction (wallet.wallet_m->wallets.tx_begin_read ());
+	auto block_transaction (this->wallet.node.store.tx_begin_read ());
 	QBrush brush;
 	for (auto i (wallet.wallet_m->store.begin (transaction)), j (wallet.wallet_m->store.end ()); i != j; ++i)
 	{
-		rai::public_key key (i->first.uint256 ());
-		auto balance_amount (wallet.node.ledger.account_balance (transaction, key));
+		badem::public_key key (i->first);
+		auto balance_amount (wallet.node.ledger.account_balance (block_transaction, key));
 		bool display (true);
 		switch (wallet.wallet_m->store.key_type (i->second))
 		{
-			case rai::key_type::adhoc:
+			case badem::key_type::adhoc:
 			{
 				brush.setColor ("red");
 				display = !balance_amount.is_zero ();
@@ -370,16 +393,21 @@ wallet (wallet_a)
 		if (clear_line->text ().toStdString () == "clear keys")
 		{
 			show_line_ok (*clear_line);
-			rai::raw_key seed_l;
+			badem::raw_key seed_l;
 			if (!seed_l.data.decode_hex (seed->text ().toStdString ()))
 			{
 				bool successful (false);
 				{
-					rai::transaction transaction (this->wallet.wallet_m->store.environment, nullptr, true);
+					auto transaction (this->wallet.wallet_m->wallets.tx_begin_write ());
 					if (this->wallet.wallet_m->store.valid_password (transaction))
 					{
 						this->wallet.account = this->wallet.wallet_m->change_seed (transaction, seed_l);
 						successful = true;
+						// Pending check for accounts to restore if bootstrap is in progress
+						if (this->wallet.node.bootstrap_initiator.in_progress ())
+						{
+							this->wallet.needs_deterministic_restore = true;
+						}
 					}
 					else
 					{
@@ -444,9 +472,19 @@ wallet (wallet_a)
 			});
 		}
 	});
+	QObject::connect (seed, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = seed->cursorPosition ();
+		seed->setText (value.trimmed ());
+		seed->setCursorPosition (pos);
+	});
+	QObject::connect (filename, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = filename->cursorPosition ();
+		filename->setText (value.trimmed ());
+		filename->setCursorPosition (pos);
+	});
 }
 
-badem_qt::history::history (rai::ledger & ledger_a, rai::account const & account_a, badem_qt::wallet & wallet_a) :
+badem_qt::history::history (badem::ledger & ledger_a, badem::account const & account_a, badem_qt::wallet & wallet_a) :
 window (new QWidget),
 layout (new QVBoxLayout),
 model (new QStandardItemModel),
@@ -481,80 +519,87 @@ wallet (wallet_a)
 
 namespace
 {
-class short_text_visitor : public rai::block_visitor
+class short_text_visitor : public badem::block_visitor
 {
 public:
-	short_text_visitor (MDB_txn * transaction_a, rai::ledger & ledger_a) :
+	short_text_visitor (badem::transaction const & transaction_a, badem::ledger & ledger_a) :
 	transaction (transaction_a),
 	ledger (ledger_a)
 	{
 	}
-	void send_block (rai::send_block const & block_a)
+	void send_block (badem::send_block const & block_a)
 	{
 		type = "Send";
 		account = block_a.hashables.destination;
 		amount = ledger.amount (transaction, block_a.hash ());
 	}
-	void receive_block (rai::receive_block const & block_a)
+	void receive_block (badem::receive_block const & block_a)
 	{
 		type = "Receive";
 		account = ledger.account (transaction, block_a.source ());
 		amount = ledger.amount (transaction, block_a.source ());
 	}
-	void open_block (rai::open_block const & block_a)
+	void open_block (badem::open_block const & block_a)
 	{
 		type = "Receive";
-		if (block_a.hashables.source != rai::genesis_account)
+		if (block_a.hashables.source != badem::genesis_account)
 		{
 			account = ledger.account (transaction, block_a.hashables.source);
 			amount = ledger.amount (transaction, block_a.hash ());
 		}
 		else
 		{
-			account = rai::genesis_account;
-			amount = rai::genesis_amount;
+			account = badem::genesis_account;
+			amount = badem::genesis_amount;
 		}
 	}
-	void change_block (rai::change_block const & block_a)
+	void change_block (badem::change_block const & block_a)
 	{
 		type = "Change";
 		amount = 0;
 		account = block_a.hashables.representative;
 	}
-	void state_block (rai::state_block const & block_a)
+	void state_block (badem::state_block const & block_a)
 	{
 		auto balance (block_a.hashables.balance.number ());
 		auto previous_balance (ledger.balance (transaction, block_a.hashables.previous));
-		account = block_a.hashables.account;
 		if (balance < previous_balance)
 		{
 			type = "Send";
 			amount = previous_balance - balance;
+			account = block_a.hashables.link;
 		}
 		else
 		{
 			if (block_a.hashables.link.is_zero ())
 			{
 				type = "Change";
+				account = block_a.hashables.representative;
+			}
+			else if (balance == previous_balance && !ledger.epoch_link.is_zero () && ledger.is_epoch_link (block_a.hashables.link))
+			{
+				type = "Epoch";
+				account = ledger.epoch_signer;
 			}
 			else
 			{
 				type = "Receive";
+				account = ledger.account (transaction, block_a.hashables.link);
 			}
 			amount = balance - previous_balance;
 		}
 	}
-	MDB_txn * transaction;
-	rai::ledger & ledger;
+	badem::transaction const & transaction;
+	badem::ledger & ledger;
 	std::string type;
-	rai::uint128_t amount;
-	rai::account account;
+	badem::uint128_t amount;
+	badem::account account;
 };
 }
 
 void badem_qt::history::refresh ()
 {
-	rai::transaction transaction (ledger.store.environment, nullptr, false);
+	auto transaction (ledger.store.tx_begin_read ());
 	model->removeRows (0, model->rowCount ());
 	auto hash (ledger.latest (transaction, account));
 	short_text_visitor visitor (transaction, ledger);
@@ -604,10 +649,10 @@ wallet (wallet_a)
 		this->wallet.pop_main_stack ();
 	});
 	QObject::connect (retrieve, &QPushButton::released, [this]() {
-		rai::block_hash hash_l;
+		badem::block_hash hash_l;
 		if (!hash_l.decode_hex (hash->text ().toStdString ()))
 		{
-			rai::transaction transaction (this->wallet.node.store.environment, nullptr, false);
+			auto transaction (this->wallet.node.store.tx_begin_read ());
 			auto block_l (this->wallet.node.store.block_get (transaction, hash_l));
 			if (block_l != nullptr)
 			{
@@ -628,11 +673,11 @@ wallet (wallet_a)
 		}
 	});
 	QObject::connect (rebroadcast, &QPushButton::released, [this]() {
-		rai::block_hash block;
+		badem::block_hash block;
 		auto error (block.decode_hex (hash->text ().toStdString ()));
 		if (!error)
 		{
-			rai::transaction transaction (this->wallet.node.store.environment, nullptr, false);
+			auto transaction (this->wallet.node.store.tx_begin_read ());
 			if (this->wallet.node.store.block_exists (transaction, block))
 			{
 				rebroadcast->setEnabled (false);
@@ -642,17 +687,22 @@ wallet (wallet_a)
 			}
 		}
 	});
+	QObject::connect (hash, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = hash->cursorPosition ();
+		hash->setText (value.trimmed ());
+		hash->setCursorPosition (pos);
+	});
 	rebroadcast->setToolTip ("Rebroadcast block into the network");
 }
 
-void badem_qt::block_viewer::rebroadcast_action (rai::uint256_union const & hash_a)
+void badem_qt::block_viewer::rebroadcast_action (badem::uint256_union const & hash_a)
 {
 	auto done (true);
-	rai::transaction transaction (wallet.node.ledger.store.environment, nullptr, false);
+	auto transaction (wallet.node.ledger.store.tx_begin_read ());
 	auto block (wallet.node.store.block_get (transaction, hash_a));
 	if (block != nullptr)
 	{
-		wallet.node.network.republish_block (transaction, std::move (block));
+		wallet.node.network.republish_block (std::move (block));
 		auto successor (wallet.node.store.block_successor (transaction, hash_a));
 		if (!successor.is_zero ())
 		{
@@ -679,7 +729,7 @@ refresh (new QPushButton ("Refresh")),
 balance_window (new QWidget),
 balance_layout (new QHBoxLayout),
 balance_label (new QLabel),
-history (wallet_a.wallet_m->node.ledger, account, wallet_a),
+history (wallet_a.node.ledger, account, wallet_a),
 back (new QPushButton ("Back")),
 account (wallet_a.account),
 wallet (wallet_a)
@@ -705,7 +755,7 @@ wallet (wallet_a)
 			show_line_ok (*account_line);
 			this->history.refresh ();
 			auto balance (this->wallet.node.balance_pending (account));
-			auto final_text (std::string ("Balance (BDM): ") + wallet.format_balance (balance.first));
+			auto final_text (std::string ("Balance (BADEM): ") + wallet.format_balance (balance.first));
 			if (!balance.second.is_zero ())
 			{
 				final_text += "\nPending: " + wallet.format_balance (balance.second);
@@ -718,14 +768,19 @@ wallet (wallet_a)
 			balance_label->clear ();
 		}
 	});
+	QObject::connect (account_line, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = account_line->cursorPosition ();
+		account_line->setText (value.trimmed ());
+		account_line->setCursorPosition (pos);
+	});
 }
 
 badem_qt::stats_viewer::stats_viewer (badem_qt::wallet & wallet_a) :
 window (new QWidget),
 layout (new QVBoxLayout),
+refresh (new QPushButton ("Refresh")),
 model (new QStandardItemModel),
 view (new QTableView),
-refresh (new QPushButton ("Refresh")),
 back (new QPushButton ("Back")),
 wallet (wallet_a)
 {
@@ -777,16 +832,18 @@ void badem_qt::stats_viewer::refresh_stats ()
 				detail = "total";
 			}
 
-			if (type == "traffic")
+			if (type == "traffic" || type == "traffic_bootstrap")
 			{
 				const std::vector<std::string> units = { " bytes", " KB", " MB", " GB", " TB", " PB" };
 				double bytes = std::stod (value);
-				auto index = std::min (units.size () - 1, static_cast<size_t> (std::floor (std::log2 (bytes) / 10)));
+				auto index = bytes == 0 ? 0 : std::min (units.size () - 1, static_cast<size_t> (std::floor (std::log2 (bytes) / 10)));
 				std::string unit = units[index];
 				bytes /= std::pow (1024, index);
 
+				// Only show decimals from MB and up
+				int precision = index < 2 ? 0 : 2;
 				std::stringstream numstream;
-				numstream << std::fixed << std::setprecision (2) << bytes;
+				numstream << std::fixed << std::setprecision (precision) << bytes;
 				value = numstream.str () + unit;
 			}
 
@@ -838,9 +895,9 @@ std::string badem_qt::status::text ()
 	size_t unchecked (0);
 	std::string count_string;
 	{
-		rai::transaction transaction (wallet.wallet_m->node.store.environment, nullptr, false);
-		auto size (wallet.wallet_m->node.store.block_count (transaction));
-		unchecked = wallet.wallet_m->node.store.unchecked_count (transaction);
+		auto transaction (wallet.wallet_m->wallets.node.store.tx_begin_read ());
+		auto size (wallet.wallet_m->wallets.node.store.block_count (transaction));
+		unchecked = wallet.wallet_m->wallets.node.store.unchecked_count (transaction);
 		count_string = std::to_string (size.sum ());
 	}
 
@@ -872,10 +929,10 @@ std::string badem_qt::status::text ()
 			break;
 	}
 
-	result += ", Block: ";
-	if (unchecked != 0 && wallet.wallet_m->node.bootstrap_initiator.in_progress ())
+	result += ", Blocks: ";
+	if (unchecked != 0 && wallet.node.bootstrap_initiator.in_progress ())
 	{
-		count_string += " (" + std::to_string (unchecked) + ")";
+		count_string += ", Queued: " + std::to_string (unchecked);
 	}
 	result += count_string.c_str ();
 
@@ -916,8 +973,8 @@ std::string badem_qt::status::color ()
 	return result;
 }
 
-badem_qt::wallet::wallet (QApplication & application_a, badem_qt::eventloop_processor & processor_a, rai::node & node_a, std::shared_ptr<rai::wallet> wallet_a, rai::account & account_a) :
-rendering_ratio (rai::BDM_ratio),
+badem_qt::wallet::wallet (QApplication & application_a, badem_qt::eventloop_processor & processor_a, badem::node & node_a, std::shared_ptr<badem::wallet> wallet_a, badem::account & account_a) :
+rendering_ratio (badem::BDM_ratio),
 node (node_a),
 wallet_m (wallet_a),
 account (account_a),
@@ -954,13 +1011,14 @@ send_count_label (new QLabel ("Amount:")),
 send_count (new QLineEdit),
 send_blocks_send (new QPushButton ("Send")),
 send_blocks_back (new QPushButton ("Back")),
-active_status (*this)
+active_status (*this),
+needs_deterministic_restore (false)
 {
 	update_connected ();
 	empty_password ();
 	settings.update_locked (true, true);
 	send_blocks_layout->addWidget (send_account_label);
-	send_account->setPlaceholderText (rai::zero_key.pub.to_account ().c_str ());
+	send_account->setPlaceholderText (badem::zero_key.pub.to_account ().c_str ());
 	send_blocks_layout->addWidget (send_account);
 	send_blocks_layout->addWidget (send_count_label);
 	send_count->setPlaceholderText ("0");
@@ -994,15 +1052,61 @@ active_status (*this)
 	client_layout->setSpacing (0);
 	client_layout->setContentsMargins (0, 0, 0, 0);
 	client_window->setLayout (client_layout);
-	client_window->resize (500, 620);
+	client_window->resize (620, 640);
 	client_window->setStyleSheet ("\
 		QLineEdit { padding: 3px; } \
 	");
+	QObject::connect (send_account, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = send_account->cursorPosition ();
+		send_account->setText (value.trimmed ());
+		send_account->setCursorPosition (pos);
+	});
+	QObject::connect (send_count, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = send_count->cursorPosition ();
+		send_count->setText (value.trimmed ());
+		send_count->setCursorPosition (pos);
+	});
 	refresh ();
+}
+
+void badem_qt::wallet::ongoing_refresh ()
+{
+	std::weak_ptr<badem_qt::wallet> wallet_w (shared_from_this ());
+
+	// Update balance if needed. This happens on an alarm thread, which posts back to the UI
+	// to do the actual rendering. This avoid UI lockups as balance_pending may take several
+	// seconds if there's a lot of pending transactions.
+	if (needs_balance_refresh)
+	{
+		needs_balance_refresh = false;
+		auto balance_l (node.balance_pending (account));
+		application.postEvent (&processor, new eventloop_event ([wallet_w, balance_l]() {
+			if (auto this_l = wallet_w.lock ())
+			{
+				this_l->self.set_balance_text (balance_l);
+			}
+		}));
+	}
+
+	// Updates the status line periodically with bootstrap status and block counts.
+	application.postEvent (&processor, new eventloop_event ([wallet_w]() {
+		if (auto this_l = wallet_w.lock ())
+		{
+			this_l->active_status.set_text ();
+		}
+	}));
+
+	node.alarm.add (std::chrono::steady_clock::now () + std::chrono::seconds (5), [wallet_w]() {
+		if (auto wallet_l = wallet_w.lock ())
+		{
+			wallet_l->ongoing_refresh ();
+		}
+	});
 }
 
 void badem_qt::wallet::start ()
 {
+	ongoing_refresh ();
 	std::weak_ptr<badem_qt::wallet> this_w (shared_from_this ());
 	QObject::connect (settings_button, &QPushButton::released, [this_w]() {
 		if (auto this_l = this_w.lock ())
@@ -1027,29 +1131,29 @@ void badem_qt::wallet::start ()
 		{
 			show_line_ok (*this_l->send_count);
 			show_line_ok (*this_l->send_account);
-			rai::amount amount;
+			badem::amount amount;
 			if (!amount.decode_dec (this_l->send_count->text ().toStdString ()))
 			{
-				rai::uint128_t actual (amount.number () * this_l->rendering_ratio);
+				badem::uint128_t actual (amount.number () * this_l->rendering_ratio);
 				if (actual / this_l->rendering_ratio == amount.number ())
 				{
 					QString account_text (this_l->send_account->text ());
 					std::string account_text_narrow (account_text.toLocal8Bit ());
-					rai::account account_l;
+					badem::account account_l;
 					auto parse_error (account_l.decode_account (account_text_narrow));
 					if (!parse_error)
 					{
 						auto balance (this_l->node.balance (this_l->account));
 						if (actual <= balance)
 						{
-							rai::transaction transaction (this_l->wallet_m->store.environment, nullptr, false);
+							auto transaction (this_l->wallet_m->wallets.tx_begin_read ());
 							if (this_l->wallet_m->store.valid_password (transaction))
 							{
 								this_l->send_blocks_send->setEnabled (false);
 								this_l->node.background ([this_w, account_l, actual]() {
 									if (auto this_l = this_w.lock ())
 									{
-										this_l->wallet_m->send_async (this_l->account, account_l, actual, [this_w](std::shared_ptr<rai::block> block_a) {
+										this_l->wallet_m->send_async (this_l->account, account_l, actual, [this_w](std::shared_ptr<badem::block> block_a) {
 											if (auto this_l = this_w.lock ())
 											{
 												auto succeeded (block_a != nullptr);
@@ -1185,7 +1289,7 @@ void badem_qt::wallet::start ()
 			this_l->push_main_stack (this_l->send_blocks_window);
 		}
 	});
-	node.observers.blocks.add ([this_w](std::shared_ptr<rai::block> block_a, rai::account const & account_a, rai::uint128_t const & amount_a, bool) {
+	node.observers.blocks.add ([this_w](std::shared_ptr<badem::block> block_a, badem::account const & account_a, badem::uint128_t const & amount_a, bool) {
 		if (auto this_l = this_w.lock ())
 		{
 			this_l->application.postEvent (&this_l->processor, new eventloop_event ([this_w, block_a, account_a]() {
@@ -1203,18 +1307,10 @@ void badem_qt::wallet::start ()
 			}));
 		}
 	});
-	node.observers.account_balance.add ([this_w](rai::account const & account_a, bool is_pending) {
+	node.observers.account_balance.add ([this_w](badem::account const & account_a, bool is_pending) {
 		if (auto this_l = this_w.lock ())
 		{
-			this_l->application.postEvent (&this_l->processor, new eventloop_event ([this_w, account_a]() {
-				if (auto this_l = this_w.lock ())
-				{
-					if (account_a == this_l->account)
-					{
-						this_l->self.refresh_balance ();
-					}
-				}
-			}));
+			this_l->needs_balance_refresh = this_l->needs_balance_refresh || account_a == this_l->account;
 		}
 	});
 	node.observers.wallet.add ([this_w](bool active_a) {
@@ -1235,7 +1331,7 @@ void badem_qt::wallet::start ()
 			}));
 		}
 	});
-	node.observers.endpoint.add ([this_w](rai::endpoint const &) {
+	node.observers.endpoint.add ([this_w](badem::endpoint const &) {
 		if (auto this_l = this_w.lock ())
 		{
 			this_l->application.postEvent (&this_l->processor, new eventloop_event ([this_w]() {
@@ -1270,6 +1366,13 @@ void badem_qt::wallet::start ()
 					else
 					{
 						this_l->active_status.erase (badem_qt::status_types::synchronizing);
+						// Check for accounts to restore
+						if (this_l->needs_deterministic_restore)
+						{
+							this_l->needs_deterministic_restore = false;
+							auto transaction (this_l->wallet_m->wallets.tx_begin_write ());
+							this_l->wallet_m->deterministic_restore (transaction);
+						}
 					}
 				}
 			}));
@@ -1310,11 +1413,11 @@ void badem_qt::wallet::start ()
 void badem_qt::wallet::refresh ()
 {
 	{
-		rai::transaction transaction (wallet_m->store.environment, nullptr, false);
+		auto transaction (wallet_m->wallets.tx_begin_read ());
 		assert (wallet_m->store.exists (transaction, account));
 	}
 	self.account_text->setText (QString (account.to_account ().c_str ()));
-	self.refresh_balance ();
+	needs_balance_refresh = true;
 	accounts.refresh ();
 	history.refresh ();
 	account_viewer.history.refresh ();
@@ -1336,30 +1439,25 @@ void badem_qt::wallet::update_connected ()
 void badem_qt::wallet::empty_password ()
 {
 	this->node.alarm.add (std::chrono::steady_clock::now () + std::chrono::seconds (3), [this]() {
-		wallet_m->enter_password (std::string (""));
+		auto transaction (wallet_m->wallets.tx_begin_write ());
+		wallet_m->enter_password (transaction, std::string (""));
 	});
 }
 
-void badem_qt::wallet::change_rendering_ratio (rai::uint128_t const & rendering_ratio_a)
+void badem_qt::wallet::change_rendering_ratio (badem::uint128_t const & rendering_ratio_a)
 {
 	application.postEvent (&processor, new eventloop_event ([this, rendering_ratio_a]() {
 		this->rendering_ratio = rendering_ratio_a;
+		auto balance_l (this->node.balance_pending (account));
+		this->self.set_balance_text (balance_l);
 		this->refresh ();
 	}));
 }
 
-std::string badem_qt::wallet::format_balance (rai::uint128_t const & balance) const
+std::string badem_qt::wallet::format_balance (badem::uint128_t const & balance) const
 {
-	auto balance_str = rai::amount (balance).format_balance (rendering_ratio, 0, false);
-	auto unit = std::string ("BDM");
-	if (rendering_ratio == rai::bademcik_ratio)
-	{
-		unit = std::string ("bademcik");
-	}
-	else if (rendering_ratio == rai::RAW_ratio)
-	{
-		unit = std::string ("raw");
-	}
+	auto balance_str = badem::amount (balance).format_balance (rendering_ratio, 0, false);
+	auto unit = std::string ("BADEM");
 	return balance_str + " " + unit;
 }
 
@@ -1411,14 +1509,14 @@ wallet (wallet_a)
 	layout->addWidget (representative);
 	current_representative->setTextInteractionFlags (Qt::TextSelectableByMouse);
 	layout->addWidget (current_representative);
-	new_representative->setPlaceholderText (rai::zero_key.pub.to_account ().c_str ());
+	new_representative->setPlaceholderText (badem::zero_key.pub.to_account ().c_str ());
 	layout->addWidget (new_representative);
 	layout->addWidget (change_rep);
 	layout->addStretch ();
 	layout->addWidget (back);
 	window->setLayout (layout);
 	QObject::connect (change, &QPushButton::released, [this]() {
-		rai::transaction transaction (this->wallet.wallet_m->store.environment, nullptr, true);
+		auto transaction (this->wallet.wallet_m->wallets.tx_begin_write ());
 		if (this->wallet.wallet_m->store.valid_password (transaction))
 		{
 			if (new_password->text ().isEmpty ())
@@ -1466,22 +1564,22 @@ wallet (wallet_a)
 		}
 	});
 	QObject::connect (change_rep, &QPushButton::released, [this]() {
-		rai::account representative_l;
+		badem::account representative_l;
 		if (!representative_l.decode_account (new_representative->text ().toStdString ()))
 		{
-			rai::transaction transaction (this->wallet.wallet_m->store.environment, nullptr, false);
+			auto transaction (this->wallet.wallet_m->wallets.tx_begin_read ());
 			if (this->wallet.wallet_m->store.valid_password (transaction))
 			{
 				change_rep->setEnabled (false);
 				{
-					rai::transaction transaction_l (this->wallet.wallet_m->store.environment, nullptr, true);
+					auto transaction_l (this->wallet.wallet_m->wallets.tx_begin_write ());
 					this->wallet.wallet_m->store.representative_set (transaction_l, representative_l);
 				}
-				auto block (this->wallet.wallet_m->change_sync (this->wallet.account, representative_l));
+				this->wallet.wallet_m->change_sync (this->wallet.account, representative_l);
 				change_rep->setEnabled (true);
 				show_button_success (*change_rep);
 				change_rep->setText ("Representative was changed");
-				current_representative->setText (QString (representative_l.to_account_split ().c_str ()));
+				current_representative->setText (QString (representative_l.to_account ().c_str ()));
 				new_representative->clear ();
 				this->wallet.node.alarm.add (std::chrono::steady_clock::now () + std::chrono::seconds (5), [this]() {
 					this->wallet.application.postEvent (&this->wallet.processor, new eventloop_event ([this]() {
@@ -1521,11 +1619,11 @@ wallet (wallet_a)
 		this->wallet.pop_main_stack ();
 	});
 	QObject::connect (lock_toggle, &QPushButton::released, [this]() {
-		rai::transaction transaction (this->wallet.wallet_m->store.environment, nullptr, true);
+		auto transaction (this->wallet.wallet_m->wallets.tx_begin_write ());
 		if (this->wallet.wallet_m->store.valid_password (transaction))
 		{
 			// lock wallet
-			rai::raw_key empty;
+			badem::raw_key empty;
 			empty.data.clear ();
 			this->wallet.wallet_m->store.password.value_set (empty);
 			update_locked (true, true);
@@ -1535,7 +1633,7 @@ wallet (wallet_a)
 		else
 		{
 			// try to unlock wallet
-			if (!this->wallet.wallet_m->enter_password (std::string (password->text ().toLocal8Bit ())))
+			if (!this->wallet.wallet_m->enter_password (transaction, std::string (password->text ().toLocal8Bit ())))
 			{
 				password->clear ();
 				lock_toggle->setText ("Lock");
@@ -1552,7 +1650,7 @@ wallet (wallet_a)
 						show_button_ok (*lock_toggle);
 
 						// if wallet is still not unlocked by now, change button text
-						rai::transaction transaction (this->wallet.wallet_m->store.environment, nullptr, true);
+						auto transaction (this->wallet.wallet_m->wallets.tx_begin_write ());
 						if (!this->wallet.wallet_m->store.valid_password (transaction))
 						{
 							lock_toggle->setText ("Unlock");
@@ -1562,9 +1660,14 @@ wallet (wallet_a)
 			}
 		}
 	});
+	QObject::connect (new_representative, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = new_representative->cursorPosition ();
+		new_representative->setText (value.trimmed ());
+		new_representative->setCursorPosition (pos);
+	});
 
 	// initial state for lock toggle button
-	rai::transaction transaction (this->wallet.wallet_m->store.environment, nullptr, true);
+	auto transaction (this->wallet.wallet_m->wallets.tx_begin_write ());
 	if (this->wallet.wallet_m->store.valid_password (transaction))
 	{
 		lock_toggle->setText ("Lock");
@@ -1577,18 +1680,19 @@ wallet (wallet_a)
 
 void badem_qt::settings::refresh_representative ()
 {
-	rai::transaction transaction (this->wallet.wallet_m->node.store.environment, nullptr, false);
-	rai::account_info info;
-	auto error (this->wallet.wallet_m->node.store.account_get (transaction, this->wallet.account, info));
+	auto transaction (this->wallet.wallet_m->wallets.node.store.tx_begin_read ());
+	badem::account_info info;
+	auto error (wallet.node.store.account_get (transaction, this->wallet.account, info));
 	if (!error)
 	{
-		auto block (this->wallet.wallet_m->node.store.block_get (transaction, info.rep_block));
+		auto block (wallet.node.store.block_get (transaction, info.rep_block));
 		assert (block != nullptr);
-		current_representative->setText (QString (block->representative ().to_account_split ().c_str ()));
+		current_representative->setText (QString (block->representative ().to_account ().c_str ()));
 	}
 	else
 	{
-		current_representative->setText (this->wallet.wallet_m->store.representative (transaction).to_account_split ().c_str ());
+		auto wallet_transaction (this->wallet.wallet_m->wallets.tx_begin_read ());
+		current_representative->setText (this->wallet.wallet_m->store.representative (wallet_transaction).to_account ().c_str ());
 	}
 }
 
@@ -1634,9 +1738,9 @@ scale_window (new QWidget),
 scale_layout (new QHBoxLayout),
 scale_label (new QLabel ("Scale:")),
 ratio_group (new QButtonGroup),
-badembutton (new QRadioButton ("BADEM")),
-bademcikbutton (new QRadioButton ("bademcik")),
-rawbutton (new QRadioButton ("raw")),
+mbadem_unit (new QRadioButton ("Mbadem")),
+kbadem_unit (new QRadioButton ("kbadem")),
+badem_unit (new QRadioButton ("badem")),
 back (new QPushButton ("Back")),
 ledger_window (new QWidget),
 ledger_layout (new QVBoxLayout),
@@ -1648,23 +1752,25 @@ peers_window (new QWidget),
 peers_layout (new QVBoxLayout),
 peers_model (new QStandardItemModel),
 peers_view (new QTableView),
+peer_summary_layout (new QHBoxLayout),
 bootstrap_label (new QLabel ("IPV6:port \"::ffff:192.168.0.1:2224\"")),
+peer_count_label (new QLabel ("")),
 bootstrap_line (new QLineEdit),
 peers_bootstrap (new QPushButton ("Initiate Bootstrap")),
 peers_refresh (new QPushButton ("Refresh")),
 peers_back (new QPushButton ("Back")),
 wallet (wallet_a)
 {
-	ratio_group->addButton (badembutton);
-	ratio_group->addButton (bademcikbutton);
-	ratio_group->addButton (rawbutton);
-	ratio_group->setId (badembutton, 0);
-	ratio_group->setId (bademcikbutton, 1);
-	ratio_group->setId (rawbutton, 2);
+	ratio_group->addButton (mbadem_unit);
+	ratio_group->addButton (kbadem_unit);
+	ratio_group->addButton (badem_unit);
+	ratio_group->setId (mbadem_unit, 0);
+	ratio_group->setId (kbadem_unit, 1);
+	ratio_group->setId (badem_unit, 2);
 	scale_layout->addWidget (scale_label);
-	scale_layout->addWidget (badembutton);
-	scale_layout->addWidget (bademcikbutton);
-	scale_layout->addWidget (rawbutton);
+	scale_layout->addWidget (mbadem_unit);
+	scale_layout->addWidget (kbadem_unit);
+	scale_layout->addWidget (badem_unit);
 	scale_window->setLayout (scale_layout);
 
 	ledger_model->setHorizontalHeaderItem (0, new QStandardItem ("Account"));
@@ -1682,6 +1788,7 @@ wallet (wallet_a)
 
 	peers_model->setHorizontalHeaderItem (0, new QStandardItem ("IPv6 address:port"));
 	peers_model->setHorizontalHeaderItem (1, new QStandardItem ("Net version"));
+	peers_model->setHorizontalHeaderItem (2, new QStandardItem ("Node ID"));
 	peers_view->setEditTriggers (QAbstractItemView::NoEditTriggers);
 	peers_view->verticalHeader ()->hide ();
 	peers_view->setModel (peers_model);
@@ -1689,7 +1796,10 @@ wallet (wallet_a)
 	peers_view->setSortingEnabled (true);
 	peers_view->horizontalHeader ()->setStretchLastSection (true);
 	peers_layout->addWidget (peers_view);
-	peers_layout->addWidget (bootstrap_label);
+	peer_summary_layout->addWidget (bootstrap_label);
+	peer_summary_layout->addStretch ();
+	peer_summary_layout->addWidget (peer_count_label);
+	peers_layout->addLayout (peer_summary_layout);
 	peers_layout->addWidget (bootstrap_line);
 	peers_layout->addWidget (peers_bootstrap);
 	peers_layout->addWidget (peers_refresh);
@@ -1712,25 +1822,39 @@ wallet (wallet_a)
 	layout->addWidget (back);
 	window->setLayout (layout);
 
-	QObject::connect (badembutton, &QRadioButton::toggled, [this]() {
-		if (badembutton->isChecked ())
+	QObject::connect (mbadem_unit, &QRadioButton::toggled, [this]() {
+		if (mbadem_unit->isChecked ())
 		{
-			this->wallet.change_rendering_ratio (rai::BDM_ratio);
+			QSettings ().setValue (saved_ratio_key, ratio_group->id (mbadem_unit));
+			this->wallet.change_rendering_ratio (badem::BDM_ratio);
 		}
 	});
-	QObject::connect (bademcikbutton, &QRadioButton::toggled, [this]() {
-		if (bademcikbutton->isChecked ())
+	QObject::connect (kbadem_unit, &QRadioButton::toggled, [this]() {
+		if (kbadem_unit->isChecked ())
 		{
-			this->wallet.change_rendering_ratio (rai::bademcik_ratio);
+			QSettings ().setValue (saved_ratio_key, ratio_group->id (kbadem_unit));
+			this->wallet.change_rendering_ratio (badem::bademcik_ratio);
 		}
 	});
-	QObject::connect (rawbutton, &QRadioButton::toggled, [this]() {
-		if (rawbutton->isChecked ())
+	QObject::connect (badem_unit, &QRadioButton::toggled, [this]() {
+		if (badem_unit->isChecked ())
 		{
-			this->wallet.change_rendering_ratio (rai::RAW_ratio);
+			QSettings ().setValue (saved_ratio_key, ratio_group->id (badem_unit));
+			this->wallet.change_rendering_ratio (badem::RAW_ratio));
 		}
 	});
-	badembutton->click ();
+	auto selected_ratio_id (QSettings ().value (saved_ratio_key, ratio_group->id (mbadem_unit)).toInt ());
+	auto selected_ratio_button = ratio_group->button (selected_ratio_id);
+	assert (selected_ratio_button != nullptr);
+
+	if (selected_ratio_button)
+	{
+		selected_ratio_button->click ();
+	}
+	else
+	{
+		mbadem_unit->click ();
+	}
 	QObject::connect (wallet_refresh, &QPushButton::released, [this]() {
 		this->wallet.accounts.refresh ();
 		this->wallet.accounts.refresh_wallet_balance ();
@@ -1749,8 +1873,8 @@ wallet (wallet_a)
 		this->wallet.pop_main_stack ();
 	});
 	QObject::connect (peers_bootstrap, &QPushButton::released, [this]() {
-		rai::endpoint endpoint;
-		auto error (rai::parse_endpoint (bootstrap_line->text ().toStdString (), endpoint));
+		badem::endpoint endpoint;
+		auto error (badem::parse_endpoint (bootstrap_line->text ().toStdString (), endpoint));
 		if (!error)
 		{
 			show_line_ok (*bootstrap_line);
@@ -1772,10 +1896,10 @@ wallet (wallet_a)
 		this->wallet.pop_main_stack ();
 	});
 	QObject::connect (search_for_receivables, &QPushButton::released, [this]() {
-		this->wallet.wallet_m->search_pending ();
+		std::thread ([this] { this->wallet.wallet_m->search_pending (); }).detach ();
 	});
 	QObject::connect (bootstrap, &QPushButton::released, [this]() {
-		this->wallet.node.bootstrap_initiator.bootstrap ();
+		std::thread ([this] { this->wallet.node.bootstrap_initiator.bootstrap (); }).detach ();
 	});
 	QObject::connect (create_block, &QPushButton::released, [this]() {
 		this->wallet.push_main_stack (this->wallet.block_creation.window);
@@ -1803,32 +1927,42 @@ wallet (wallet_a)
 void badem_qt::advanced_actions::refresh_peers ()
 {
 	peers_model->removeRows (0, peers_model->rowCount ());
-	auto list (wallet.node.peers.list_version ());
+	auto list (wallet.node.peers.list_vector (std::numeric_limits<size_t>::max ()));
+	std::sort (list.begin (), list.end ());
 	for (auto i (list.begin ()), n (list.end ()); i != n; ++i)
 	{
 		std::stringstream endpoint;
-		endpoint << i->first.address ().to_string ();
+		endpoint << i->endpoint.address ().to_string ();
 		endpoint << ':';
-		endpoint << i->first.port ();
+		endpoint << i->endpoint.port ();
 		QString qendpoint (endpoint.str ().c_str ());
 		QList<QStandardItem *> items;
 		items.push_back (new QStandardItem (qendpoint));
-		items.push_back (new QStandardItem (QString (std::to_string (i->second).c_str ())));
+		auto version = new QStandardItem ();
+		version->setData (QVariant (i->network_version), Qt::DisplayRole);
+		items.push_back (version);
+		QString node_id ("");
+		if (i->node_id.is_initialized ())
+		{
+			node_id = i->node_id.get ().to_account ().c_str ();
+		}
+		items.push_back (new QStandardItem (node_id));
 		peers_model->appendRow (items);
 	}
+	peer_count_label->setText (QString ("%1 peers").arg (peers_model->rowCount ()));
 }
 
 void badem_qt::advanced_actions::refresh_ledger ()
 {
 	ledger_model->removeRows (0, ledger_model->rowCount ());
-	rai::transaction transaction (wallet.node.store.environment, nullptr, false);
+	auto transaction (wallet.node.store.tx_begin_read ());
 	for (auto i (wallet.node.ledger.store.latest_begin (transaction)), j (wallet.node.ledger.store.latest_end ()); i != j; ++i)
 	{
 		QList<QStandardItem *> items;
-		items.push_back (new QStandardItem (QString (rai::block_hash (i->first.uint256 ()).to_account ().c_str ())));
-		rai::account_info info (i->second);
+		items.push_back (new QStandardItem (QString (badem::block_hash (i->first).to_account ().c_str ())));
+		badem::account_info info (i->second);
 		std::string balance;
-		rai::amount (info.balance.number () / wallet.rendering_ratio).encode_dec (balance);
+		badem::amount (info.balance.number () / wallet.rendering_ratio).encode_dec (balance);
 		items.push_back (new QStandardItem (QString (balance.c_str ())));
 		std::string block_hash;
 		info.head.encode_hex (block_hash);
@@ -1863,7 +1997,7 @@ wallet (wallet_a)
 			boost::property_tree::ptree tree;
 			std::stringstream istream (string);
 			boost::property_tree::read_json (istream, tree);
-			auto block_l (rai::deserialize_block_json (tree));
+			auto block_l (badem::deserialize_block_json (tree));
 			if (block_l != nullptr)
 			{
 				show_label_ok (*status);
@@ -1942,29 +2076,29 @@ wallet (wallet_a)
 	layout->addWidget (create);
 	layout->addWidget (back);
 	window->setLayout (layout);
-	QObject::connect (send, &QRadioButton::toggled, [this]() {
-		if (send->isChecked ())
+	QObject::connect (send, &QRadioButton::toggled, [this](bool on) {
+		if (on)
 		{
 			deactivate_all ();
 			activate_send ();
 		}
 	});
-	QObject::connect (receive, &QRadioButton::toggled, [this]() {
-		if (receive->isChecked ())
+	QObject::connect (receive, &QRadioButton::toggled, [this](bool on) {
+		if (on)
 		{
 			deactivate_all ();
 			activate_receive ();
 		}
 	});
-	QObject::connect (open, &QRadioButton::toggled, [this]() {
-		if (open->isChecked ())
+	QObject::connect (open, &QRadioButton::toggled, [this](bool on) {
+		if (on)
 		{
 			deactivate_all ();
 			activate_open ();
 		}
 	});
-	QObject::connect (change, &QRadioButton::toggled, [this]() {
-		if (change->isChecked ())
+	QObject::connect (change, &QRadioButton::toggled, [this](bool on) {
+		if (on)
 		{
 			deactivate_all ();
 			activate_change ();
@@ -1993,6 +2127,32 @@ wallet (wallet_a)
 	QObject::connect (back, &QPushButton::released, [this]() {
 		this->wallet.pop_main_stack ();
 	});
+	QObject::connect (account, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = account->cursorPosition ();
+		account->setText (value.trimmed ());
+		account->setCursorPosition (pos);
+	});
+	QObject::connect (destination, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = destination->cursorPosition ();
+		destination->setText (value.trimmed ());
+		destination->setCursorPosition (pos);
+	});
+	QObject::connect (amount, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = amount->cursorPosition ();
+		amount->setText (value.trimmed ());
+		amount->setCursorPosition (pos);
+	});
+	QObject::connect (source, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = source->cursorPosition ();
+		source->setText (value.trimmed ());
+		source->setCursorPosition (pos);
+	});
+	QObject::connect (representative, &QLineEdit::textChanged, [this](const QString & value) {
+		auto pos = representative->cursorPosition ();
+		representative->setText (value.trimmed ());
+		representative->setCursorPosition (pos);
+	});
+
 	send->click ();
 }
 
@@ -2044,29 +2204,32 @@ void badem_qt::block_creation::activate_change ()
 
 void badem_qt::block_creation::create_send ()
 {
-	rai::account account_l;
+	badem::account account_l;
 	auto error (account_l.decode_account (account->text ().toStdString ()));
 	if (!error)
 	{
-		rai::amount amount_l;
+		badem::amount amount_l;
 		error = amount_l.decode_dec (amount->text ().toStdString ());
 		if (!error)
 		{
-			rai::account destination_l;
+			badem::account destination_l;
 			error = destination_l.decode_account (destination->text ().toStdString ());
 			if (!error)
 			{
-				rai::transaction transaction (wallet.node.store.environment, nullptr, false);
-				rai::raw_key key;
+				auto transaction (wallet.node.wallets.tx_begin_read ());
+				auto block_transaction (wallet.node.store.tx_begin_read ());
+				badem::raw_key key;
 				if (!wallet.wallet_m->store.fetch (transaction, account_l, key))
 				{
-					auto balance (wallet.node.ledger.account_balance (transaction, account_l));
+					auto balance (wallet.node.ledger.account_balance (block_transaction, account_l));
 					if (amount_l.number () <= balance)
 					{
-						rai::account_info info;
-						auto error (wallet.node.store.account_get (transaction, account_l, info));
+						badem::account_info info;
+						auto error (wallet.node.store.account_get (block_transaction, account_l, info));
 						assert (!error);
-						rai::send_block send (info.head, destination_l, balance - amount_l.number (), key, account_l, 0);
+						auto rep_block (wallet.node.store.block_get (block_transaction, info.rep_block));
+						assert (rep_block != nullptr);
+						badem::state_block send (account_l, info.head, rep_block->representative (), balance - amount_l.number (), destination_l, key, account_l, 0);
 						wallet.node.work_generate_blocking (send);
 						std::string block_l;
 						send.serialize_json (block_l);
@@ -2107,30 +2270,33 @@ void badem_qt::block_creation::create_send ()
 
 void badem_qt::block_creation::create_receive ()
 {
-	rai::block_hash source_l;
+	badem::block_hash source_l;
 	auto error (source_l.decode_hex (source->text ().toStdString ()));
 	if (!error)
 	{
-		rai::transaction transaction (wallet.node.store.environment, nullptr, false);
-		auto block_l (wallet.node.store.block_get (transaction, source_l));
+		auto transaction (wallet.node.wallets.tx_begin_read ());
+		auto block_transaction (wallet.node.store.tx_begin_read ());
+		auto block_l (wallet.node.store.block_get (block_transaction, source_l));
 		if (block_l != nullptr)
 		{
-			auto destination (wallet.node.ledger.block_destination (transaction, *block_l));
+			auto destination (wallet.node.ledger.block_destination (block_transaction, *block_l));
 			if (!destination.is_zero ())
 			{
-				rai::pending_key pending_key (destination, source_l);
-				rai::pending_info pending;
-				if (!wallet.node.store.pending_get (transaction, pending_key, pending))
+				badem::pending_key pending_key (destination, source_l);
+				badem::pending_info pending;
+				if (!wallet.node.store.pending_get (block_transaction, pending_key, pending))
 				{
-					rai::account_info info;
-					auto error (wallet.node.store.account_get (transaction, pending_key.account, info));
+					badem::account_info info;
+					auto error (wallet.node.store.account_get (block_transaction, pending_key.account, info));
 					if (!error)
 					{
-						rai::raw_key key;
+						badem::raw_key key;
 						auto error (wallet.wallet_m->store.fetch (transaction, pending_key.account, key));
 						if (!error)
 						{
-							rai::receive_block receive (info.head, source_l, key, pending_key.account, 0);
+							auto rep_block (wallet.node.store.block_get (block_transaction, info.rep_block));
+							assert (rep_block != nullptr);
+							badem::state_block receive (pending_key.account, info.head, rep_block->representative (), info.balance.number () + pending.amount.number (), source_l, key, pending_key.account, 0);
 							wallet.node.work_generate_blocking (receive);
 							std::string block_l;
 							receive.serialize_json (block_l);
@@ -2177,24 +2343,25 @@ void badem_qt::block_creation::create_receive ()
 
 void badem_qt::block_creation::create_change ()
 {
-	rai::account account_l;
+	badem::account account_l;
 	auto error (account_l.decode_account (account->text ().toStdString ()));
 	if (!error)
 	{
-		rai::account representative_l;
+		badem::account representative_l;
 		error = representative_l.decode_account (representative->text ().toStdString ());
 		if (!error)
 		{
-			rai::transaction transaction (wallet.node.store.environment, nullptr, false);
-			rai::account_info info;
-			auto error (wallet.node.store.account_get (transaction, account_l, info));
+			auto transaction (wallet.node.wallets.tx_begin_read ());
+			auto block_transaction (wallet.node.store.tx_begin_read ());
+			badem::account_info info;
+			auto error (wallet.node.store.account_get (block_transaction, account_l, info));
 			if (!error)
 			{
-				rai::raw_key key;
+				badem::raw_key key;
 				auto error (wallet.wallet_m->store.fetch (transaction, account_l, key));
 				if (!error)
 				{
-					rai::change_block change (info.head, representative_l, key, account_l, 0);
+					badem::state_block change (account_l, info.head, representative_l, info.balance, 0, key, account_l, 0);
 					wallet.node.work_generate_blocking (change);
 					std::string block_l;
 					change.serialize_json (block_l);
@@ -2229,34 +2396,35 @@ void badem_qt::block_creation::create_change ()
 
 void badem_qt::block_creation::create_open ()
 {
-	rai::block_hash source_l;
+	badem::block_hash source_l;
 	auto error (source_l.decode_hex (source->text ().toStdString ()));
 	if (!error)
 	{
-		rai::account representative_l;
+		badem::account representative_l;
 		error = representative_l.decode_account (representative->text ().toStdString ());
 		if (!error)
 		{
-			rai::transaction transaction (wallet.node.store.environment, nullptr, false);
-			auto block_l (wallet.node.store.block_get (transaction, source_l));
+			auto transaction (wallet.node.wallets.tx_begin_read ());
+			auto block_transaction (wallet.node.store.tx_begin_read ());
+			auto block_l (wallet.node.store.block_get (block_transaction, source_l));
 			if (block_l != nullptr)
 			{
-				auto destination (wallet.node.ledger.block_destination (transaction, *block_l));
+				auto destination (wallet.node.ledger.block_destination (block_transaction, *block_l));
 				if (!destination.is_zero ())
 				{
-					rai::pending_key pending_key (destination, source_l);
-					rai::pending_info pending;
-					if (!wallet.node.store.pending_get (transaction, pending_key, pending))
+					badem::pending_key pending_key (destination, source_l);
+					badem::pending_info pending;
+					if (!wallet.node.store.pending_get (block_transaction, pending_key, pending))
 					{
-						rai::account_info info;
-						auto error (wallet.node.store.account_get (transaction, pending_key.account, info));
+						badem::account_info info;
+						auto error (wallet.node.store.account_get (block_transaction, pending_key.account, info));
 						if (error)
 						{
-							rai::raw_key key;
+							badem::raw_key key;
 							auto error (wallet.wallet_m->store.fetch (transaction, pending_key.account, key));
 							if (!error)
 							{
-								rai::open_block open (source_l, representative_l, pending_key.account, key, pending_key.account, 0);
+								badem::state_block open (pending_key.account, 0, representative_l, pending.amount, source_l, key, pending_key.account, 0);
 								wallet.node.work_generate_blocking (open);
 								std::string block_l;
 								open.serialize_json (block_l);

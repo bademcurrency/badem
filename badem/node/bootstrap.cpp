@@ -3,26 +3,31 @@
 #include <badem/node/common.hpp>
 #include <badem/node/node.hpp>
 
+#include <algorithm>
 #include <boost/log/trivial.hpp>
 
 constexpr double bootstrap_connection_scale_target_blocks = 50000.0;
 constexpr double bootstrap_connection_warmup_time_sec = 5.0;
 constexpr double bootstrap_minimum_blocks_per_sec = 10.0;
+constexpr double bootstrap_minimum_elapsed_seconds_blockrate = 0.02;
 constexpr double bootstrap_minimum_frontier_blocks_per_sec = 1000.0;
 constexpr unsigned bootstrap_frontier_retry_limit = 16;
 constexpr double bootstrap_minimum_termination_time_sec = 30.0;
 constexpr unsigned bootstrap_max_new_connections = 10;
 constexpr unsigned bulk_push_cost_limit = 200;
 
-rai::socket::socket (std::shared_ptr<rai::node> node_a) :
-socket_m (node_a->service),
-ticket (0),
+size_t constexpr badem::frontier_req_client::size_frontier;
+
+badem::socket::socket (std::shared_ptr<badem::node> node_a) :
+socket_m (node_a->io_ctx),
+cutoff (std::numeric_limits<uint64_t>::max ()),
 node (node_a)
 {
 }
 
-void rai::socket::async_connect (rai::tcp_endpoint const & endpoint_a, std::function<void(boost::system::error_code const &)> callback_a)
+void badem::socket::async_connect (badem::tcp_endpoint const & endpoint_a, std::function<void(boost::system::error_code const &)> callback_a)
 {
+	checkup ();
 	auto this_l (shared_from_this ());
 	start ();
 	socket_m.async_connect (endpoint_a, [this_l, callback_a](boost::system::error_code const & ec) {
@@ -31,65 +36,101 @@ void rai::socket::async_connect (rai::tcp_endpoint const & endpoint_a, std::func
 	});
 }
 
-void rai::socket::async_read (std::shared_ptr<std::vector<uint8_t>> buffer_a, size_t size_a, std::function<void(boost::system::error_code const &, size_t)> callback_a)
+void badem::socket::async_read (std::shared_ptr<std::vector<uint8_t>> buffer_a, size_t size_a, std::function<void(boost::system::error_code const &, size_t)> callback_a)
 {
 	assert (size_a <= buffer_a->size ());
 	auto this_l (shared_from_this ());
-	start ();
-	boost::asio::async_read (socket_m, boost::asio::buffer (buffer_a->data (), size_a), [this_l, callback_a](boost::system::error_code const & ec, size_t size_a) {
-		this_l->stop ();
-		callback_a (ec, size_a);
-	});
+	if (socket_m.is_open ())
+	{
+		start ();
+		boost::asio::async_read (socket_m, boost::asio::buffer (buffer_a->data (), size_a), [this_l, callback_a](boost::system::error_code const & ec, size_t size_a) {
+			this_l->node->stats.add (badem::stat::type::traffic_bootstrap, badem::stat::dir::in, size_a);
+			this_l->stop ();
+			callback_a (ec, size_a);
+		});
+	}
 }
 
-void rai::socket::async_write (std::shared_ptr<std::vector<uint8_t>> buffer_a, std::function<void(boost::system::error_code const &, size_t)> callback_a)
+void badem::socket::async_write (std::shared_ptr<std::vector<uint8_t>> buffer_a, std::function<void(boost::system::error_code const &, size_t)> callback_a)
 {
 	auto this_l (shared_from_this ());
-	start ();
-	boost::asio::async_write (socket_m, boost::asio::buffer (buffer_a->data (), buffer_a->size ()), [this_l, callback_a](boost::system::error_code const & ec, size_t size_a) {
-		this_l->stop ();
-		callback_a (ec, size_a);
-	});
+	if (socket_m.is_open ())
+	{
+		start ();
+		boost::asio::async_write (socket_m, boost::asio::buffer (buffer_a->data (), buffer_a->size ()), [this_l, callback_a, buffer_a](boost::system::error_code const & ec, size_t size_a) {
+			this_l->node->stats.add (badem::stat::type::traffic_bootstrap, badem::stat::dir::out, size_a);
+			this_l->stop ();
+			callback_a (ec, size_a);
+		});
+	}
 }
 
-void rai::socket::start (std::chrono::steady_clock::time_point timeout_a)
+void badem::socket::start (std::chrono::steady_clock::time_point timeout_a)
 {
-	auto ticket_l (++ticket);
-	std::weak_ptr<rai::socket> this_w (shared_from_this ());
-	node->alarm.add (timeout_a, [this_w, ticket_l]() {
+	cutoff = timeout_a.time_since_epoch ().count ();
+}
+
+void badem::socket::stop ()
+{
+	cutoff = std::numeric_limits<uint64_t>::max ();
+}
+
+void badem::socket::close ()
+{
+	if (socket_m.is_open ())
+	{
+		try
+		{
+			socket_m.shutdown (boost::asio::ip::tcp::socket::shutdown_both);
+		}
+		catch (...)
+		{
+			/* Ignore spurious exceptions; shutdown is best effort. */
+		}
+		socket_m.close ();
+	}
+}
+
+void badem::socket::checkup ()
+{
+	std::weak_ptr<badem::socket> this_w (shared_from_this ());
+	node->alarm.add (std::chrono::steady_clock::now () + std::chrono::seconds (10), [this_w]() {
 		if (auto this_l = this_w.lock ())
 		{
-			if (this_l->ticket == ticket_l)
+			if (this_l->cutoff != std::numeric_limits<uint64_t>::max () && this_l->cutoff < static_cast<uint64_t> (std::chrono::steady_clock::now ().time_since_epoch ().count ()))
 			{
-				this_l->socket_m.close ();
 				if (this_l->node->config.logging.bulk_pull_logging ())
 				{
-					BOOST_LOG (this_l->node->log) << boost::str (boost::format ("Disconnecting from %1% due to timeout") % this_l->socket_m.remote_endpoint ());
+					BOOST_LOG (this_l->node->log) << boost::str (boost::format ("Disconnecting from %1% due to timeout") % this_l->remote_endpoint ());
 				}
+				this_l->close ();
+			}
+			else
+			{
+				this_l->checkup ();
 			}
 		}
 	});
 }
 
-void rai::socket::stop ()
+badem::tcp_endpoint badem::socket::remote_endpoint ()
 {
-	++ticket;
+	badem::tcp_endpoint endpoint;
+
+	if (socket_m.is_open ())
+	{
+		boost::system::error_code remote_endpoint_error;
+
+		endpoint = socket_m.remote_endpoint (remote_endpoint_error);
+	}
+
+	return endpoint;
 }
 
-void rai::socket::close ()
-{
-	socket_m.close ();
-}
-
-rai::tcp_endpoint rai::socket::remote_endpoint ()
-{
-	return socket_m.remote_endpoint ();
-}
-
-rai::bootstrap_client::bootstrap_client (std::shared_ptr<rai::node> node_a, std::shared_ptr<rai::bootstrap_attempt> attempt_a, rai::tcp_endpoint const & endpoint_a) :
+badem::bootstrap_client::bootstrap_client (std::shared_ptr<badem::node> node_a, std::shared_ptr<badem::bootstrap_attempt> attempt_a, badem::tcp_endpoint const & endpoint_a) :
 node (node_a),
 attempt (attempt_a),
-socket (std::make_shared<rai::socket> (node_a)),
+socket (std::make_shared<badem::socket> (node_a)),
 receive_buffer (std::make_shared<std::vector<uint8_t>> ()),
 endpoint (endpoint_a),
 start_time (std::chrono::steady_clock::now ()),
@@ -101,23 +142,23 @@ hard_stop (false)
 	receive_buffer->resize (256);
 }
 
-rai::bootstrap_client::~bootstrap_client ()
+badem::bootstrap_client::~bootstrap_client ()
 {
 	--attempt->connections;
 }
 
-double rai::bootstrap_client::block_rate () const
+double badem::bootstrap_client::block_rate () const
 {
-	auto elapsed = elapsed_seconds ();
-	return elapsed > 0.0 ? (double)block_count.load () / elapsed : 0.0;
+	auto elapsed = std::max (elapsed_seconds (), bootstrap_minimum_elapsed_seconds_blockrate);
+	return static_cast<double> (block_count.load () / elapsed);
 }
 
-double rai::bootstrap_client::elapsed_seconds () const
+double badem::bootstrap_client::elapsed_seconds () const
 {
 	return std::chrono::duration_cast<std::chrono::duration<double>> (std::chrono::steady_clock::now () - start_time).count ();
 }
 
-void rai::bootstrap_client::stop (bool force)
+void badem::bootstrap_client::stop (bool force)
 {
 	pending_stop = true;
 	if (force)
@@ -126,7 +167,7 @@ void rai::bootstrap_client::stop (bool force)
 	}
 }
 
-void rai::bootstrap_client::run ()
+void badem::bootstrap_client::run ()
 {
 	auto this_l (shared_from_this ());
 	socket->async_connect (endpoint, [this_l](boost::system::error_code const & ec) {
@@ -159,19 +200,19 @@ void rai::bootstrap_client::run ()
 	});
 }
 
-void rai::frontier_req_client::run ()
+void badem::frontier_req_client::run ()
 {
-	std::unique_ptr<rai::frontier_req> request (new rai::frontier_req);
+	std::unique_ptr<badem::frontier_req> request (new badem::frontier_req);
 	request->start.clear ();
 	request->age = std::numeric_limits<decltype (request->age)>::max ();
-	request->count = std::numeric_limits<decltype (request->age)>::max ();
+	request->count = std::numeric_limits<decltype (request->count)>::max ();
 	auto send_buffer (std::make_shared<std::vector<uint8_t>> ());
 	{
-		rai::vectorstream stream (*send_buffer);
+		badem::vectorstream stream (*send_buffer);
 		request->serialize (stream);
 	}
 	auto this_l (shared_from_this ());
-	connection->socket->async_write (send_buffer, [this_l, send_buffer](boost::system::error_code const & ec, size_t size_a) {
+	connection->socket->async_write (send_buffer, [this_l](boost::system::error_code const & ec, size_t size_a) {
 		if (!ec)
 		{
 			this_l->receive_frontier ();
@@ -186,33 +227,32 @@ void rai::frontier_req_client::run ()
 	});
 }
 
-std::shared_ptr<rai::bootstrap_client> rai::bootstrap_client::shared ()
+std::shared_ptr<badem::bootstrap_client> badem::bootstrap_client::shared ()
 {
 	return shared_from_this ();
 }
 
-rai::frontier_req_client::frontier_req_client (std::shared_ptr<rai::bootstrap_client> connection_a) :
+badem::frontier_req_client::frontier_req_client (std::shared_ptr<badem::bootstrap_client> connection_a) :
 connection (connection_a),
 current (0),
 count (0),
 bulk_push_cost (0)
 {
-	rai::transaction transaction (connection->node->store.environment, nullptr, false);
+	auto transaction (connection->node->store.tx_begin_read ());
 	next (transaction);
 }
 
-rai::frontier_req_client::~frontier_req_client ()
+badem::frontier_req_client::~frontier_req_client ()
 {
 }
 
-void rai::frontier_req_client::receive_frontier ()
+void badem::frontier_req_client::receive_frontier ()
 {
 	auto this_l (shared_from_this ());
-	size_t size_l (sizeof (rai::uint256_union) + sizeof (rai::uint256_union));
-	connection->socket->async_read (connection->receive_buffer, size_l, [this_l, size_l](boost::system::error_code const & ec, size_t size_a) {
+	connection->socket->async_read (connection->receive_buffer, badem::frontier_req_client::size_frontier, [this_l](boost::system::error_code const & ec, size_t size_a) {
 		// An issue with asio is that sometimes, instead of reporting a bad file descriptor during disconnect,
 		// we simply get a size of 0.
-		if (size_a == size_l)
+		if (size_a == badem::frontier_req_client::size_frontier)
 		{
 			this_l->received_frontier (ec, size_a);
 		}
@@ -220,13 +260,13 @@ void rai::frontier_req_client::receive_frontier ()
 		{
 			if (this_l->connection->node->config.logging.network_message_logging ())
 			{
-				BOOST_LOG (this_l->connection->node->log) << boost::str (boost::format ("Invalid size: expected %1%, got %2%") % size_l % size_a);
+				BOOST_LOG (this_l->connection->node->log) << boost::str (boost::format ("Invalid size: expected %1%, got %2%") % badem::frontier_req_client::size_frontier % size_a);
 			}
 		}
 	});
 }
 
-void rai::frontier_req_client::unsynced (MDB_txn * transaction_a, rai::block_hash const & head, rai::block_hash const & end)
+void badem::frontier_req_client::unsynced (badem::block_hash const & head, badem::block_hash const & end)
 {
 	if (bulk_push_cost < bulk_push_cost_limit)
 	{
@@ -242,18 +282,18 @@ void rai::frontier_req_client::unsynced (MDB_txn * transaction_a, rai::block_has
 	}
 }
 
-void rai::frontier_req_client::received_frontier (boost::system::error_code const & ec, size_t size_a)
+void badem::frontier_req_client::received_frontier (boost::system::error_code const & ec, size_t size_a)
 {
 	if (!ec)
 	{
-		assert (size_a == sizeof (rai::uint256_union) + sizeof (rai::uint256_union));
-		rai::account account;
-		rai::bufferstream account_stream (connection->receive_buffer->data (), sizeof (rai::uint256_union));
-		auto error1 (rai::read (account_stream, account));
+		assert (size_a == badem::frontier_req_client::size_frontier);
+		badem::account account;
+		badem::bufferstream account_stream (connection->receive_buffer->data (), sizeof (account));
+		auto error1 (badem::try_read (account_stream, account));
 		assert (!error1);
-		rai::block_hash latest;
-		rai::bufferstream latest_stream (connection->receive_buffer->data () + sizeof (rai::uint256_union), sizeof (rai::uint256_union));
-		auto error2 (rai::read (latest_stream, latest));
+		badem::block_hash latest;
+		badem::bufferstream latest_stream (connection->receive_buffer->data () + sizeof (account), sizeof (latest));
+		auto error2 (badem::try_read (latest_stream, latest));
 		assert (!error2);
 		if (count == 0)
 		{
@@ -261,8 +301,9 @@ void rai::frontier_req_client::received_frontier (boost::system::error_code cons
 		}
 		++count;
 		std::chrono::duration<double> time_span = std::chrono::duration_cast<std::chrono::duration<double>> (std::chrono::steady_clock::now () - start_time);
-		double elapsed_sec = time_span.count ();
-		double blocks_per_sec = (double)count / elapsed_sec;
+
+		double elapsed_sec = std::max (time_span.count (), bootstrap_minimum_elapsed_seconds_blockrate);
+		double blocks_per_sec = static_cast<double> (count) / elapsed_sec;
 		if (elapsed_sec > bootstrap_connection_warmup_time_sec && blocks_per_sec < bootstrap_minimum_frontier_blocks_per_sec)
 		{
 			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Aborting frontier req because it was too slow"));
@@ -273,21 +314,20 @@ void rai::frontier_req_client::received_frontier (boost::system::error_code cons
 		{
 			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Received %1% frontiers from %2%") % std::to_string (count) % connection->socket->remote_endpoint ());
 		}
+		auto transaction (connection->node->store.tx_begin_read ());
 		if (!account.is_zero ())
 		{
 			while (!current.is_zero () && current < account)
 			{
 				// We know about an account they don't.
-				rai::transaction transaction (connection->node->store.environment, nullptr, true);
-				unsynced (transaction, info.head, 0);
+				unsynced (frontier, 0);
 				next (transaction);
 			}
 			if (!current.is_zero ())
 			{
 				if (account == current)
 				{
-					rai::transaction transaction (connection->node->store.environment, nullptr, true);
-					if (latest == info.head)
+					if (latest == frontier)
 					{
 						// In sync
 					}
@@ -296,11 +336,11 @@ void rai::frontier_req_client::received_frontier (boost::system::error_code cons
 						if (connection->node->store.block_exists (transaction, latest))
 						{
 							// We know about a block they don't.
-							unsynced (transaction, info.head, latest);
+							unsynced (frontier, latest);
 						}
 						else
 						{
-							connection->attempt->add_pull (rai::pull_info (account, latest, info.head));
+							connection->attempt->add_pull (badem::pull_info (account, latest, frontier));
 							// Either we're behind or there's a fork we differ on
 							// Either way, bulk pushing will probably not be effective
 							bulk_push_cost += 5;
@@ -311,25 +351,22 @@ void rai::frontier_req_client::received_frontier (boost::system::error_code cons
 				else
 				{
 					assert (account < current);
-					connection->attempt->add_pull (rai::pull_info (account, latest, rai::block_hash (0)));
+					connection->attempt->add_pull (badem::pull_info (account, latest, badem::block_hash (0)));
 				}
 			}
 			else
 			{
-				connection->attempt->add_pull (rai::pull_info (account, latest, rai::block_hash (0)));
+				connection->attempt->add_pull (badem::pull_info (account, latest, badem::block_hash (0)));
 			}
 			receive_frontier ();
 		}
 		else
 		{
+			while (!current.is_zero ())
 			{
-				rai::transaction transaction (connection->node->store.environment, nullptr, true);
-				while (!current.is_zero ())
-				{
-					// We know about an account they don't.
-					unsynced (transaction, info.head, 0);
-					next (transaction);
-				}
+				// We know about an account they don't.
+				unsynced (frontier, 0);
+				next (transaction);
 			}
 			if (connection->node->config.logging.bulk_pull_logging ())
 			{
@@ -356,55 +393,77 @@ void rai::frontier_req_client::received_frontier (boost::system::error_code cons
 	}
 }
 
-void rai::frontier_req_client::next (MDB_txn * transaction_a)
+void badem::frontier_req_client::next (badem::transaction const & transaction_a)
 {
-	auto iterator (connection->node->store.latest_begin (transaction_a, rai::uint256_union (current.number () + 1)));
-	if (iterator != connection->node->store.latest_end ())
+	// Filling accounts deque to prevent often read transactions
+	if (accounts.empty ())
 	{
-		current = rai::account (iterator->first.uint256 ());
-		info = rai::account_info (iterator->second);
+		size_t max_size (128);
+		for (auto i (connection->node->store.latest_begin (transaction_a, current.number () + 1)), n (connection->node->store.latest_end ()); i != n && accounts.size () != max_size; ++i)
+		{
+			badem::account_info info (i->second);
+			accounts.push_back (std::make_pair (badem::account (i->first), info.head));
+		}
+		/* If loop breaks before max_size, then latest_end () is reached
+		Add empty record to finish frontier_req_server */
+		if (accounts.size () != max_size)
+		{
+			accounts.push_back (std::make_pair (badem::account (0), badem::block_hash (0)));
+		}
 	}
-	else
-	{
-		current.clear ();
-	}
+	// Retrieving accounts from deque
+	auto account_pair (accounts.front ());
+	accounts.pop_front ();
+	current = account_pair.first;
+	frontier = account_pair.second;
 }
 
-rai::bulk_pull_client::bulk_pull_client (std::shared_ptr<rai::bootstrap_client> connection_a, rai::pull_info const & pull_a) :
+badem::bulk_pull_client::bulk_pull_client (std::shared_ptr<badem::bootstrap_client> connection_a, badem::pull_info const & pull_a) :
 connection (connection_a),
-pull (pull_a)
+known_account (0),
+pull (pull_a),
+total_blocks (0),
+unexpected_count (0)
 {
 	std::lock_guard<std::mutex> mutex (connection->attempt->mutex);
-	++connection->attempt->pulling;
 	connection->attempt->condition.notify_all ();
 }
 
-rai::bulk_pull_client::~bulk_pull_client ()
+badem::bulk_pull_client::~bulk_pull_client ()
 {
 	// If received end block is not expected end block
 	if (expected != pull.end)
 	{
 		pull.head = expected;
+		if (connection->attempt->mode != badem::bootstrap_mode::legacy)
+		{
+			pull.account = expected;
+		}
 		connection->attempt->requeue_pull (pull);
 		if (connection->node->config.logging.bulk_pull_logging ())
 		{
 			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Bulk pull end block is not expected %1% for account %2%") % pull.end.to_string () % pull.account.to_account ());
 		}
 	}
-	std::lock_guard<std::mutex> mutex (connection->attempt->mutex);
-	--connection->attempt->pulling;
+	{
+		std::lock_guard<std::mutex> mutex (connection->attempt->mutex);
+		--connection->attempt->pulling;
+	}
 	connection->attempt->condition.notify_all ();
 }
 
-void rai::bulk_pull_client::request ()
+void badem::bulk_pull_client::request ()
 {
 	expected = pull.head;
-	rai::bulk_pull req;
+	badem::bulk_pull req;
 	req.start = pull.account;
 	req.end = pull.end;
+	req.count = pull.count;
+	req.set_count_present (pull.count != 0);
+
 	auto buffer (std::make_shared<std::vector<uint8_t>> ());
 	{
-		rai::vectorstream stream (*buffer);
+		badem::vectorstream stream (*buffer);
 		req.serialize (stream);
 	}
 	if (connection->node->config.logging.bulk_pull_logging ())
@@ -418,7 +477,7 @@ void rai::bulk_pull_client::request ()
 		BOOST_LOG (connection->node->log) << boost::str (boost::format ("%1% accounts in pull queue") % connection->attempt->pulls.size ());
 	}
 	auto this_l (shared_from_this ());
-	connection->socket->async_write (buffer, [this_l, buffer](boost::system::error_code const & ec, size_t size_a) {
+	connection->socket->async_write (buffer, [this_l](boost::system::error_code const & ec, size_t size_a) {
 		if (!ec)
 		{
 			this_l->receive_block ();
@@ -433,7 +492,7 @@ void rai::bulk_pull_client::request ()
 	});
 }
 
-void rai::bulk_pull_client::receive_block ()
+void badem::bulk_pull_client::receive_block ()
 {
 	auto this_l (shared_from_this ());
 	connection->socket->async_read (connection->receive_buffer, 1, [this_l](boost::system::error_code const & ec, size_t size_a) {
@@ -451,48 +510,48 @@ void rai::bulk_pull_client::receive_block ()
 	});
 }
 
-void rai::bulk_pull_client::received_type ()
+void badem::bulk_pull_client::received_type ()
 {
 	auto this_l (shared_from_this ());
-	rai::block_type type (static_cast<rai::block_type> (connection->receive_buffer->data ()[0]));
+	badem::block_type type (static_cast<badem::block_type> (connection->receive_buffer->data ()[0]));
 	switch (type)
 	{
-		case rai::block_type::send:
+		case badem::block_type::send:
 		{
-			connection->socket->async_read (connection->receive_buffer, rai::send_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
+			connection->socket->async_read (connection->receive_buffer, badem::send_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
 				this_l->received_block (ec, size_a, type);
 			});
 			break;
 		}
-		case rai::block_type::receive:
+		case badem::block_type::receive:
 		{
-			connection->socket->async_read (connection->receive_buffer, rai::receive_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
+			connection->socket->async_read (connection->receive_buffer, badem::receive_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
 				this_l->received_block (ec, size_a, type);
 			});
 			break;
 		}
-		case rai::block_type::open:
+		case badem::block_type::open:
 		{
-			connection->socket->async_read (connection->receive_buffer, rai::open_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
+			connection->socket->async_read (connection->receive_buffer, badem::open_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
 				this_l->received_block (ec, size_a, type);
 			});
 			break;
 		}
-		case rai::block_type::change:
+		case badem::block_type::change:
 		{
-			connection->socket->async_read (connection->receive_buffer, rai::change_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
+			connection->socket->async_read (connection->receive_buffer, badem::change_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
 				this_l->received_block (ec, size_a, type);
 			});
 			break;
 		}
-		case rai::block_type::state:
+		case badem::block_type::state:
 		{
-			connection->socket->async_read (connection->receive_buffer, rai::state_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
+			connection->socket->async_read (connection->receive_buffer, badem::state_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
 				this_l->received_block (ec, size_a, type);
 			});
 			break;
 		}
-		case rai::block_type::not_a_block:
+		case badem::block_type::not_a_block:
 		{
 			// Avoid re-using slow peers, or peers that sent the wrong blocks.
 			if (!connection->pending_stop && expected == pull.end)
@@ -512,13 +571,13 @@ void rai::bulk_pull_client::received_type ()
 	}
 }
 
-void rai::bulk_pull_client::received_block (boost::system::error_code const & ec, size_t size_a, rai::block_type type_a)
+void badem::bulk_pull_client::received_block (boost::system::error_code const & ec, size_t size_a, badem::block_type type_a)
 {
 	if (!ec)
 	{
-		rai::bufferstream stream (connection->receive_buffer->data (), size_a);
-		std::shared_ptr<rai::block> block (rai::deserialize_block (stream, type_a));
-		if (block != nullptr && !rai::work_validate (*block))
+		badem::bufferstream stream (connection->receive_buffer->data (), size_a);
+		std::shared_ptr<badem::block> block (badem::deserialize_block (stream, type_a));
+		if (block != nullptr && !badem::work_validate (*block))
 		{
 			auto hash (block->hash ());
 			if (connection->node->config.logging.bulk_pull_logging ())
@@ -527,19 +586,46 @@ void rai::bulk_pull_client::received_block (boost::system::error_code const & ec
 				block->serialize_json (block_l);
 				BOOST_LOG (connection->node->log) << boost::str (boost::format ("Pulled block %1% %2%") % hash.to_string () % block_l);
 			}
+			// Is block expected?
+			bool block_expected (false);
 			if (hash == expected)
 			{
 				expected = block->previous ();
+				block_expected = true;
+			}
+			else
+			{
+				unexpected_count++;
+			}
+			if (total_blocks == 0 && block_expected)
+			{
+				known_account = block->account ();
 			}
 			if (connection->block_count++ == 0)
 			{
 				connection->start_time = std::chrono::steady_clock::now ();
 			}
 			connection->attempt->total_blocks++;
-			connection->attempt->node->block_processor.add (block);
-			if (!connection->hard_stop.load ())
+			total_blocks++;
+			bool stop_pull (connection->attempt->process_block (block, known_account, total_blocks, block_expected));
+			if (!stop_pull && !connection->hard_stop.load ())
 			{
-				receive_block ();
+				/* Process block in lazy pull if not stopped
+				Stop usual pull request with unexpected block & more than 16k blocks processed
+				to prevent spam */
+				if (connection->attempt->mode != badem::bootstrap_mode::legacy || unexpected_count < 16384)
+				{
+					receive_block ();
+				}
+			}
+			else if (stop_pull && block_expected)
+			{
+				expected = pull.end;
+				connection->attempt->pool_connection (connection);
+			}
+			if (stop_pull)
+			{
+				connection->attempt->lazy_stopped++;
 			}
 		}
 		else
@@ -559,26 +645,26 @@ void rai::bulk_pull_client::received_block (boost::system::error_code const & ec
 	}
 }
 
-rai::bulk_push_client::bulk_push_client (std::shared_ptr<rai::bootstrap_client> const & connection_a) :
+badem::bulk_push_client::bulk_push_client (std::shared_ptr<badem::bootstrap_client> const & connection_a) :
 connection (connection_a)
 {
 }
 
-rai::bulk_push_client::~bulk_push_client ()
+badem::bulk_push_client::~bulk_push_client ()
 {
 }
 
-void rai::bulk_push_client::start ()
+void badem::bulk_push_client::start ()
 {
-	rai::bulk_push message;
+	badem::bulk_push message;
 	auto buffer (std::make_shared<std::vector<uint8_t>> ());
 	{
-		rai::vectorstream stream (*buffer);
+		badem::vectorstream stream (*buffer);
 		message.serialize (stream);
 	}
 	auto this_l (shared_from_this ());
-	connection->socket->async_write (buffer, [this_l, buffer](boost::system::error_code const & ec, size_t size_a) {
-		rai::transaction transaction (this_l->connection->node->store.environment, nullptr, false);
+	connection->socket->async_write (buffer, [this_l](boost::system::error_code const & ec, size_t size_a) {
+		auto transaction (this_l->connection->node->store.tx_begin_read ());
 		if (!ec)
 		{
 			this_l->push (transaction);
@@ -593,9 +679,9 @@ void rai::bulk_push_client::start ()
 	});
 }
 
-void rai::bulk_push_client::push (MDB_txn * transaction_a)
+void badem::bulk_push_client::push (badem::transaction const & transaction_a)
 {
-	std::unique_ptr<rai::block> block;
+	std::shared_ptr<badem::block> block;
 	bool finished (false);
 	while (block == nullptr && !finished)
 	{
@@ -617,7 +703,7 @@ void rai::bulk_push_client::push (MDB_txn * transaction_a)
 			block = connection->node->store.block_get (transaction_a, current_target.first);
 			if (block == nullptr)
 			{
-				current_target.first = rai::block_hash (0);
+				current_target.first = badem::block_hash (0);
 			}
 			else
 			{
@@ -639,11 +725,11 @@ void rai::bulk_push_client::push (MDB_txn * transaction_a)
 	}
 }
 
-void rai::bulk_push_client::send_finished ()
+void badem::bulk_push_client::send_finished ()
 {
 	auto buffer (std::make_shared<std::vector<uint8_t>> ());
-	buffer->push_back (static_cast<uint8_t> (rai::block_type::not_a_block));
-	connection->node->stats.inc (rai::stat::type::bootstrap, rai::stat::detail::bulk_push, rai::stat::dir::out);
+	buffer->push_back (static_cast<uint8_t> (badem::block_type::not_a_block));
+	connection->node->stats.inc (badem::stat::type::bootstrap, badem::stat::detail::bulk_push, badem::stat::dir::out);
 	if (connection->node->config.logging.network_logging ())
 	{
 		BOOST_LOG (connection->node->log) << "Bulk push finished";
@@ -660,18 +746,18 @@ void rai::bulk_push_client::send_finished ()
 	});
 }
 
-void rai::bulk_push_client::push_block (rai::block const & block_a)
+void badem::bulk_push_client::push_block (badem::block const & block_a)
 {
 	auto buffer (std::make_shared<std::vector<uint8_t>> ());
 	{
-		rai::vectorstream stream (*buffer);
-		rai::serialize_block (stream, block_a);
+		badem::vectorstream stream (*buffer);
+		badem::serialize_block (stream, block_a);
 	}
 	auto this_l (shared_from_this ());
-	connection->socket->async_write (buffer, [this_l, buffer](boost::system::error_code const & ec, size_t size_a) {
+	connection->socket->async_write (buffer, [this_l](boost::system::error_code const & ec, size_t size_a) {
 		if (!ec)
 		{
-			rai::transaction transaction (this_l->connection->node->store.environment, nullptr, false);
+			auto transaction (this_l->connection->node->store.tx_begin_read ());
 			this_l->push (transaction);
 		}
 		else
@@ -684,41 +770,168 @@ void rai::bulk_push_client::push_block (rai::block const & block_a)
 	});
 }
 
-rai::pull_info::pull_info () :
+badem::bulk_pull_account_client::bulk_pull_account_client (std::shared_ptr<badem::bootstrap_client> connection_a, badem::account const & account_a) :
+connection (connection_a),
+account (account_a),
+total_blocks (0)
+{
+	connection->attempt->condition.notify_all ();
+}
+
+badem::bulk_pull_account_client::~bulk_pull_account_client ()
+{
+	{
+		std::lock_guard<std::mutex> mutex (connection->attempt->mutex);
+		--connection->attempt->pulling;
+	}
+	connection->attempt->condition.notify_all ();
+}
+
+void badem::bulk_pull_account_client::request ()
+{
+	badem::bulk_pull_account req;
+	req.account = account;
+	req.minimum_amount = connection->node->config.receive_minimum;
+	req.flags = badem::bulk_pull_account_flags::pending_hash_and_amount;
+
+	auto buffer (std::make_shared<std::vector<uint8_t>> ());
+	{
+		badem::vectorstream stream (*buffer);
+		req.serialize (stream);
+	}
+	if (connection->node->config.logging.bulk_pull_logging ())
+	{
+		std::unique_lock<std::mutex> lock (connection->attempt->mutex);
+		BOOST_LOG (connection->node->log) << boost::str (boost::format ("Requesting pending for account %1% from %2%. %3% accounts in queue") % req.account.to_account () % connection->endpoint % connection->attempt->wallet_accounts.size ());
+	}
+	else if (connection->node->config.logging.network_logging () && connection->attempt->should_log ())
+	{
+		std::unique_lock<std::mutex> lock (connection->attempt->mutex);
+		BOOST_LOG (connection->node->log) << boost::str (boost::format ("%1% accounts in pull queue") % connection->attempt->wallet_accounts.size ());
+	}
+	auto this_l (shared_from_this ());
+	connection->socket->async_write (buffer, [this_l](boost::system::error_code const & ec, size_t size_a) {
+		if (!ec)
+		{
+			this_l->receive_pending ();
+		}
+		else
+		{
+			this_l->connection->attempt->requeue_pending (this_l->account);
+			if (this_l->connection->node->config.logging.bulk_pull_logging ())
+			{
+				BOOST_LOG (this_l->connection->node->log) << boost::str (boost::format ("Error starting bulk pull request to %1%: to %2%") % ec.message () % this_l->connection->endpoint);
+			}
+		}
+	});
+}
+
+void badem::bulk_pull_account_client::receive_pending ()
+{
+	auto this_l (shared_from_this ());
+	size_t size_l (sizeof (badem::uint256_union) + sizeof (badem::uint128_union));
+	connection->socket->async_read (connection->receive_buffer, size_l, [this_l, size_l](boost::system::error_code const & ec, size_t size_a) {
+		// An issue with asio is that sometimes, instead of reporting a bad file descriptor during disconnect,
+		// we simply get a size of 0.
+		if (size_a == size_l)
+		{
+			if (!ec)
+			{
+				badem::block_hash pending;
+				badem::bufferstream frontier_stream (this_l->connection->receive_buffer->data (), sizeof (badem::uint256_union));
+				auto error1 (badem::try_read (frontier_stream, pending));
+				assert (!error1);
+				badem::amount balance;
+				badem::bufferstream balance_stream (this_l->connection->receive_buffer->data () + sizeof (badem::uint256_union), sizeof (badem::uint128_union));
+				auto error2 (badem::try_read (balance_stream, balance));
+				assert (!error2);
+				if (this_l->total_blocks == 0 || !pending.is_zero ())
+				{
+					if (this_l->total_blocks == 0 || balance.number () >= this_l->connection->node->config.receive_minimum.number ())
+					{
+						this_l->total_blocks++;
+						{
+							if (!pending.is_zero ())
+							{
+								auto transaction (this_l->connection->node->store.tx_begin_read ());
+								if (!this_l->connection->node->store.block_exists (transaction, pending))
+								{
+									this_l->connection->attempt->lazy_start (pending);
+								}
+							}
+						}
+						this_l->receive_pending ();
+					}
+					else
+					{
+						this_l->connection->attempt->requeue_pending (this_l->account);
+					}
+				}
+				else
+				{
+					this_l->connection->attempt->pool_connection (this_l->connection);
+				}
+			}
+			else
+			{
+				this_l->connection->attempt->requeue_pending (this_l->account);
+				if (this_l->connection->node->config.logging.network_logging ())
+				{
+					BOOST_LOG (this_l->connection->node->log) << boost::str (boost::format ("Error while receiving bulk pull account frontier %1%") % ec.message ());
+				}
+			}
+		}
+		else
+		{
+			this_l->connection->attempt->requeue_pending (this_l->account);
+			if (this_l->connection->node->config.logging.network_message_logging ())
+			{
+				BOOST_LOG (this_l->connection->node->log) << boost::str (boost::format ("Invalid size: expected %1%, got %2%") % size_l % size_a);
+			}
+		}
+	});
+}
+
+badem::pull_info::pull_info () :
 account (0),
 end (0),
+count (0),
 attempts (0)
 {
 }
 
-rai::pull_info::pull_info (rai::account const & account_a, rai::block_hash const & head_a, rai::block_hash const & end_a) :
+badem::pull_info::pull_info (badem::account const & account_a, badem::block_hash const & head_a, badem::block_hash const & end_a, count_t count_a) :
 account (account_a),
 head (head_a),
 end (end_a),
+count (count_a),
 attempts (0)
 {
 }
 
-rai::bootstrap_attempt::bootstrap_attempt (std::shared_ptr<rai::node> node_a) :
+badem::bootstrap_attempt::bootstrap_attempt (std::shared_ptr<badem::node> node_a) :
 next_log (std::chrono::steady_clock::now ()),
 connections (0),
 pulling (0),
 node (node_a),
 account_count (0),
 total_blocks (0),
-stopped (false)
+runs_count (0),
+stopped (false),
+mode (badem::bootstrap_mode::legacy),
+lazy_stopped (0)
 {
 	BOOST_LOG (node->log) << "Starting bootstrap attempt";
 	node->bootstrap_initiator.notify_listeners (true);
 }
 
-rai::bootstrap_attempt::~bootstrap_attempt ()
+badem::bootstrap_attempt::~bootstrap_attempt ()
 {
 	BOOST_LOG (node->log) << "Exiting bootstrap attempt";
 	node->bootstrap_initiator.notify_listeners (false);
 }
 
-bool rai::bootstrap_attempt::should_log ()
+bool badem::bootstrap_attempt::should_log ()
 {
 	std::lock_guard<std::mutex> lock (mutex);
 	auto result (false);
@@ -731,7 +944,7 @@ bool rai::bootstrap_attempt::should_log ()
 	return result;
 }
 
-bool rai::bootstrap_attempt::request_frontier (std::unique_lock<std::mutex> & lock_a)
+bool badem::bootstrap_attempt::request_frontier (std::unique_lock<std::mutex> & lock_a)
 {
 	auto result (true);
 	auto connection_l (connection (lock_a));
@@ -740,13 +953,13 @@ bool rai::bootstrap_attempt::request_frontier (std::unique_lock<std::mutex> & lo
 	{
 		std::future<bool> future;
 		{
-			auto client (std::make_shared<rai::frontier_req_client> (connection_l));
+			auto client (std::make_shared<badem::frontier_req_client> (connection_l));
 			client->run ();
 			frontiers = client;
 			future = client->promise.get_future ();
 		}
 		lock_a.unlock ();
-		result = consume_future (future);
+		result = consume_future (future); // This is out of scope of `client' so when the last reference via boost::asio::io_context is lost and the client is destroyed, the future throws an exception.
 		lock_a.lock ();
 		if (result)
 		{
@@ -767,33 +980,48 @@ bool rai::bootstrap_attempt::request_frontier (std::unique_lock<std::mutex> & lo
 	return result;
 }
 
-void rai::bootstrap_attempt::request_pull (std::unique_lock<std::mutex> & lock_a)
+void badem::bootstrap_attempt::request_pull (std::unique_lock<std::mutex> & lock_a)
 {
 	auto connection_l (connection (lock_a));
 	if (connection_l)
 	{
 		auto pull (pulls.front ());
 		pulls.pop_front ();
+		if (mode != badem::bootstrap_mode::legacy)
+		{
+			// Check if pull is obsolete (head was processed)
+			std::unique_lock<std::mutex> lock (lazy_mutex);
+			auto transaction (node->store.tx_begin_read ());
+			while (!pulls.empty () && !pull.head.is_zero () && (lazy_blocks.find (pull.head) != lazy_blocks.end () || node->store.block_exists (transaction, pull.head)))
+			{
+				pull = pulls.front ();
+				pulls.pop_front ();
+			}
+		}
+		++pulling;
 		// The bulk_pull_client destructor attempt to requeue_pull which can cause a deadlock if this is the last reference
 		// Dispatch request in an external thread in case it needs to be destroyed
 		node->background ([connection_l, pull]() {
-			auto client (std::make_shared<rai::bulk_pull_client> (connection_l, pull));
+			auto client (std::make_shared<badem::bulk_pull_client> (connection_l, pull));
 			client->request ();
 		});
 	}
 }
 
-void rai::bootstrap_attempt::request_push (std::unique_lock<std::mutex> & lock_a)
+void badem::bootstrap_attempt::request_push (std::unique_lock<std::mutex> & lock_a)
 {
 	bool error (false);
 	if (auto connection_shared = connection_frontier_request.lock ())
 	{
-		auto client (std::make_shared<rai::bulk_push_client> (connection_shared));
-		client->start ();
-		push = client;
-		auto future (client->promise.get_future ());
+		std::future<bool> future;
+		{
+			auto client (std::make_shared<badem::bulk_push_client> (connection_shared));
+			client->start ();
+			push = client;
+			future = client->promise.get_future ();
+		}
 		lock_a.unlock ();
-		error = consume_future (future);
+		error = consume_future (future); // This is out of scope of `client' so when the last reference via boost::asio::io_context is lost and the client is destroyed, the future throws an exception.
 		lock_a.lock ();
 	}
 	if (node->config.logging.network_logging ())
@@ -806,7 +1034,7 @@ void rai::bootstrap_attempt::request_push (std::unique_lock<std::mutex> & lock_a
 	}
 }
 
-bool rai::bootstrap_attempt::still_pulling ()
+bool badem::bootstrap_attempt::still_pulling ()
 {
 	assert (!mutex.try_lock ());
 	auto running (!stopped);
@@ -815,7 +1043,7 @@ bool rai::bootstrap_attempt::still_pulling ()
 	return running && (more_pulls || still_pulling);
 }
 
-void rai::bootstrap_attempt::run ()
+void badem::bootstrap_attempt::run ()
 {
 	populate_connections ();
 	std::unique_lock<std::mutex> lock (mutex);
@@ -825,10 +1053,14 @@ void rai::bootstrap_attempt::run ()
 		frontier_failure = request_frontier (lock);
 	}
 	// Shuffle pulls.
-	for (int i = pulls.size () - 1; i > 0; i--)
+	release_assert (std::numeric_limits<CryptoPP::word32>::max () > pulls.size ());
+	if (!pulls.empty ())
 	{
-		auto k = rai::random_pool.GenerateWord32 (0, i);
-		std::swap (pulls[i], pulls[k]);
+		for (auto i = static_cast<CryptoPP::word32> (pulls.size () - 1); i > 0; --i)
+		{
+			auto k = badem::random_pool::generate_word32 (0, i);
+			std::swap (pulls[i], pulls[k]);
+		}
 	}
 	while (still_pulling ())
 	{
@@ -860,20 +1092,41 @@ void rai::bootstrap_attempt::run ()
 	if (!stopped)
 	{
 		BOOST_LOG (node->log) << "Completed pulls";
+		request_push (lock);
+		runs_count++;
+		// Start wallet lazy bootstrap if required
+		if (!wallet_accounts.empty () && !node->flags.disable_wallet_bootstrap)
+		{
+			lock.unlock ();
+			mode = badem::bootstrap_mode::wallet_lazy;
+			wallet_run ();
+			lock.lock ();
+		}
+		// Start lazy bootstrap if some lazy keys were inserted
+		else if (runs_count < 3 && !lazy_finished () && !node->flags.disable_lazy_bootstrap)
+		{
+			lock.unlock ();
+			mode = badem::bootstrap_mode::lazy;
+			lazy_run ();
+			lock.lock ();
+		}
+		if (!node->flags.disable_unchecked_cleanup)
+		{
+			node->unchecked_cleanup ();
+		}
 	}
-	request_push (lock);
 	stopped = true;
 	condition.notify_all ();
 	idle.clear ();
 }
 
-std::shared_ptr<rai::bootstrap_client> rai::bootstrap_attempt::connection (std::unique_lock<std::mutex> & lock_a)
+std::shared_ptr<badem::bootstrap_client> badem::bootstrap_attempt::connection (std::unique_lock<std::mutex> & lock_a)
 {
 	while (!stopped && idle.empty ())
 	{
 		condition.wait (lock_a);
 	}
-	std::shared_ptr<rai::bootstrap_client> result;
+	std::shared_ptr<badem::bootstrap_client> result;
 	if (!idle.empty ())
 	{
 		result = idle.back ();
@@ -882,7 +1135,7 @@ std::shared_ptr<rai::bootstrap_client> rai::bootstrap_attempt::connection (std::
 	return result;
 }
 
-bool rai::bootstrap_attempt::consume_future (std::future<bool> & future_a)
+bool badem::bootstrap_attempt::consume_future (std::future<bool> & future_a)
 {
 	bool result;
 	try
@@ -898,13 +1151,13 @@ bool rai::bootstrap_attempt::consume_future (std::future<bool> & future_a)
 
 struct block_rate_cmp
 {
-	bool operator() (const std::shared_ptr<rai::bootstrap_client> & lhs, const std::shared_ptr<rai::bootstrap_client> & rhs) const
+	bool operator() (const std::shared_ptr<badem::bootstrap_client> & lhs, const std::shared_ptr<badem::bootstrap_client> & rhs) const
 	{
 		return lhs->block_rate () > rhs->block_rate ();
 	}
 };
 
-unsigned rai::bootstrap_attempt::target_connections (size_t pulls_remaining)
+unsigned badem::bootstrap_attempt::target_connections (size_t pulls_remaining)
 {
 	if (node->config.bootstrap_connections >= node->config.bootstrap_connections_max)
 	{
@@ -917,18 +1170,22 @@ unsigned rai::bootstrap_attempt::target_connections (size_t pulls_remaining)
 	return std::max (1U, (unsigned)(target + 0.5f));
 }
 
-void rai::bootstrap_attempt::populate_connections ()
+void badem::bootstrap_attempt::populate_connections ()
 {
 	double rate_sum = 0.0;
 	size_t num_pulls = 0;
-	std::priority_queue<std::shared_ptr<rai::bootstrap_client>, std::vector<std::shared_ptr<rai::bootstrap_client>>, block_rate_cmp> sorted_connections;
+	std::priority_queue<std::shared_ptr<badem::bootstrap_client>, std::vector<std::shared_ptr<badem::bootstrap_client>>, block_rate_cmp> sorted_connections;
+	std::unordered_set<badem::tcp_endpoint> endpoints;
 	{
 		std::unique_lock<std::mutex> lock (mutex);
 		num_pulls = pulls.size ();
+		std::deque<std::weak_ptr<badem::bootstrap_client>> new_clients;
 		for (auto & c : clients)
 		{
 			if (auto client = c.lock ())
 			{
+				new_clients.push_back (client);
+				endpoints.insert (client->endpoint);
 				double elapsed_sec = client->elapsed_seconds ();
 				auto blocks_per_sec = client->block_rate ();
 				rate_sum += blocks_per_sec;
@@ -949,6 +1206,8 @@ void rai::bootstrap_attempt::populate_connections ()
 				}
 			}
 		}
+		// Cleanup expired clients
+		clients.swap (new_clients);
 	}
 
 	auto target = target_connections (num_pulls);
@@ -990,15 +1249,17 @@ void rai::bootstrap_attempt::populate_connections ()
 		auto delta = std::min ((target - connections) * 2, bootstrap_max_new_connections);
 		// TODO - tune this better
 		// Not many peers respond, need to try to make more connections than we need.
-		for (int i = 0; i < delta; i++)
+		for (auto i = 0u; i < delta; i++)
 		{
 			auto peer (node->peers.bootstrap_peer ());
-			if (peer != rai::endpoint (boost::asio::ip::address_v6::any (), 0))
+			auto endpoint (badem::tcp_endpoint (peer.address (), peer.port ()));
+			if (peer != badem::endpoint (boost::asio::ip::address_v6::any (), 0) && endpoints.find (endpoint) == endpoints.end ())
 			{
-				auto client (std::make_shared<rai::bootstrap_client> (node, shared_from_this (), rai::tcp_endpoint (peer.address (), peer.port ())));
+				auto client (std::make_shared<badem::bootstrap_client> (node, shared_from_this (), endpoint));
 				client->run ();
 				std::lock_guard<std::mutex> lock (mutex);
 				clients.push_back (client);
+				endpoints.insert (endpoint);
 			}
 			else if (connections == 0)
 			{
@@ -1010,7 +1271,7 @@ void rai::bootstrap_attempt::populate_connections ()
 	}
 	if (!stopped)
 	{
-		std::weak_ptr<rai::bootstrap_attempt> this_w (shared_from_this ());
+		std::weak_ptr<badem::bootstrap_attempt> this_w (shared_from_this ());
 		node->alarm.add (std::chrono::steady_clock::now () + std::chrono::seconds (1), [this_w]() {
 			if (auto this_l = this_w.lock ())
 			{
@@ -1020,20 +1281,25 @@ void rai::bootstrap_attempt::populate_connections ()
 	}
 }
 
-void rai::bootstrap_attempt::add_connection (rai::endpoint const & endpoint_a)
+void badem::bootstrap_attempt::add_connection (badem::endpoint const & endpoint_a)
 {
-	auto client (std::make_shared<rai::bootstrap_client> (node, shared_from_this (), rai::tcp_endpoint (endpoint_a.address (), endpoint_a.port ())));
+	auto client (std::make_shared<badem::bootstrap_client> (node, shared_from_this (), badem::tcp_endpoint (endpoint_a.address (), endpoint_a.port ())));
 	client->run ();
 }
 
-void rai::bootstrap_attempt::pool_connection (std::shared_ptr<rai::bootstrap_client> client_a)
+void badem::bootstrap_attempt::pool_connection (std::shared_ptr<badem::bootstrap_client> client_a)
 {
-	std::lock_guard<std::mutex> lock (mutex);
-	idle.push_front (client_a);
+	{
+		std::lock_guard<std::mutex> lock (mutex);
+		if (!stopped && !client_a->pending_stop)
+		{
+			idle.push_front (client_a);
+		}
+	}
 	condition.notify_all ();
 }
 
-void rai::bootstrap_attempt::stop ()
+void badem::bootstrap_attempt::stop ()
 {
 	std::lock_guard<std::mutex> lock (mutex);
 	stopped = true;
@@ -1067,14 +1333,16 @@ void rai::bootstrap_attempt::stop ()
 	}
 }
 
-void rai::bootstrap_attempt::add_pull (rai::pull_info const & pull)
+void badem::bootstrap_attempt::add_pull (badem::pull_info const & pull)
 {
-	std::lock_guard<std::mutex> lock (mutex);
-	pulls.push_back (pull);
+	{
+		std::lock_guard<std::mutex> lock (mutex);
+		pulls.push_back (pull);
+	}
 	condition.notify_all ();
 }
 
-void rai::bootstrap_attempt::requeue_pull (rai::pull_info const & pull_a)
+void badem::bootstrap_attempt::requeue_pull (badem::pull_info const & pull_a)
 {
 	auto pull (pull_a);
 	if (++pull.attempts < bootstrap_frontier_retry_limit)
@@ -1083,21 +1351,15 @@ void rai::bootstrap_attempt::requeue_pull (rai::pull_info const & pull_a)
 		pulls.push_front (pull);
 		condition.notify_all ();
 	}
-	else if (pull.attempts == bootstrap_frontier_retry_limit)
+	else if (mode == badem::bootstrap_mode::lazy)
 	{
-		pull.attempts++;
-		std::lock_guard<std::mutex> lock (mutex);
-		if (auto connection_shared = connection_frontier_request.lock ())
 		{
-			node->background ([connection_shared, pull]() {
-				auto client (std::make_shared<rai::bulk_pull_client> (connection_shared, pull));
-				client->request ();
-			});
-			if (node->config.logging.bulk_pull_logging ())
-			{
-				BOOST_LOG (node->log) << boost::str (boost::format ("Requesting pull account %1% from frontier peer after %2% attempts") % pull.account.to_account () % pull.attempts);
-			}
+			// Retry for lazy pulls (not weak state block link assumptions)
+			std::lock_guard<std::mutex> lock (mutex);
+			pull.attempts++;
+			pulls.push_back (pull);
 		}
+		condition.notify_all ();
 	}
 	else
 	{
@@ -1108,41 +1370,424 @@ void rai::bootstrap_attempt::requeue_pull (rai::pull_info const & pull_a)
 	}
 }
 
-void rai::bootstrap_attempt::add_bulk_push_target (rai::block_hash const & head, rai::block_hash const & end)
+void badem::bootstrap_attempt::add_bulk_push_target (badem::block_hash const & head, badem::block_hash const & end)
 {
 	std::lock_guard<std::mutex> lock (mutex);
 	bulk_push_targets.push_back (std::make_pair (head, end));
 }
 
-rai::bootstrap_initiator::bootstrap_initiator (rai::node & node_a) :
+void badem::bootstrap_attempt::lazy_start (badem::block_hash const & hash_a)
+{
+	std::unique_lock<std::mutex> lock (lazy_mutex);
+	// Add start blocks, limit 1024 (32k with disabled legacy bootstrap)
+	size_t max_keys (node->flags.disable_legacy_bootstrap ? 32 * 1024 : 1024);
+	if (lazy_keys.size () < max_keys && lazy_keys.find (hash_a) == lazy_keys.end () && lazy_blocks.find (hash_a) == lazy_blocks.end ())
+	{
+		lazy_keys.insert (hash_a);
+		lazy_pulls.push_back (hash_a);
+	}
+}
+
+void badem::bootstrap_attempt::lazy_add (badem::block_hash const & hash_a)
+{
+	// Add only unknown blocks
+	assert (!lazy_mutex.try_lock ());
+	if (lazy_blocks.find (hash_a) == lazy_blocks.end ())
+	{
+		lazy_pulls.push_back (hash_a);
+	}
+}
+
+void badem::bootstrap_attempt::lazy_pull_flush ()
+{
+	assert (!mutex.try_lock ());
+	std::unique_lock<std::mutex> lazy_lock (lazy_mutex);
+	auto transaction (node->store.tx_begin_read ());
+	for (auto & pull_start : lazy_pulls)
+	{
+		// Recheck if block was already processed
+		if (lazy_blocks.find (pull_start) == lazy_blocks.end () && !node->store.block_exists (transaction, pull_start))
+		{
+			pulls.push_back (badem::pull_info (pull_start, pull_start, badem::block_hash (0), lazy_max_pull_blocks));
+		}
+	}
+	lazy_pulls.clear ();
+}
+
+bool badem::bootstrap_attempt::lazy_finished ()
+{
+	bool result (true);
+	auto transaction (node->store.tx_begin_read ());
+	std::unique_lock<std::mutex> lock (lazy_mutex);
+	for (auto it (lazy_keys.begin ()), end (lazy_keys.end ()); it != end && !stopped;)
+	{
+		if (node->store.block_exists (transaction, *it))
+		{
+			it = lazy_keys.erase (it);
+		}
+		else
+		{
+			result = false;
+			break;
+			// No need to increment `it` as we break above.
+		}
+	}
+	// Finish lazy bootstrap without lazy pulls (in combination with still_pulling ())
+	if (!result && lazy_pulls.empty ())
+	{
+		result = true;
+	}
+	return result;
+}
+
+void badem::bootstrap_attempt::lazy_clear ()
+{
+	assert (!lazy_mutex.try_lock ());
+	lazy_blocks.clear ();
+	lazy_keys.clear ();
+	lazy_pulls.clear ();
+	lazy_state_unknown.clear ();
+	lazy_balances.clear ();
+	lazy_stopped = 0;
+}
+
+void badem::bootstrap_attempt::lazy_run ()
+{
+	populate_connections ();
+	auto start_time (std::chrono::steady_clock::now ());
+	auto max_time (std::chrono::minutes (node->flags.disable_legacy_bootstrap ? 48 * 60 : 30));
+	std::unique_lock<std::mutex> lock (mutex);
+	while ((still_pulling () || !lazy_finished ()) && lazy_stopped < lazy_max_stopped && std::chrono::steady_clock::now () - start_time < max_time)
+	{
+		unsigned iterations (0);
+		while (still_pulling () && lazy_stopped < lazy_max_stopped && std::chrono::steady_clock::now () - start_time < max_time)
+		{
+			if (!pulls.empty ())
+			{
+				if (!node->block_processor.full ())
+				{
+					request_pull (lock);
+				}
+				else
+				{
+					condition.wait_for (lock, std::chrono::seconds (15));
+				}
+			}
+			else
+			{
+				condition.wait (lock);
+			}
+			++iterations;
+			// Flushing lazy pulls
+			if (iterations % 100 == 0)
+			{
+				lazy_pull_flush ();
+			}
+		}
+		// Flushing may resolve forks which can add more pulls
+		// Flushing lazy pulls
+		lock.unlock ();
+		node->block_processor.flush ();
+		lock.lock ();
+		lazy_pull_flush ();
+	}
+	if (!stopped)
+	{
+		BOOST_LOG (node->log) << "Completed lazy pulls";
+		std::unique_lock<std::mutex> lazy_lock (lazy_mutex);
+		runs_count++;
+		// Start wallet lazy bootstrap if required
+		if (!wallet_accounts.empty () && !node->flags.disable_wallet_bootstrap)
+		{
+			pulls.clear ();
+			lazy_clear ();
+			mode = badem::bootstrap_mode::wallet_lazy;
+			lock.unlock ();
+			lazy_lock.unlock ();
+			wallet_run ();
+			lock.lock ();
+		}
+		// Fallback to legacy bootstrap
+		else if (runs_count < 3 && !lazy_keys.empty () && !node->flags.disable_legacy_bootstrap)
+		{
+			pulls.clear ();
+			lazy_clear ();
+			mode = badem::bootstrap_mode::legacy;
+			lock.unlock ();
+			lazy_lock.unlock ();
+			run ();
+			lock.lock ();
+		}
+	}
+	stopped = true;
+	condition.notify_all ();
+	idle.clear ();
+}
+
+bool badem::bootstrap_attempt::process_block (std::shared_ptr<badem::block> block_a, badem::account const & known_account_a, uint64_t total_blocks, bool block_expected)
+{
+	bool stop_pull (false);
+	if (mode != badem::bootstrap_mode::legacy && block_expected)
+	{
+		auto hash (block_a->hash ());
+		std::unique_lock<std::mutex> lock (lazy_mutex);
+		// Processing new blocks
+		if (lazy_blocks.find (hash) == lazy_blocks.end ())
+		{
+			// Search block in ledger (old)
+			auto transaction (node->store.tx_begin_read ());
+			if (!node->store.block_exists (transaction, block_a->type (), hash))
+			{
+				badem::uint128_t balance (std::numeric_limits<badem::uint128_t>::max ());
+				badem::unchecked_info info (block_a, known_account_a, 0, badem::signature_verification::unknown);
+				node->block_processor.add (info);
+				// Search for new dependencies
+				if (!block_a->source ().is_zero () && !node->store.block_exists (transaction, block_a->source ()))
+				{
+					lazy_add (block_a->source ());
+				}
+				else if (block_a->type () == badem::block_type::send)
+				{
+					// Calculate balance for legacy send blocks
+					std::shared_ptr<badem::send_block> block_l (std::static_pointer_cast<badem::send_block> (block_a));
+					if (block_l != nullptr)
+					{
+						balance = block_l->hashables.balance.number ();
+					}
+				}
+				else if (block_a->type () == badem::block_type::state)
+				{
+					std::shared_ptr<badem::state_block> block_l (std::static_pointer_cast<badem::state_block> (block_a));
+					if (block_l != nullptr)
+					{
+						balance = block_l->hashables.balance.number ();
+						badem::block_hash link (block_l->hashables.link);
+						// If link is not epoch link or 0. And if block from link unknown
+						if (!link.is_zero () && link != node->ledger.epoch_link && lazy_blocks.find (link) == lazy_blocks.end () && !node->store.block_exists (transaction, link))
+						{
+							badem::block_hash previous (block_l->hashables.previous);
+							// If state block previous is 0 then source block required
+							if (previous.is_zero ())
+							{
+								lazy_add (link);
+							}
+							// In other cases previous block balance required to find out subtype of state block
+							else if (node->store.block_exists (transaction, previous))
+							{
+								badem::amount prev_balance (node->ledger.balance (transaction, previous));
+								if (prev_balance.number () <= balance)
+								{
+									lazy_add (link);
+								}
+							}
+							// Search balance of already processed previous blocks
+							else if (lazy_blocks.find (previous) != lazy_blocks.end ())
+							{
+								auto previous_balance (lazy_balances.find (previous));
+								if (previous_balance != lazy_balances.end ())
+								{
+									if (previous_balance->second <= balance)
+									{
+										lazy_add (link);
+									}
+									lazy_balances.erase (previous_balance);
+								}
+							}
+							// Insert in unknown state blocks if previous wasn't already processed
+							else
+							{
+								lazy_state_unknown.insert (std::make_pair (previous, std::make_pair (link, balance)));
+							}
+						}
+					}
+				}
+				lazy_blocks.insert (hash);
+				// Adding lazy balances
+				if (total_blocks == 0)
+				{
+					lazy_balances.insert (std::make_pair (hash, balance));
+				}
+				// Removing lazy balances
+				if (!block_a->previous ().is_zero () && lazy_balances.find (block_a->previous ()) != lazy_balances.end ())
+				{
+					lazy_balances.erase (block_a->previous ());
+				}
+			}
+			// Drop bulk_pull if block is already known (ledger)
+			else
+			{
+				// Disabled until server rewrite
+				// stop_pull = true;
+				// Force drop lazy bootstrap connection for long bulk_pull
+				if (total_blocks > lazy_max_pull_blocks)
+				{
+					stop_pull = true;
+				}
+			}
+			//Search unknown state blocks balances
+			auto find_state (lazy_state_unknown.find (hash));
+			if (find_state != lazy_state_unknown.end ())
+			{
+				auto next_block (find_state->second);
+				lazy_state_unknown.erase (hash);
+				// Retrieve balance for previous state blocks
+				if (block_a->type () == badem::block_type::state)
+				{
+					std::shared_ptr<badem::state_block> block_l (std::static_pointer_cast<badem::state_block> (block_a));
+					if (block_l->hashables.balance.number () <= next_block.second)
+					{
+						lazy_add (next_block.first);
+					}
+				}
+				// Retrieve balance for previous legacy send blocks
+				else if (block_a->type () == badem::block_type::send)
+				{
+					std::shared_ptr<badem::send_block> block_l (std::static_pointer_cast<badem::send_block> (block_a));
+					if (block_l->hashables.balance.number () <= next_block.second)
+					{
+						lazy_add (next_block.first);
+					}
+				}
+				// Weak assumption for other legacy block types
+				else
+				{
+					// Disabled
+				}
+			}
+		}
+		// Drop bulk_pull if block is already known (processed set)
+		else
+		{
+			// Disabled until server rewrite
+			// stop_pull = true;
+			// Force drop lazy bootstrap connection for long bulk_pull
+			if (total_blocks > lazy_max_pull_blocks)
+			{
+				stop_pull = true;
+			}
+		}
+	}
+	else if (mode != badem::bootstrap_mode::legacy)
+	{
+		// Drop connection with unexpected block for lazy bootstrap
+		stop_pull = true;
+	}
+	else
+	{
+		badem::unchecked_info info (block_a, known_account_a, 0, badem::signature_verification::unknown);
+		node->block_processor.add (info);
+	}
+	return stop_pull;
+}
+
+void badem::bootstrap_attempt::request_pending (std::unique_lock<std::mutex> & lock_a)
+{
+	auto connection_l (connection (lock_a));
+	if (connection_l)
+	{
+		auto account (wallet_accounts.front ());
+		wallet_accounts.pop_front ();
+		++pulling;
+		// The bulk_pull_account_client destructor attempt to requeue_pull which can cause a deadlock if this is the last reference
+		// Dispatch request in an external thread in case it needs to be destroyed
+		node->background ([connection_l, account]() {
+			auto client (std::make_shared<badem::bulk_pull_account_client> (connection_l, account));
+			client->request ();
+		});
+	}
+}
+
+void badem::bootstrap_attempt::requeue_pending (badem::account const & account_a)
+{
+	auto account (account_a);
+	{
+		std::lock_guard<std::mutex> lock (mutex);
+		wallet_accounts.push_front (account);
+		condition.notify_all ();
+	}
+}
+
+void badem::bootstrap_attempt::wallet_start (std::deque<badem::account> & accounts_a)
+{
+	std::lock_guard<std::mutex> lock (mutex);
+	wallet_accounts.swap (accounts_a);
+}
+
+bool badem::bootstrap_attempt::wallet_finished ()
+{
+	assert (!mutex.try_lock ());
+	auto running (!stopped);
+	auto more_accounts (!wallet_accounts.empty ());
+	auto still_pulling (pulling > 0);
+	return running && (more_accounts || still_pulling);
+}
+
+void badem::bootstrap_attempt::wallet_run ()
+{
+	populate_connections ();
+	auto start_time (std::chrono::steady_clock::now ());
+	auto max_time (std::chrono::minutes (10));
+	std::unique_lock<std::mutex> lock (mutex);
+	while (wallet_finished () && std::chrono::steady_clock::now () - start_time < max_time)
+	{
+		if (!wallet_accounts.empty ())
+		{
+			request_pending (lock);
+		}
+		else
+		{
+			condition.wait (lock);
+		}
+	}
+	if (!stopped)
+	{
+		BOOST_LOG (node->log) << "Completed wallet lazy pulls";
+		runs_count++;
+		// Start lazy bootstrap if some lazy keys were inserted
+		if (!lazy_finished ())
+		{
+			lock.unlock ();
+			lazy_run ();
+			lock.lock ();
+		}
+	}
+	stopped = true;
+	condition.notify_all ();
+	idle.clear ();
+}
+
+badem::bootstrap_initiator::bootstrap_initiator (badem::node & node_a) :
 node (node_a),
 stopped (false),
-thread ([this]() { run_bootstrap (); })
+thread ([this]() {
+	badem::thread_role::set (badem::thread_role::name::bootstrap_initiator);
+	run_bootstrap ();
+})
 {
 }
 
-rai::bootstrap_initiator::~bootstrap_initiator ()
+badem::bootstrap_initiator::~bootstrap_initiator ()
 {
 	stop ();
 	thread.join ();
 }
 
-void rai::bootstrap_initiator::bootstrap ()
+void badem::bootstrap_initiator::bootstrap ()
 {
 	std::unique_lock<std::mutex> lock (mutex);
 	if (!stopped && attempt == nullptr)
 	{
-		node.stats.inc (rai::stat::type::bootstrap, rai::stat::detail::initiate, rai::stat::dir::out);
-		attempt = std::make_shared<rai::bootstrap_attempt> (node.shared ());
+		node.stats.inc (badem::stat::type::bootstrap, badem::stat::detail::initiate, badem::stat::dir::out);
+		attempt = std::make_shared<badem::bootstrap_attempt> (node.shared ());
 		condition.notify_all ();
 	}
 }
 
-void rai::bootstrap_initiator::bootstrap (rai::endpoint const & endpoint_a, bool add_to_peers)
+void badem::bootstrap_initiator::bootstrap (badem::endpoint const & endpoint_a, bool add_to_peers)
 {
 	if (add_to_peers)
 	{
-		node.peers.insert (endpoint_a, rai::protocol_version);
+		node.peers.insert (badem::map_endpoint_to_v6 (endpoint_a), badem::protocol_version);
 	}
 	std::unique_lock<std::mutex> lock (mutex);
 	if (!stopped)
@@ -1152,14 +1797,52 @@ void rai::bootstrap_initiator::bootstrap (rai::endpoint const & endpoint_a, bool
 			attempt->stop ();
 			condition.wait (lock);
 		}
-		node.stats.inc (rai::stat::type::bootstrap, rai::stat::detail::initiate, rai::stat::dir::out);
-		attempt = std::make_shared<rai::bootstrap_attempt> (node.shared ());
+		node.stats.inc (badem::stat::type::bootstrap, badem::stat::detail::initiate, badem::stat::dir::out);
+		attempt = std::make_shared<badem::bootstrap_attempt> (node.shared ());
 		attempt->add_connection (endpoint_a);
 		condition.notify_all ();
 	}
 }
 
-void rai::bootstrap_initiator::run_bootstrap ()
+void badem::bootstrap_initiator::bootstrap_lazy (badem::block_hash const & hash_a, bool force)
+{
+	{
+		std::unique_lock<std::mutex> lock (mutex);
+		if (force)
+		{
+			while (attempt != nullptr)
+			{
+				attempt->stop ();
+				condition.wait (lock);
+			}
+		}
+		node.stats.inc (badem::stat::type::bootstrap, badem::stat::detail::initiate_lazy, badem::stat::dir::out);
+		if (attempt == nullptr)
+		{
+			attempt = std::make_shared<badem::bootstrap_attempt> (node.shared ());
+			attempt->mode = badem::bootstrap_mode::lazy;
+		}
+		attempt->lazy_start (hash_a);
+	}
+	condition.notify_all ();
+}
+
+void badem::bootstrap_initiator::bootstrap_wallet (std::deque<badem::account> & accounts_a)
+{
+	{
+		std::unique_lock<std::mutex> lock (mutex);
+		node.stats.inc (badem::stat::type::bootstrap, badem::stat::detail::initiate_wallet_lazy, badem::stat::dir::out);
+		if (attempt == nullptr)
+		{
+			attempt = std::make_shared<badem::bootstrap_attempt> (node.shared ());
+			attempt->mode = badem::bootstrap_mode::wallet_lazy;
+		}
+		attempt->wallet_start (accounts_a);
+	}
+	condition.notify_all ();
+}
+
+void badem::bootstrap_initiator::run_bootstrap ()
 {
 	std::unique_lock<std::mutex> lock (mutex);
 	while (!stopped)
@@ -1167,7 +1850,18 @@ void rai::bootstrap_initiator::run_bootstrap ()
 		if (attempt != nullptr)
 		{
 			lock.unlock ();
-			attempt->run ();
+			if (attempt->mode == badem::bootstrap_mode::legacy)
+			{
+				attempt->run ();
+			}
+			else if (attempt->mode == badem::bootstrap_mode::lazy)
+			{
+				attempt->lazy_run ();
+			}
+			else
+			{
+				attempt->wallet_run ();
+			}
 			lock.lock ();
 			attempt = nullptr;
 			condition.notify_all ();
@@ -1179,35 +1873,37 @@ void rai::bootstrap_initiator::run_bootstrap ()
 	}
 }
 
-void rai::bootstrap_initiator::add_observer (std::function<void(bool)> const & observer_a)
+void badem::bootstrap_initiator::add_observer (std::function<void(bool)> const & observer_a)
 {
 	std::lock_guard<std::mutex> lock (mutex);
 	observers.push_back (observer_a);
 }
 
-bool rai::bootstrap_initiator::in_progress ()
+bool badem::bootstrap_initiator::in_progress ()
 {
 	return current_attempt () != nullptr;
 }
 
-std::shared_ptr<rai::bootstrap_attempt> rai::bootstrap_initiator::current_attempt ()
+std::shared_ptr<badem::bootstrap_attempt> badem::bootstrap_initiator::current_attempt ()
 {
 	std::lock_guard<std::mutex> lock (mutex);
 	return attempt;
 }
 
-void rai::bootstrap_initiator::stop ()
+void badem::bootstrap_initiator::stop ()
 {
-	std::unique_lock<std::mutex> lock (mutex);
-	stopped = true;
-	if (attempt != nullptr)
 	{
-		attempt->stop ();
+		std::unique_lock<std::mutex> lock (mutex);
+		stopped = true;
+		if (attempt != nullptr)
+		{
+			attempt->stop ();
+		}
 	}
 	condition.notify_all ();
 }
 
-void rai::bootstrap_initiator::notify_listeners (bool in_progress_a)
+void badem::bootstrap_initiator::notify_listeners (bool in_progress_a)
 {
 	for (auto & i : observers)
 	{
@@ -1215,15 +1911,33 @@ void rai::bootstrap_initiator::notify_listeners (bool in_progress_a)
 	}
 }
 
-rai::bootstrap_listener::bootstrap_listener (boost::asio::io_service & service_a, uint16_t port_a, rai::node & node_a) :
-acceptor (service_a),
+namespace badem
+{
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (bootstrap_initiator & bootstrap_initiator, const std::string & name)
+{
+	size_t count = 0;
+	{
+		std::lock_guard<std::mutex> guard (bootstrap_initiator.mutex);
+		count = bootstrap_initiator.observers.size ();
+	}
+
+	auto sizeof_element = sizeof (decltype (bootstrap_initiator.observers)::value_type);
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "observers", count, sizeof_element }));
+	return composite;
+}
+}
+
+badem::bootstrap_listener::bootstrap_listener (boost::asio::io_context & io_ctx_a, uint16_t port_a, badem::node & node_a) :
+acceptor (io_ctx_a),
 local (boost::asio::ip::tcp::endpoint (boost::asio::ip::address_v6::any (), port_a)),
-service (service_a),
-node (node_a)
+io_ctx (io_ctx_a),
+node (node_a),
+defer_acceptor (io_ctx_a)
 {
 }
 
-void rai::bootstrap_listener::start ()
+void badem::bootstrap_listener::start ()
 {
 	acceptor.open (local.protocol ());
 	acceptor.set_option (boost::asio::ip::tcp::acceptor::reuse_address (true));
@@ -1240,7 +1954,7 @@ void rai::bootstrap_listener::start ()
 	accept_connection ();
 }
 
-void rai::bootstrap_listener::stop ()
+void badem::bootstrap_listener::stop ()
 {
 	decltype (connections) connections_l;
 	{
@@ -1259,28 +1973,51 @@ void rai::bootstrap_listener::stop ()
 	}
 }
 
-void rai::bootstrap_listener::accept_connection ()
+void badem::bootstrap_listener::accept_connection ()
 {
-	auto socket (std::make_shared<rai::socket> (node.shared ()));
-	acceptor.async_accept (socket->socket_m, [this, socket](boost::system::error_code const & ec) {
-		accept_action (ec, socket);
-	});
+	if (acceptor.is_open ())
+	{
+		if (connections.size () < node.config.bootstrap_connections_max)
+		{
+			auto socket (std::make_shared<badem::socket> (node.shared ()));
+			acceptor.async_accept (socket->socket_m, [this, socket](boost::system::error_code const & ec) {
+				accept_action (ec, socket);
+			});
+		}
+		else
+		{
+			BOOST_LOG (node.log) << boost::str (boost::format ("Unable to accept new TCP network sockets (have %1% concurrent connections, limit of %2%), will try to accept again in 1s") % connections.size () % node.config.bootstrap_connections_max);
+			defer_acceptor.expires_after (std::chrono::seconds (1));
+			defer_acceptor.async_wait ([this](const boost::system::error_code & ec) {
+				/*
+				 * There should be no other call points that can invoke
+				 * accept_connect() after starting the listener, so if we
+				 * get an error from the I/O context, something is probably
+				 * wrong.
+				 */
+				if (!ec)
+				{
+					accept_connection ();
+				}
+			});
+		}
+	}
 }
 
-void rai::bootstrap_listener::accept_action (boost::system::error_code const & ec, std::shared_ptr<rai::socket> socket_a)
+void badem::bootstrap_listener::accept_action (boost::system::error_code const & ec, std::shared_ptr<badem::socket> socket_a)
 {
 	if (!ec)
 	{
-		accept_connection ();
-		auto connection (std::make_shared<rai::bootstrap_server> (socket_a, node.shared ()));
+		auto connection (std::make_shared<badem::bootstrap_server> (socket_a, node.shared ()));
 		{
 			std::lock_guard<std::mutex> lock (mutex);
-			if (connections.size () < node.config.bootstrap_connections_max && acceptor.is_open ())
+			if (acceptor.is_open ())
 			{
 				connections[connection.get ()] = connection;
 				connection->receive ();
 			}
 		}
+		accept_connection ();
 	}
 	else
 	{
@@ -1288,12 +2025,29 @@ void rai::bootstrap_listener::accept_action (boost::system::error_code const & e
 	}
 }
 
-boost::asio::ip::tcp::endpoint rai::bootstrap_listener::endpoint ()
+boost::asio::ip::tcp::endpoint badem::bootstrap_listener::endpoint ()
 {
 	return boost::asio::ip::tcp::endpoint (boost::asio::ip::address_v6::loopback (), local.port ());
 }
 
-rai::bootstrap_server::~bootstrap_server ()
+namespace badem
+{
+std::unique_ptr<seq_con_info_component> collect_seq_con_info (bootstrap_listener & bootstrap_listener, const std::string & name)
+{
+	size_t count = 0;
+	{
+		std::lock_guard<std::mutex> guard (bootstrap_listener.mutex);
+		count = bootstrap_listener.connections.size ();
+	}
+
+	auto sizeof_element = sizeof (decltype (bootstrap_listener.connections)::value_type);
+	auto composite = std::make_unique<seq_con_info_composite> (name);
+	composite->add_component (std::make_unique<seq_con_info_leaf> (seq_con_info{ "connections", count, sizeof_element }));
+	return composite;
+}
+}
+
+badem::bootstrap_server::~bootstrap_server ()
 {
 	if (node->config.logging.bulk_pull_logging ())
 	{
@@ -1303,15 +2057,15 @@ rai::bootstrap_server::~bootstrap_server ()
 	node->bootstrap.connections.erase (this);
 }
 
-rai::bootstrap_server::bootstrap_server (std::shared_ptr<rai::socket> socket_a, std::shared_ptr<rai::node> node_a) :
+badem::bootstrap_server::bootstrap_server (std::shared_ptr<badem::socket> socket_a, std::shared_ptr<badem::node> node_a) :
 receive_buffer (std::make_shared<std::vector<uint8_t>> ()),
 socket (socket_a),
 node (node_a)
 {
-	receive_buffer->resize (128);
+	receive_buffer->resize (512);
 }
 
-void rai::bootstrap_server::receive ()
+void badem::bootstrap_server::receive ()
 {
 	auto this_l (shared_from_this ());
 	socket->async_read (receive_buffer, 8, [this_l](boost::system::error_code const & ec, size_t size_a) {
@@ -1319,49 +2073,58 @@ void rai::bootstrap_server::receive ()
 	});
 }
 
-void rai::bootstrap_server::receive_header_action (boost::system::error_code const & ec, size_t size_a)
+void badem::bootstrap_server::receive_header_action (boost::system::error_code const & ec, size_t size_a)
 {
 	if (!ec)
 	{
 		assert (size_a == 8);
-		rai::bufferstream type_stream (receive_buffer->data (), size_a);
+		badem::bufferstream type_stream (receive_buffer->data (), size_a);
 		auto error (false);
-		rai::message_header header (error, type_stream);
+		badem::message_header header (error, type_stream);
 		if (!error)
 		{
 			switch (header.type)
 			{
-				case rai::message_type::bulk_pull:
+				case badem::message_type::bulk_pull:
 				{
-					node->stats.inc (rai::stat::type::bootstrap, rai::stat::detail::bulk_pull, rai::stat::dir::in);
+					node->stats.inc (badem::stat::type::bootstrap, badem::stat::detail::bulk_pull, badem::stat::dir::in);
+
 					auto this_l (shared_from_this ());
-					socket->async_read (receive_buffer, sizeof (rai::uint256_union) + sizeof (rai::uint256_union), [this_l, header](boost::system::error_code const & ec, size_t size_a) {
+					socket->async_read (receive_buffer, header.payload_length_bytes (), [this_l, header](boost::system::error_code const & ec, size_t size_a) {
 						this_l->receive_bulk_pull_action (ec, size_a, header);
 					});
 					break;
 				}
-				case rai::message_type::bulk_pull_blocks:
+				case badem::message_type::bulk_pull_account:
 				{
-					node->stats.inc (rai::stat::type::bootstrap, rai::stat::detail::bulk_pull_blocks, rai::stat::dir::in);
+					node->stats.inc (badem::stat::type::bootstrap, badem::stat::detail::bulk_pull_account, badem::stat::dir::in);
 					auto this_l (shared_from_this ());
-					socket->async_read (receive_buffer, sizeof (rai::uint256_union) + sizeof (rai::uint256_union) + sizeof (bulk_pull_blocks_mode) + sizeof (uint32_t), [this_l, header](boost::system::error_code const & ec, size_t size_a) {
-						this_l->receive_bulk_pull_blocks_action (ec, size_a, header);
+					socket->async_read (receive_buffer, header.payload_length_bytes (), [this_l, header](boost::system::error_code const & ec, size_t size_a) {
+						this_l->receive_bulk_pull_account_action (ec, size_a, header);
 					});
 					break;
 				}
-				case rai::message_type::frontier_req:
+				case badem::message_type::frontier_req:
 				{
-					node->stats.inc (rai::stat::type::bootstrap, rai::stat::detail::frontier_req, rai::stat::dir::in);
+					node->stats.inc (badem::stat::type::bootstrap, badem::stat::detail::frontier_req, badem::stat::dir::in);
 					auto this_l (shared_from_this ());
-					socket->async_read (receive_buffer, sizeof (rai::uint256_union) + sizeof (uint32_t) + sizeof (uint32_t), [this_l, header](boost::system::error_code const & ec, size_t size_a) {
+					socket->async_read (receive_buffer, header.payload_length_bytes (), [this_l, header](boost::system::error_code const & ec, size_t size_a) {
 						this_l->receive_frontier_req_action (ec, size_a, header);
 					});
 					break;
 				}
-				case rai::message_type::bulk_push:
+				case badem::message_type::bulk_push:
 				{
-					node->stats.inc (rai::stat::type::bootstrap, rai::stat::detail::bulk_push, rai::stat::dir::in);
-					add_request (std::unique_ptr<rai::message> (new rai::bulk_push (header)));
+					node->stats.inc (badem::stat::type::bootstrap, badem::stat::detail::bulk_push, badem::stat::dir::in);
+					add_request (std::unique_ptr<badem::message> (new badem::bulk_push (header)));
+					break;
+				}
+				case badem::message_type::keepalive:
+				{
+					auto this_l (shared_from_this ());
+					socket->async_read (receive_buffer, header.payload_length_bytes (), [this_l, header](boost::system::error_code const & ec, size_t size_a) {
+						this_l->receive_keepalive_action (ec, size_a, header);
+					});
 					break;
 				}
 				default:
@@ -1384,58 +2147,81 @@ void rai::bootstrap_server::receive_header_action (boost::system::error_code con
 	}
 }
 
-void rai::bootstrap_server::receive_bulk_pull_action (boost::system::error_code const & ec, size_t size_a, rai::message_header const & header_a)
+void badem::bootstrap_server::receive_bulk_pull_action (boost::system::error_code const & ec, size_t size_a, badem::message_header const & header_a)
 {
 	if (!ec)
 	{
 		auto error (false);
-		rai::bufferstream stream (receive_buffer->data (), sizeof (rai::uint256_union) + sizeof (rai::uint256_union));
-		std::unique_ptr<rai::bulk_pull> request (new rai::bulk_pull (error, stream, header_a));
+		badem::bufferstream stream (receive_buffer->data (), size_a);
+		std::unique_ptr<badem::bulk_pull> request (new badem::bulk_pull (error, stream, header_a));
 		if (!error)
 		{
 			if (node->config.logging.bulk_pull_logging ())
 			{
-				BOOST_LOG (node->log) << boost::str (boost::format ("Received bulk pull for %1% down to %2%") % request->start.to_string () % request->end.to_string ());
+				BOOST_LOG (node->log) << boost::str (boost::format ("Received bulk pull for %1% down to %2%, maximum of %3%") % request->start.to_string () % request->end.to_string () % (request->count ? request->count : std::numeric_limits<double>::infinity ()));
 			}
-			add_request (std::unique_ptr<rai::message> (request.release ()));
+			add_request (std::unique_ptr<badem::message> (request.release ()));
 			receive ();
 		}
 	}
 }
 
-void rai::bootstrap_server::receive_bulk_pull_blocks_action (boost::system::error_code const & ec, size_t size_a, rai::message_header const & header_a)
+void badem::bootstrap_server::receive_bulk_pull_account_action (boost::system::error_code const & ec, size_t size_a, badem::message_header const & header_a)
 {
 	if (!ec)
 	{
 		auto error (false);
-		rai::bufferstream stream (receive_buffer->data (), sizeof (rai::uint256_union) + sizeof (rai::uint256_union) + sizeof (bulk_pull_blocks_mode) + sizeof (uint32_t));
-		std::unique_ptr<rai::bulk_pull_blocks> request (new rai::bulk_pull_blocks (error, stream, header_a));
+		assert (size_a == header_a.payload_length_bytes ());
+		badem::bufferstream stream (receive_buffer->data (), size_a);
+		std::unique_ptr<badem::bulk_pull_account> request (new badem::bulk_pull_account (error, stream, header_a));
 		if (!error)
 		{
 			if (node->config.logging.bulk_pull_logging ())
 			{
-				BOOST_LOG (node->log) << boost::str (boost::format ("Received bulk pull blocks for %1% to %2%") % request->min_hash.to_string () % request->max_hash.to_string ());
+				BOOST_LOG (node->log) << boost::str (boost::format ("Received bulk pull account for %1% with a minimum amount of %2%") % request->account.to_account () % badem::amount (request->minimum_amount).format_balance (badem::BDM_ratio, 10, true));
 			}
-			add_request (std::unique_ptr<rai::message> (request.release ()));
+			add_request (std::unique_ptr<badem::message> (request.release ()));
 			receive ();
 		}
 	}
 }
 
-void rai::bootstrap_server::receive_frontier_req_action (boost::system::error_code const & ec, size_t size_a, rai::message_header const & header_a)
+void badem::bootstrap_server::receive_keepalive_action (boost::system::error_code const & ec, size_t size_a, badem::message_header const & header_a)
 {
 	if (!ec)
 	{
 		auto error (false);
-		rai::bufferstream stream (receive_buffer->data (), sizeof (rai::uint256_union) + sizeof (uint32_t) + sizeof (uint32_t));
-		std::unique_ptr<rai::frontier_req> request (new rai::frontier_req (error, stream, header_a));
+		badem::bufferstream stream (receive_buffer->data (), header_a.payload_length_bytes ());
+		std::unique_ptr<badem::keepalive> request (new badem::keepalive (error, stream, header_a));
+		if (!error)
+		{
+			add_request (std::unique_ptr<badem::message> (request.release ()));
+			receive ();
+		}
+	}
+	else
+	{
+		if (node->config.logging.network_keepalive_logging ())
+		{
+			BOOST_LOG (node->log) << boost::str (boost::format ("Error receiving keepalive from: %1%") % ec.message ());
+		}
+	}
+}
+
+void badem::bootstrap_server::receive_frontier_req_action (boost::system::error_code const & ec, size_t size_a, badem::message_header const & header_a)
+{
+	if (!ec)
+	{
+		auto error (false);
+		badem::bufferstream stream (receive_buffer->data (), header_a.payload_length_bytes ());
+		std::unique_ptr<badem::frontier_req> request (new badem::frontier_req (error, stream, header_a));
 		if (!error)
 		{
 			if (node->config.logging.bulk_pull_logging ())
 			{
 				BOOST_LOG (node->log) << boost::str (boost::format ("Received frontier request for %1% with age %2%") % request->start.to_string () % request->age);
 			}
-			add_request (std::unique_ptr<rai::message> (request.release ()));
+			add_request (std::unique_ptr<badem::message> (request.release ()));
 			receive ();
 		}
 	}
@@ -1448,7 +2234,7 @@ void rai::bootstrap_server::receive_frontier_req_action (boost::system::error_co
 	}
 }
 
-void rai::bootstrap_server::add_request (std::unique_ptr<rai::message> message_a)
+void badem::bootstrap_server::add_request (std::unique_ptr<badem::message> message_a)
 {
 	std::lock_guard<std::mutex> lock (mutex);
 	auto start (requests.empty ());
@@ -1459,7 +2245,7 @@ void rai::bootstrap_server::add_request (std::unique_ptr<rai::message> message_a
 	}
 }
 
-void rai::bootstrap_server::finish_request ()
+void badem::bootstrap_server::finish_request ()
 {
 	std::lock_guard<std::mutex> lock (mutex);
 	requests.pop ();
@@ -1471,55 +2257,85 @@ void rai::bootstrap_server::finish_request ()
 
 namespace
 {
-class request_response_visitor : public rai::message_visitor
+class request_response_visitor : public badem::message_visitor
 {
 public:
-	request_response_visitor (std::shared_ptr<rai::bootstrap_server> connection_a) :
+	request_response_visitor (std::shared_ptr<badem::bootstrap_server> connection_a) :
 	connection (connection_a)
 	{
 	}
 	virtual ~request_response_visitor () = default;
-	void keepalive (rai::keepalive const &) override
+	void keepalive (badem::keepalive const & message_a) override
+	{
+		if (connection->node->config.logging.network_keepalive_logging ())
+		{
+			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Received keepalive message from %1%") % connection->socket->remote_endpoint ());
+		}
+		connection->node->stats.inc (badem::stat::type::message, badem::stat::detail::keepalive, badem::stat::dir::in);
+		connection->node->network.merge_peers (message_a.peers);
+		badem::keepalive message;
+		connection->node->peers.random_fill (message.peers);
+		auto bytes = message.to_bytes ();
+		if (connection->node->config.logging.network_keepalive_logging ())
+		{
+			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Keepalive req sent to %1%") % connection->socket->remote_endpoint ());
+		}
+		connection->socket->async_write (bytes, [connection = connection](boost::system::error_code const & ec, size_t size_a) {
+			if (ec)
+			{
+				if (connection->node->config.logging.network_keepalive_logging ())
+				{
+					BOOST_LOG (connection->node->log) << boost::str (boost::format ("Error sending keepalive to %1%: %2%") % connection->socket->remote_endpoint () % ec.message ());
+				}
+			}
+			else
+			{
+				connection->node->stats.inc (badem::stat::type::message, badem::stat::detail::keepalive, badem::stat::dir::out);
+				connection->finish_request ();
+			}
+		});
+	}
+	void publish (badem::publish const &) override
 	{
 		assert (false);
 	}
-	void publish (rai::publish const &) override
+	void confirm_req (badem::confirm_req const &) override
 	{
 		assert (false);
 	}
-	void confirm_req (rai::confirm_req const &) override
+	void confirm_ack (badem::confirm_ack const &) override
 	{
 		assert (false);
 	}
-	void confirm_ack (rai::confirm_ack const &) override
+	void bulk_pull (badem::bulk_pull const &) override
 	{
-		assert (false);
-	}
-	void bulk_pull (rai::bulk_pull const &) override
-	{
-		auto response (std::make_shared<rai::bulk_pull_server> (connection, std::unique_ptr<rai::bulk_pull> (static_cast<rai::bulk_pull *> (connection->requests.front ().release ()))));
+		auto response (std::make_shared<badem::bulk_pull_server> (connection, std::unique_ptr<badem::bulk_pull> (static_cast<badem::bulk_pull *> (connection->requests.front ().release ()))));
 		response->send_next ();
 	}
-	void bulk_pull_blocks (rai::bulk_pull_blocks const &) override
+	void bulk_pull_account (badem::bulk_pull_account const &) override
 	{
-		auto response (std::make_shared<rai::bulk_pull_blocks_server> (connection, std::unique_ptr<rai::bulk_pull_blocks> (static_cast<rai::bulk_pull_blocks *> (connection->requests.front ().release ()))));
-		response->send_next ();
+		auto response (std::make_shared<badem::bulk_pull_account_server> (connection, std::unique_ptr<badem::bulk_pull_account> (static_cast<badem::bulk_pull_account *> (connection->requests.front ().release ()))));
+		response->send_frontier ();
 	}
-	void bulk_push (rai::bulk_push const &) override
+	void bulk_push (badem::bulk_push const &) override
 	{
-		auto response (std::make_shared<rai::bulk_push_server> (connection));
+		auto response (std::make_shared<badem::bulk_push_server> (connection));
 		response->receive ();
 	}
-	void frontier_req (rai::frontier_req const &) override
+	void frontier_req (badem::frontier_req const &) override
 	{
-		auto response (std::make_shared<rai::frontier_req_server> (connection, std::unique_ptr<rai::frontier_req> (static_cast<rai::frontier_req *> (connection->requests.front ().release ()))));
+		auto response (std::make_shared<badem::frontier_req_server> (connection, std::unique_ptr<badem::frontier_req> (static_cast<badem::frontier_req *> (connection->requests.front ().release ()))));
 		response->send_next ();
 	}
-	std::shared_ptr<rai::bootstrap_server> connection;
+	void node_id_handshake (badem::node_id_handshake const &) override
+	{
+		assert (false);
+	}
+	std::shared_ptr<badem::bootstrap_server> connection;
 };
 }
 
-void rai::bootstrap_server::run_next ()
+void badem::bootstrap_server::run_next ()
 {
 	assert (!requests.empty ());
 	request_response_visitor visitor (shared_from_this ());
@@ -1529,12 +2345,23 @@ void rai::bootstrap_server::run_next ()
 /**
  * Handle a request for the pull of all blocks associated with an account
  * The account is supplied as the "start" member, and the final block to
- * send is the "end" member
+ * send is the "end" member.  The "start" member may also be a block
+ * hash, in which case the that hash is used as the start of a chain
+ * to send.  To determine if "start" is interpretted as an account or
+ * hash, the ledger is checked to see if the block specified exists,
+ * if not then it is interpretted as an account.
+ *
+ * Additionally, if "start" is specified as a block hash the range
+ * is inclusive of that block hash, that is the range will be:
+ * [start, end); In the case that a block hash is not specified the
+ * range will be exclusive of the frontier for that account with
+ * a range of (frontier, end)
  */
-void rai::bulk_pull_server::set_current_end ()
+void badem::bulk_pull_server::set_current_end ()
 {
+	include_start = false;
 	assert (request != nullptr);
-	rai::transaction transaction (connection->node->store.environment, nullptr, false);
+	auto transaction (connection->node->store.tx_begin_read ());
 	if (!connection->node->store.block_exists (transaction, request->end))
 	{
 		if (connection->node->config.logging.bulk_pull_logging ())
@@ -1543,46 +2370,67 @@ void rai::bulk_pull_server::set_current_end ()
 		}
 		request->end.clear ();
 	}
-	rai::account_info info;
-	auto no_address (connection->node->store.account_get (transaction, request->start, info));
-	if (no_address)
+
+	if (connection->node->store.block_exists (transaction, request->start))
 	{
 		if (connection->node->config.logging.bulk_pull_logging ())
 		{
-			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Request for unknown account: %1%") % request->start.to_account ());
+			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Bulk pull request for block hash: %1%") % request->start.to_string ());
 		}
-		current = request->end;
+
+		current = request->start;
+		include_start = true;
 	}
 	else
 	{
-		if (!request->end.is_zero ())
+		badem::account_info info;
+		auto no_address (connection->node->store.account_get (transaction, request->start, info));
+		if (no_address)
 		{
-			auto account (connection->node->ledger.account (transaction, request->end));
-			if (account == request->start)
+			if (connection->node->config.logging.bulk_pull_logging ())
 			{
-				current = info.head;
+				BOOST_LOG (connection->node->log) << boost::str (boost::format ("Request for unknown account: %1%") % request->start.to_account ());
 			}
-			else
-			{
-				current = request->end;
-			}
+			current = request->end;
 		}
 		else
 		{
 			current = info.head;
+			if (!request->end.is_zero ())
+			{
+				auto account (connection->node->ledger.account (transaction, request->end));
+				if (account != request->start)
+				{
+					if (connection->node->config.logging.bulk_pull_logging ())
+					{
+						BOOST_LOG (connection->node->log) << boost::str (boost::format ("Request for block that is not on account chain: %1% not on %2%") % request->end.to_string () % request->start.to_account ());
+					}
+					current = request->end;
+				}
+			}
 		}
+	}
+
+	sent_count = 0;
+	if (request->is_count_present ())
+	{
+		max_count = request->count;
+	}
+	else
+	{
+		max_count = 0;
 	}
 }
 
-void rai::bulk_pull_server::send_next ()
+void badem::bulk_pull_server::send_next ()
 {
-	std::unique_ptr<rai::block> block (get_next ());
+	auto block (get_next ());
 	if (block != nullptr)
 	{
 		{
 			send_buffer->clear ();
-			rai::vectorstream stream (*send_buffer);
-			rai::serialize_block (stream, *block);
+			badem::vectorstream stream (*send_buffer);
+			badem::serialize_block (stream, *block);
 		}
 		auto this_l (shared_from_this ());
 		if (connection->node->config.logging.bulk_pull_logging ())
@@ -1599,14 +2447,50 @@ void rai::bulk_pull_server::send_next ()
 	}
 }
 
-std::unique_ptr<rai::block> rai::bulk_pull_server::get_next ()
+std::shared_ptr<badem::block> badem::bulk_pull_server::get_next ()
 {
-	std::unique_ptr<rai::block> result;
+	std::shared_ptr<badem::block> result;
+	bool send_current = false, set_current_to_end = false;
+
+	/*
+	 * Determine if we should reply with a block
+	 *
+	 * If our cursor is on the final block, we should signal that we
+	 * are done by returning a null result.
+	 *
+	 * Unless we are including the "start" member and this is the
+	 * start member, then include it anyway.
+	 */
 	if (current != request->end)
 	{
-		rai::transaction transaction (connection->node->store.environment, nullptr, false);
+		send_current = true;
+	}
+	else if (current == request->end && include_start == true)
+	{
+		send_current = true;
+
+		/*
+		 * We also need to ensure that the next time
+		 * are invoked that we return a null result
+		 */
+		set_current_to_end = true;
+	}
+
+	/*
+	 * Account for how many blocks we have provided.  If this
+	 * exceeds the requested maximum, return an empty object
+	 * to signal the end of results
+	 */
+	if (max_count != 0 && sent_count >= max_count)
+	{
+		send_current = false;
+	}
+
+	if (send_current)
+	{
+		auto transaction (connection->node->store.tx_begin_read ());
 		result = connection->node->store.block_get (transaction, current);
-		if (result != nullptr)
+		if (result != nullptr && set_current_to_end == false)
 		{
 			auto previous (result->previous ());
 			if (!previous.is_zero ())
@@ -1622,11 +2506,20 @@ std::unique_ptr<rai::block> rai::bulk_pull_server::get_next ()
 		{
 			current = request->end;
 		}
+
+		sent_count++;
 	}
+
+	/*
+	 * Once we have processed "get_next()" once our cursor is no longer on
+	 * the "start" member, so this flag is not relevant is always false.
+	 */
+	include_start = false;
+
 	return result;
 }
 
-void rai::bulk_pull_server::sent_action (boost::system::error_code const & ec, size_t size_a)
+void badem::bulk_pull_server::sent_action (boost::system::error_code const & ec, size_t size_a)
 {
 	if (!ec)
 	{
@@ -1641,10 +2534,10 @@ void rai::bulk_pull_server::sent_action (boost::system::error_code const & ec, s
 	}
 }
 
-void rai::bulk_pull_server::send_finished ()
+void badem::bulk_pull_server::send_finished ()
 {
 	send_buffer->clear ();
-	send_buffer->push_back (static_cast<uint8_t> (rai::block_type::not_a_block));
+	send_buffer->push_back (static_cast<uint8_t> (badem::block_type::not_a_block));
 	auto this_l (shared_from_this ());
 	if (connection->node->config.logging.bulk_pull_logging ())
 	{
@@ -1655,7 +2548,7 @@ void rai::bulk_pull_server::send_finished ()
 	});
 }
 
-void rai::bulk_pull_server::no_block_sent (boost::system::error_code const & ec, size_t size_a)
+void badem::bulk_pull_server::no_block_sent (boost::system::error_code const & ec, size_t size_a)
 {
 	if (!ec)
 	{
@@ -1671,7 +2564,7 @@ void rai::bulk_pull_server::no_block_sent (boost::system::error_code const & ec,
 	}
 }
 
-rai::bulk_pull_server::bulk_pull_server (std::shared_ptr<rai::bootstrap_server> const & connection_a, std::unique_ptr<rai::bulk_pull> request_a) :
+badem::bulk_pull_server::bulk_pull_server (std::shared_ptr<badem::bootstrap_server> const & connection_a, std::unique_ptr<badem::bulk_pull> request_a) :
 connection (connection_a),
 request (std::move (request_a)),
 send_buffer (std::make_shared<std::vector<uint8_t>> ())
@@ -1680,144 +2573,254 @@ send_buffer (std::make_shared<std::vector<uint8_t>> ())
 }
 
 /**
- * Bulk pull of a range of blocks, or a checksum for a range of
- * blocks [min_hash, max_hash) up to a max of max_count.  mode
- * specifies whether the list is returned or a single checksum
- * of all the hashes.  The checksum is computed by XORing the
- * hash of all the blocks that would be returned
+ * Bulk pull blocks related to an account
  */
-void rai::bulk_pull_blocks_server::set_params ()
+void badem::bulk_pull_account_server::set_params ()
 {
 	assert (request != nullptr);
 
-	if (connection->node->config.logging.bulk_pull_logging ())
+	/*
+	 * Parse the flags
+	 */
+	invalid_request = false;
+	pending_include_address = false;
+	pending_address_only = false;
+	if (request->flags == badem::bulk_pull_account_flags::pending_address_only)
 	{
-		std::string modeName = "<unknown>";
-
-		switch (request->mode)
-		{
-			case rai::bulk_pull_blocks_mode::list_blocks:
-				modeName = "list";
-				break;
-			case rai::bulk_pull_blocks_mode::checksum_blocks:
-				modeName = "checksum";
-				break;
-		}
-
-		BOOST_LOG (connection->node->log) << boost::str (boost::format ("Bulk pull of block range starting, min (%1%) to max (%2%), max_count = %3%, mode = %4%") % request->min_hash.to_string () % request->max_hash.to_string () % request->max_count % modeName);
+		pending_address_only = true;
 	}
-
-	stream = connection->node->store.block_info_begin (stream_transaction, request->min_hash);
-
-	if (request->max_hash < request->min_hash)
+	else if (request->flags == badem::bulk_pull_account_flags::pending_hash_amount_and_address)
+	{
+		/**
+		 ** This is the same as "pending_hash_and_amount" but with the
+		 ** sending address appended, for UI purposes mainly.
+		 **/
+		pending_include_address = true;
+	}
+	else if (request->flags == badem::bulk_pull_account_flags::pending_hash_and_amount)
+	{
+		/** The defaults are set above **/
+	}
+	else
 	{
 		if (connection->node->config.logging.bulk_pull_logging ())
 		{
-			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Bulk pull of block range is invalid, min (%1%) is greater than max (%2%)") % request->min_hash.to_string () % request->max_hash.to_string ());
+			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Invalid bulk_pull_account flags supplied %1%") % static_cast<uint8_t> (request->flags));
 		}
 
-		request->max_hash = request->min_hash;
+		invalid_request = true;
+
+		return;
 	}
+
+	/*
+	 * Initialize the current item from the requested account
+	 */
+	current_key.account = request->account;
+	current_key.hash = 0;
 }
 
-void rai::bulk_pull_blocks_server::send_next ()
+void badem::bulk_pull_account_server::send_frontier ()
 {
-	std::unique_ptr<rai::block> block (get_next ());
-	if (block != nullptr)
+	/*
+	 * This function is really the entry point into this class,
+	 * so handle the invalid_request case by terminating the
+	 * request without any response
+	 */
+	if (invalid_request)
 	{
-		if (connection->node->config.logging.bulk_pull_logging ())
-		{
-			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Sending block: %1%") % block->hash ().to_string ());
-		}
+		connection->finish_request ();
 
+		return;
+	}
+
+	/*
+	 * Supply the account frontier
+	 */
+	/**
+	 ** Establish a database transaction
+	 **/
+	auto stream_transaction (connection->node->store.tx_begin_read ());
+
+	/**
+	 ** Get account balance and frontier block hash
+	 **/
+	auto account_frontier_hash (connection->node->ledger.latest (stream_transaction, request->account));
+	auto account_frontier_balance_int (connection->node->ledger.account_balance (stream_transaction, request->account));
+	badem::uint128_union account_frontier_balance (account_frontier_balance_int);
+
+	/**
+	 ** Write the frontier block hash and balance into a buffer
+	 **/
+	send_buffer->clear ();
+	{
+		badem::vectorstream output_stream (*send_buffer);
+
+		write (output_stream, account_frontier_hash.bytes);
+		write (output_stream, account_frontier_balance.bytes);
+	}
+
+	/**
+	 ** Send the buffer to the requestor
+	 **/
+	auto this_l (shared_from_this ());
+	connection->socket->async_write (send_buffer, [this_l](boost::system::error_code const & ec, size_t size_a) {
+		this_l->sent_action (ec, size_a);
+	});
+}
+
+void badem::bulk_pull_account_server::send_next_block ()
+{
+	/*
+	 * Get the next item from the queue, it is a tuple with the key (which
+	 * contains the account and hash) and data (which contains the amount)
+	 */
+	auto block_data (get_next ());
+	auto block_info_key (block_data.first.get ());
+	auto block_info (block_data.second.get ());
+
+	if (block_info_key != nullptr)
+	{
+		/*
+		 * If we have a new item, emit it to the socket
+		 */
 		send_buffer->clear ();
+
+		if (pending_address_only)
+		{
+			badem::vectorstream output_stream (*send_buffer);
+
+			if (connection->node->config.logging.bulk_pull_logging ())
+			{
+				BOOST_LOG (connection->node->log) << boost::str (boost::format ("Sending address: %1%") % block_info->source.to_string ());
+			}
+
+			write (output_stream, block_info->source.bytes);
+		}
+		else
+		{
+			badem::vectorstream output_stream (*send_buffer);
+
+			if (connection->node->config.logging.bulk_pull_logging ())
+			{
+				BOOST_LOG (connection->node->log) << boost::str (boost::format ("Sending block: %1%") % block_info_key->hash.to_string ());
+			}
+
+			write (output_stream, block_info_key->hash.bytes);
+			write (output_stream, block_info->amount.bytes);
+
+			if (pending_include_address)
+			{
+				/**
+				 ** Write the source address as well, if requested
+				 **/
+				write (output_stream, block_info->source.bytes);
+			}
+		}
+
 		auto this_l (shared_from_this ());
-
-		if (request->mode == rai::bulk_pull_blocks_mode::list_blocks)
-		{
-			rai::vectorstream stream (*send_buffer);
-			rai::serialize_block (stream, *block);
-		}
-		else if (request->mode == rai::bulk_pull_blocks_mode::checksum_blocks)
-		{
-			checksum ^= block->hash ();
-		}
-
 		connection->socket->async_write (send_buffer, [this_l](boost::system::error_code const & ec, size_t size_a) {
 			this_l->sent_action (ec, size_a);
 		});
 	}
 	else
 	{
+		/*
+		 * Otherwise, finalize the connection
+		 */
 		if (connection->node->config.logging.bulk_pull_logging ())
 		{
 			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Done sending blocks"));
 		}
 
-		if (request->mode == rai::bulk_pull_blocks_mode::checksum_blocks)
-		{
-			{
-				send_buffer->clear ();
-				rai::vectorstream stream (*send_buffer);
-				write (stream, static_cast<uint8_t> (rai::block_type::not_a_block));
-				write (stream, checksum);
-			}
-
-			auto this_l (shared_from_this ());
-			if (connection->node->config.logging.bulk_pull_logging ())
-			{
-				BOOST_LOG (connection->node->log) << boost::str (boost::format ("Sending checksum: %1%") % checksum.to_string ());
-			}
-
-			connection->socket->async_write (send_buffer, [this_l](boost::system::error_code const & ec, size_t size_a) {
-				this_l->send_finished ();
-			});
-		}
-		else
-		{
-			send_finished ();
-		}
+		send_finished ();
 	}
 }
 
-std::unique_ptr<rai::block> rai::bulk_pull_blocks_server::get_next ()
+std::pair<std::unique_ptr<badem::pending_key>, std::unique_ptr<badem::pending_info>> badem::bulk_pull_account_server::get_next ()
 {
-	std::unique_ptr<rai::block> result;
-	bool out_of_bounds;
+	std::pair<std::unique_ptr<badem::pending_key>, std::unique_ptr<badem::pending_info>> result;
 
-	out_of_bounds = false;
-	if (request->max_count != 0)
+	while (true)
 	{
-		if (sent_count >= request->max_count)
+		/*
+		 * For each iteration of this loop, establish and then
+		 * destroy a database transaction, to avoid locking the
+		 * database for a prolonged period.
+		 */
+		auto stream_transaction (connection->node->store.tx_begin_read ());
+		auto stream (connection->node->store.pending_begin (stream_transaction, current_key));
+
+		if (stream == badem::store_iterator<badem::pending_key, badem::pending_info> (nullptr))
 		{
-			out_of_bounds = true;
+			break;
 		}
 
-		sent_count++;
-	}
+		badem::pending_key key (stream->first);
+		badem::pending_info info (stream->second);
 
-	if (!out_of_bounds)
-	{
-		if (stream->first.size () != 0)
+		/*
+		 * Get the key for the next value, to use in the next call or iteration
+		 */
+		current_key.account = key.account;
+		current_key.hash = key.hash.number () + 1;
+
+		/*
+		 * Finish up if the response is for a different account
+		 */
+		if (key.account != request->account)
 		{
-			auto current = stream->first.uint256 ();
-			if (current < request->max_hash)
-			{
-				rai::transaction transaction (connection->node->store.environment, nullptr, false);
-				result = connection->node->store.block_get (transaction, current);
+			break;
+		}
 
-				++stream;
+		/*
+		 * Skip entries where the amount is less than the requested
+		 * minimum
+		 */
+		if (info.amount < request->minimum_amount)
+		{
+			continue;
+		}
+
+		/*
+		 * If the pending_address_only flag is set, de-duplicate the
+		 * responses.  The responses are the address of the sender,
+		 * so they are are part of the pending table's information
+		 * and not key, so we have to de-duplicate them manually.
+		 */
+		if (pending_address_only)
+		{
+			if (!deduplication.insert (info.source).second)
+			{
+				/*
+				 * If the deduplication map gets too
+				 * large, clear it out.  This may
+				 * result in some duplicates getting
+				 * sent to the client, but we do not
+				 * want to commit too much memory
+				 */
+				if (deduplication.size () > 4096)
+				{
+					deduplication.clear ();
+				}
+				continue;
 			}
 		}
+
+		result.first = std::unique_ptr<badem::pending_key> (new badem::pending_key (key));
+		result.second = std::unique_ptr<badem::pending_info> (new badem::pending_info (info));
+
+		break;
 	}
+
 	return result;
 }
 
-void rai::bulk_pull_blocks_server::sent_action (boost::system::error_code const & ec, size_t size_a)
+void badem::bulk_pull_account_server::sent_action (boost::system::error_code const & ec, size_t size_a)
 {
 	if (!ec)
 	{
-		send_next ();
+		send_next_block ();
 	}
 	else
 	{
@@ -1828,120 +2831,172 @@ void rai::bulk_pull_blocks_server::sent_action (boost::system::error_code const 
 	}
 }
 
-void rai::bulk_pull_blocks_server::send_finished ()
+void badem::bulk_pull_account_server::send_finished ()
 {
+	/*
+	 * The "bulk_pull_account" final sequence is a final block of all
+	 * zeros.  If we are sending only account public keys (with the
+	 * "pending_address_only" flag) then it will be 256-bits of zeros,
+	 * otherwise it will be either 384-bits of zeros (if the
+	 * "pending_include_address" flag is not set) or 640-bits of zeros
+	 * (if that flag is set).
+	 */
 	send_buffer->clear ();
-	send_buffer->push_back (static_cast<uint8_t> (rai::block_type::not_a_block));
+
+	{
+		badem::vectorstream output_stream (*send_buffer);
+		badem::uint256_union account_zero (0);
+		badem::uint128_union balance_zero (0);
+
+		write (output_stream, account_zero.bytes);
+
+		if (!pending_address_only)
+		{
+			write (output_stream, balance_zero.bytes);
+			if (pending_include_address)
+			{
+				write (output_stream, account_zero.bytes);
+			}
+		}
+	}
+
 	auto this_l (shared_from_this ());
+
 	if (connection->node->config.logging.bulk_pull_logging ())
 	{
-		BOOST_LOG (connection->node->log) << "Bulk sending finished";
+		BOOST_LOG (connection->node->log) << "Bulk sending for an account finished";
 	}
+
 	connection->socket->async_write (send_buffer, [this_l](boost::system::error_code const & ec, size_t size_a) {
-		this_l->no_block_sent (ec, size_a);
+		this_l->complete (ec, size_a);
 	});
 }
 
-void rai::bulk_pull_blocks_server::no_block_sent (boost::system::error_code const & ec, size_t size_a)
+void badem::bulk_pull_account_server::complete (boost::system::error_code const & ec, size_t size_a)
 {
 	if (!ec)
 	{
-		assert (size_a == 1);
+		if (pending_address_only)
+		{
+			assert (size_a == 32);
+		}
+		else
+		{
+			if (pending_include_address)
+			{
+				assert (size_a == 80);
+			}
+			else
+			{
+				assert (size_a == 48);
+			}
+		}
+
 		connection->finish_request ();
 	}
 	else
 	{
 		if (connection->node->config.logging.bulk_pull_logging ())
 		{
-			BOOST_LOG (connection->node->log) << "Unable to send not-a-block";
+			BOOST_LOG (connection->node->log) << "Unable to pending-as-zero";
 		}
 	}
 }
 
-rai::bulk_pull_blocks_server::bulk_pull_blocks_server (std::shared_ptr<rai::bootstrap_server> const & connection_a, std::unique_ptr<rai::bulk_pull_blocks> request_a) :
+badem::bulk_pull_account_server::bulk_pull_account_server (std::shared_ptr<badem::bootstrap_server> const & connection_a, std::unique_ptr<badem::bulk_pull_account> request_a) :
 connection (connection_a),
 request (std::move (request_a)),
 send_buffer (std::make_shared<std::vector<uint8_t>> ()),
-stream (nullptr),
-stream_transaction (connection_a->node->store.environment, nullptr, false),
-sent_count (0),
-checksum (0)
+current_key (0, 0)
 {
+	/*
+	 * Setup the streaming response for the first call to "send_frontier" and  "send_next_block"
+	 */
 	set_params ();
 }
 
-rai::bulk_push_server::bulk_push_server (std::shared_ptr<rai::bootstrap_server> const & connection_a) :
+badem::bulk_push_server::bulk_push_server (std::shared_ptr<badem::bootstrap_server> const & connection_a) :
 receive_buffer (std::make_shared<std::vector<uint8_t>> ()),
 connection (connection_a)
 {
 	receive_buffer->resize (256);
 }
 
-void rai::bulk_push_server::receive ()
+void badem::bulk_push_server::receive ()
 {
-	auto this_l (shared_from_this ());
-	connection->socket->async_read (receive_buffer, 1, [this_l](boost::system::error_code const & ec, size_t size_a) {
-		if (!ec)
+	if (connection->node->bootstrap_initiator.in_progress ())
+	{
+		if (connection->node->config.logging.bulk_pull_logging ())
 		{
-			this_l->received_type ();
+			BOOST_LOG (connection->node->log) << "Aborting bulk_push because a bootstrap attempt is in progress";
 		}
-		else
-		{
-			if (this_l->connection->node->config.logging.bulk_pull_logging ())
+	}
+	else
+	{
+		auto this_l (shared_from_this ());
+		connection->socket->async_read (receive_buffer, 1, [this_l](boost::system::error_code const & ec, size_t size_a) {
+			if (!ec)
 			{
-				BOOST_LOG (this_l->connection->node->log) << boost::str (boost::format ("Error receiving block type: %1%") % ec.message ());
+				this_l->received_type ();
 			}
-		}
-	});
+			else
+			{
+				if (this_l->connection->node->config.logging.bulk_pull_logging ())
+				{
+					BOOST_LOG (this_l->connection->node->log) << boost::str (boost::format ("Error receiving block type: %1%") % ec.message ());
+				}
+			}
+		});
+	}
 }
 
-void rai::bulk_push_server::received_type ()
+void badem::bulk_push_server::received_type ()
 {
 	auto this_l (shared_from_this ());
-	rai::block_type type (static_cast<rai::block_type> (receive_buffer->data ()[0]));
+	badem::block_type type (static_cast<badem::block_type> (receive_buffer->data ()[0]));
 	switch (type)
 	{
-		case rai::block_type::send:
+		case badem::block_type::send:
 		{
-			connection->node->stats.inc (rai::stat::type::bootstrap, rai::stat::detail::send, rai::stat::dir::in);
-			connection->socket->async_read (receive_buffer, rai::send_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
+			connection->node->stats.inc (badem::stat::type::bootstrap, badem::stat::detail::send, badem::stat::dir::in);
+			connection->socket->async_read (receive_buffer, badem::send_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
 				this_l->received_block (ec, size_a, type);
 			});
 			break;
 		}
-		case rai::block_type::receive:
+		case badem::block_type::receive:
 		{
-			connection->node->stats.inc (rai::stat::type::bootstrap, rai::stat::detail::receive, rai::stat::dir::in);
-			connection->socket->async_read (receive_buffer, rai::receive_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
+			connection->node->stats.inc (badem::stat::type::bootstrap, badem::stat::detail::receive, badem::stat::dir::in);
+			connection->socket->async_read (receive_buffer, badem::receive_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
 				this_l->received_block (ec, size_a, type);
 			});
 			break;
 		}
-		case rai::block_type::open:
+		case badem::block_type::open:
 		{
-			connection->node->stats.inc (rai::stat::type::bootstrap, rai::stat::detail::open, rai::stat::dir::in);
-			connection->socket->async_read (receive_buffer, rai::open_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
+			connection->node->stats.inc (badem::stat::type::bootstrap, badem::stat::detail::open, badem::stat::dir::in);
+			connection->socket->async_read (receive_buffer, badem::open_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
 				this_l->received_block (ec, size_a, type);
 			});
 			break;
 		}
-		case rai::block_type::change:
+		case badem::block_type::change:
 		{
-			connection->node->stats.inc (rai::stat::type::bootstrap, rai::stat::detail::change, rai::stat::dir::in);
-			connection->socket->async_read (receive_buffer, rai::change_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
+			connection->node->stats.inc (badem::stat::type::bootstrap, badem::stat::detail::change, badem::stat::dir::in);
+			connection->socket->async_read (receive_buffer, badem::change_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
 				this_l->received_block (ec, size_a, type);
 			});
 			break;
 		}
-		case rai::block_type::state:
+		case badem::block_type::state:
 		{
-			connection->node->stats.inc (rai::stat::type::bootstrap, rai::stat::detail::state_block, rai::stat::dir::in);
-			connection->socket->async_read (receive_buffer, rai::state_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
+			connection->node->stats.inc (badem::stat::type::bootstrap, badem::stat::detail::state_block, badem::stat::dir::in);
+			connection->socket->async_read (receive_buffer, badem::state_block::size, [this_l, type](boost::system::error_code const & ec, size_t size_a) {
 				this_l->received_block (ec, size_a, type);
 			});
 			break;
 		}
-		case rai::block_type::not_a_block:
+		case badem::block_type::not_a_block:
 		{
 			connection->finish_request ();
 			break;
@@ -1957,13 +3012,13 @@ void rai::bulk_push_server::received_type ()
 	}
 }
 
-void rai::bulk_push_server::received_block (boost::system::error_code const & ec, size_t size_a, rai::block_type type_a)
+void badem::bulk_push_server::received_block (boost::system::error_code const & ec, size_t size_a, badem::block_type type_a)
 {
 	if (!ec)
 	{
-		rai::bufferstream stream (receive_buffer->data (), size_a);
-		auto block (rai::deserialize_block (stream, type_a));
-		if (block != nullptr && !rai::work_validate (*block))
+		badem::bufferstream stream (receive_buffer->data (), size_a);
+		auto block (badem::deserialize_block (stream, type_a));
+		if (block != nullptr && !badem::work_validate (*block))
 		{
 			connection->node->process_active (std::move (block));
 			receive ();
@@ -1978,43 +3033,31 @@ void rai::bulk_push_server::received_block (boost::system::error_code const & ec
 	}
 }
 
-rai::frontier_req_server::frontier_req_server (std::shared_ptr<rai::bootstrap_server> const & connection_a, std::unique_ptr<rai::frontier_req> request_a) :
+badem::frontier_req_server::frontier_req_server (std::shared_ptr<badem::bootstrap_server> const & connection_a, std::unique_ptr<badem::frontier_req> request_a) :
 connection (connection_a),
 current (request_a->start.number () - 1),
-info (0, 0, 0, 0, 0, 0),
+frontier (0),
 request (std::move (request_a)),
-send_buffer (std::make_shared<std::vector<uint8_t>> ())
+send_buffer (std::make_shared<std::vector<uint8_t>> ()),
+count (0)
 {
 	next ();
-	skip_old ();
 }
 
-void rai::frontier_req_server::skip_old ()
+void badem::frontier_req_server::send_next ()
 {
-	if (request->age != std::numeric_limits<decltype (request->age)>::max ())
-	{
-		auto now (rai::seconds_since_epoch ());
-		while (!current.is_zero () && (now - info.modified) >= request->age)
-		{
-			next ();
-		}
-	}
-}
-
-void rai::frontier_req_server::send_next ()
-{
-	if (!current.is_zero ())
+	if (!current.is_zero () && count <= request->count)
 	{
 		{
 			send_buffer->clear ();
-			rai::vectorstream stream (*send_buffer);
+			badem::vectorstream stream (*send_buffer);
 			write (stream, current.bytes);
-			write (stream, info.head.bytes);
+			write (stream, frontier.bytes);
 		}
 		auto this_l (shared_from_this ());
 		if (connection->node->config.logging.bulk_pull_logging ())
 		{
-			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Sending frontier for %1% %2%") % current.to_account () % info.head.to_string ());
+			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Sending frontier for %1% %2%") % current.to_account () % frontier.to_string ());
 		}
 		next ();
 		connection->socket->async_write (send_buffer, [this_l](boost::system::error_code const & ec, size_t size_a) {
@@ -2027,12 +3070,12 @@ void rai::frontier_req_server::send_next ()
 	}
 }
 
-void rai::frontier_req_server::send_finished ()
+void badem::frontier_req_server::send_finished ()
 {
 	{
 		send_buffer->clear ();
-		rai::vectorstream stream (*send_buffer);
-		rai::uint256_union zero (0);
+		badem::vectorstream stream (*send_buffer);
+		badem::uint256_union zero (0);
 		write (stream, zero.bytes);
 		write (stream, zero.bytes);
 	}
@@ -2046,7 +3089,7 @@ void rai::frontier_req_server::send_finished ()
 	});
 }
 
-void rai::frontier_req_server::no_block_sent (boost::system::error_code const & ec, size_t size_a)
+void badem::frontier_req_server::no_block_sent (boost::system::error_code const & ec, size_t size_a)
 {
 	if (!ec)
 	{
@@ -2061,10 +3104,11 @@ void rai::frontier_req_server::no_block_sent (boost::system::error_code const & 
 	}
 }
 
-void rai::frontier_req_server::sent_action (boost::system::error_code const & ec, size_t size_a)
+void badem::frontier_req_server::sent_action (boost::system::error_code const & ec, size_t size_a)
 {
 	if (!ec)
 	{
+		count++;
 		send_next ();
 	}
 	else
@@ -2076,17 +3120,33 @@ void rai::frontier_req_server::sent_action (boost::system::error_code const & ec
 	}
 }
 
-void rai::frontier_req_server::next ()
+void badem::frontier_req_server::next ()
 {
-	rai::transaction transaction (connection->node->store.environment, nullptr, false);
-	auto iterator (connection->node->store.latest_begin (transaction, current.number () + 1));
-	if (iterator != connection->node->store.latest_end ())
+	// Filling accounts deque to prevent often read transactions
+	if (accounts.empty ())
 	{
-		current = rai::uint256_union (iterator->first.uint256 ());
-		info = rai::account_info (iterator->second);
+		auto now (badem::seconds_since_epoch ());
+		bool skip_old (request->age != std::numeric_limits<decltype (request->age)>::max ());
+		size_t max_size (128);
+		auto transaction (connection->node->store.tx_begin_read ());
+		for (auto i (connection->node->store.latest_begin (transaction, current.number () + 1)), n (connection->node->store.latest_end ()); i != n && accounts.size () != max_size; ++i)
+		{
+			badem::account_info info (i->second);
+			if (!skip_old || (now - info.modified) <= request->age)
+			{
+				accounts.push_back (std::make_pair (badem::account (i->first), info.head));
+			}
+		}
+		/* If loop breaks before max_size, then latest_end () is reached
+		Add empty record to finish frontier_req_server */
+		if (accounts.size () != max_size)
+		{
+			accounts.push_back (std::make_pair (badem::account (0), badem::block_hash (0)));
+		}
 	}
-	else
-	{
-		current.clear ();
-	}
+	// Retrieving accounts from deque
+	auto account_pair (accounts.front ());
+	accounts.pop_front ();
+	current = account_pair.first;
+	frontier = account_pair.second;
 }

@@ -2,43 +2,65 @@
 
 #include <boost/multiprecision/cpp_int.hpp>
 
-#include <cryptopp/osrng.h>
+#include <crypto/cryptopp/osrng.h>
 
-namespace rai
+namespace badem
 {
-// Random pool used by Badem.
-// This must be thread_local as long as the AutoSeededRandomPool implementation requires it
-extern thread_local CryptoPP::AutoSeededRandomPool random_pool;
+/** While this uses CryptoPP do not call any of these functions from global scope, as they depend on global variables inside the CryptoPP library which may not have been initialized yet due to an undefined order for globals in different translation units. To make sure this is not an issue, there should be no ASAN warnings at startup on Mac/Clang in the CryptoPP files. */
+class random_pool
+{
+public:
+	static void generate_block (unsigned char * output, size_t size);
+	static unsigned generate_word32 (unsigned min, unsigned max);
+	static unsigned char generate_byte ();
+
+	template <class Iter>
+	static void shuffle (Iter begin, Iter end)
+	{
+		std::lock_guard<std::mutex> lk (mutex);
+		pool.Shuffle (begin, end);
+	}
+
+	random_pool () = delete;
+	random_pool (random_pool const &) = delete;
+	random_pool & operator= (random_pool const &) = delete;
+
+private:
+	static std::mutex mutex;
+	static CryptoPP::AutoSeededRandomPool pool;
+};
+
 using uint128_t = boost::multiprecision::uint128_t;
 using uint256_t = boost::multiprecision::uint256_t;
 using uint512_t = boost::multiprecision::uint512_t;
 // SI dividers
-rai::uint128_t const kBDM_ratio = rai::uint128_t ("100000000000000000000000000000000"); // 10^32
-rai::uint128_t const BDM_ratio = rai::uint128_t ("100000000000000000000000000000"); // 10^29
-rai::uint128_t const bademcik_ratio = rai::uint128_t ("1000000000000000000000000000"); // 10^27
-rai::uint128_t const RAW_ratio = rai::uint128_t ("1"); // 10^0
-rai::uint128_t const mBDM_ratio = rai::uint128_t ("100000000000000000000000000"); // 10^26
-rai::uint128_t const uBDM_ratio = rai::uint128_t ("100000000000000000000000"); // 10^23
+badem::uint128_t const kBDM_ratio = badem::uint128_t ("100000"); // 10^5
+badem::uint128_t const BDM_ratio = badem::uint128_t ("100"); // 10^2
+badem::uint128_t const RAW_ratio = badem::uint128_t ("1"); // 10^0
 
 union uint128_union
 {
 public:
 	uint128_union () = default;
+	/**
+	 * Decode from hex string
+	 * @warning Aborts at runtime if the input is invalid
+	 */
 	uint128_union (std::string const &);
 	uint128_union (uint64_t);
-	uint128_union (rai::uint128_union const &) = default;
-	uint128_union (rai::uint128_t const &);
-	bool operator== (rai::uint128_union const &) const;
-	bool operator!= (rai::uint128_union const &) const;
-	bool operator< (rai::uint128_union const &) const;
-	bool operator> (rai::uint128_union const &) const;
+	uint128_union (badem::uint128_union const &) = default;
+	uint128_union (badem::uint128_t const &);
+	bool operator== (badem::uint128_union const &) const;
+	bool operator!= (badem::uint128_union const &) const;
+	bool operator< (badem::uint128_union const &) const;
+	bool operator> (badem::uint128_union const &) const;
 	void encode_hex (std::string &) const;
 	bool decode_hex (std::string const &);
 	void encode_dec (std::string &) const;
 	bool decode_dec (std::string const &);
-	std::string format_balance (rai::uint128_t scale, int precision, bool group_digits);
-	std::string format_balance (rai::uint128_t scale, int precision, bool group_digits, const std::locale & locale);
-	rai::uint128_t number () const;
+	std::string format_balance (badem::uint128_t scale, int precision, bool group_digits);
+	std::string format_balance (badem::uint128_t scale, int precision, bool group_digits, const std::locale & locale);
+	badem::uint128_t number () const;
 	void clear ();
 	bool is_zero () const;
 	std::string to_string () const;
@@ -54,22 +76,25 @@ class raw_key;
 union uint256_union
 {
 	uint256_union () = default;
+	/**
+	 * Decode from hex string
+	 * @warning Aborts at runtime if the input is invalid
+	 */
 	uint256_union (std::string const &);
 	uint256_union (uint64_t);
-	uint256_union (rai::uint256_t const &);
-	void encrypt (rai::raw_key const &, rai::raw_key const &, uint128_union const &);
-	uint256_union & operator^= (rai::uint256_union const &);
-	uint256_union operator^ (rai::uint256_union const &) const;
-	bool operator== (rai::uint256_union const &) const;
-	bool operator!= (rai::uint256_union const &) const;
-	bool operator< (rai::uint256_union const &) const;
+	uint256_union (badem::uint256_t const &);
+	void encrypt (badem::raw_key const &, badem::raw_key const &, uint128_union const &);
+	uint256_union & operator^= (badem::uint256_union const &);
+	uint256_union operator^ (badem::uint256_union const &) const;
+	bool operator== (badem::uint256_union const &) const;
+	bool operator!= (badem::uint256_union const &) const;
+	bool operator< (badem::uint256_union const &) const;
 	void encode_hex (std::string &) const;
 	bool decode_hex (std::string const &);
 	void encode_dec (std::string &) const;
 	bool decode_dec (std::string const &);
 	void encode_account (std::string &) const;
 	std::string to_account () const;
-	std::string to_account_split () const;
 	bool decode_account (std::string const &);
 	std::array<uint8_t, 32> bytes;
 	std::array<char, 32> chars;
@@ -79,7 +104,7 @@ union uint256_union
 	void clear ();
 	bool is_zero () const;
 	std::string to_string () const;
-	rai::uint256_t number () const;
+	badem::uint256_t number () const;
 };
 // All keys and hashes are 256 bit.
 using block_hash = uint256_union;
@@ -87,27 +112,24 @@ using account = uint256_union;
 using public_key = uint256_union;
 using private_key = uint256_union;
 using secret_key = uint256_union;
-using checksum = uint256_union;
 class raw_key
 {
 public:
 	raw_key () = default;
 	~raw_key ();
-	void decrypt (rai::uint256_union const &, rai::raw_key const &, uint128_union const &);
-	raw_key (rai::raw_key const &) = delete;
-	raw_key (rai::raw_key const &&) = delete;
-	rai::raw_key & operator= (rai::raw_key const &) = delete;
-	bool operator== (rai::raw_key const &) const;
-	bool operator!= (rai::raw_key const &) const;
-	rai::uint256_union data;
+	void decrypt (badem::uint256_union const &, badem::raw_key const &, uint128_union const &);
+	bool operator== (badem::raw_key const &) const;
+	bool operator!= (badem::raw_key const &) const;
+	badem::uint256_union data;
 };
 union uint512_union
 {
 	uint512_union () = default;
-	uint512_union (rai::uint512_t const &);
-	bool operator== (rai::uint512_union const &) const;
-	bool operator!= (rai::uint512_union const &) const;
-	rai::uint512_union & operator^= (rai::uint512_union const &);
+	uint512_union (badem::uint256_union const &, badem::uint256_union const &);
+	uint512_union (badem::uint512_t const &);
+	bool operator== (badem::uint512_union const &) const;
+	bool operator!= (badem::uint512_union const &) const;
+	badem::uint512_union & operator^= (badem::uint512_union const &);
 	void encode_hex (std::string &) const;
 	bool decode_hex (std::string const &);
 	std::array<uint8_t, 64> bytes;
@@ -115,33 +137,44 @@ union uint512_union
 	std::array<uint64_t, 8> qwords;
 	std::array<uint256_union, 2> uint256s;
 	void clear ();
-	rai::uint512_t number () const;
+	bool is_zero () const;
+	badem::uint512_t number () const;
 	std::string to_string () const;
 };
 // Only signatures are 512 bit.
 using signature = uint512_union;
 
-rai::uint512_union sign_message (rai::raw_key const &, rai::public_key const &, rai::uint256_union const &);
-bool validate_message (rai::public_key const &, rai::uint256_union const &, rai::uint512_union const &);
-void deterministic_key (rai::uint256_union const &, uint32_t, rai::uint256_union &);
+badem::uint512_union sign_message (badem::raw_key const &, badem::public_key const &, badem::uint256_union const &);
+bool validate_message (badem::public_key const &, badem::uint256_union const &, badem::uint512_union const &);
+bool validate_message_batch (const unsigned char **, size_t *, const unsigned char **, const unsigned char **, size_t, int *);
+void deterministic_key (badem::uint256_union const &, uint32_t, badem::uint256_union &);
+badem::public_key pub_key (badem::private_key const &);
 }
 
 namespace std
 {
 template <>
-struct hash<rai::uint256_union>
+struct hash<::badem::uint256_union>
 {
-	size_t operator() (rai::uint256_union const & data_a) const
+	size_t operator() (::badem::uint256_union const & data_a) const
 	{
 		return *reinterpret_cast<size_t const *> (data_a.bytes.data ());
 	}
 };
 template <>
-struct hash<rai::uint256_t>
+struct hash<::badem::uint256_t>
 {
-	size_t operator() (rai::uint256_t const & number_a) const
+	size_t operator() (::badem::uint256_t const & number_a) const
 	{
 		return number_a.convert_to<size_t> ();
+	}
+};
+template <>
+struct hash<::badem::uint512_union>
+{
+	size_t operator() (::badem::uint512_union const & data_a) const
+	{
+		return *reinterpret_cast<size_t const *> (data_a.bytes.data ());
 	}
 };
 }

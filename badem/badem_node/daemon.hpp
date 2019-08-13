@@ -1,3 +1,4 @@
+#include <badem/lib/errors.hpp>
 #include <badem/node/node.hpp>
 #include <badem/node/rpc.hpp>
 
@@ -6,19 +7,28 @@ namespace badem_daemon
 class daemon
 {
 public:
-	void run (boost::filesystem::path const &);
+	void run (boost::filesystem::path const &, badem::node_flags const & flags);
 };
 class daemon_config
 {
 public:
-	daemon_config (boost::filesystem::path const &);
-	bool deserialize_json (bool &, boost::property_tree::ptree &);
-	void serialize_json (boost::property_tree::ptree &);
-	bool upgrade_json (unsigned, boost::property_tree::ptree &);
+	daemon_config ();
+	badem::error deserialize_json (bool &, badem::jsonconfig &);
+	badem::error serialize_json (badem::jsonconfig &);
+	/** 
+	 * Returns true if an upgrade occurred
+	 * @param version The version to upgrade to.
+	 * @param config Configuration to upgrade.
+	 */
+	bool upgrade_json (unsigned version, badem::jsonconfig & config);
 	bool rpc_enable;
-	rai::rpc_config rpc;
-	rai::node_config node;
+	badem::rpc_config rpc;
+	badem::node_config node;
 	bool opencl_enable;
-	rai::opencl_config opencl;
+	badem::opencl_config opencl;
+	int json_version () const
+	{
+		return 2;
+	}
 };
 }

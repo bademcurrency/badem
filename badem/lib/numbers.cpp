@@ -1,13 +1,33 @@
 #include <badem/lib/numbers.hpp>
+#include <badem/lib/utility.hpp>
 
-#include <ed25519-donna/ed25519.h>
+#include <crypto/ed25519-donna/ed25519.h>
 
-#include <blake2/blake2.h>
+#include <crypto/blake2/blake2.h>
 
-#include <cryptopp/aes.h>
-#include <cryptopp/modes.h>
+#include <crypto/cryptopp/aes.h>
+#include <crypto/cryptopp/modes.h>
 
-thread_local CryptoPP::AutoSeededRandomPool rai::random_pool;
+std::mutex badem::random_pool::mutex;
+CryptoPP::AutoSeededRandomPool badem::random_pool::pool;
+
+void badem::random_pool::generate_block (unsigned char * output, size_t size)
+{
+	std::lock_guard<std::mutex> lk (mutex);
+	pool.GenerateBlock (output, size);
+}
+
+unsigned badem::random_pool::generate_word32 (unsigned min, unsigned max)
+{
+	std::lock_guard<std::mutex> lk (mutex);
+	return pool.GenerateWord32 (min, max);
+}
+
+unsigned char badem::random_pool::generate_byte ()
+{
+	std::lock_guard<std::mutex> lk (mutex);
+	return pool.GenerateByte ();
+}
 
 namespace
 {
@@ -16,8 +36,7 @@ uint8_t base58_decode (char value)
 {
 	assert (value >= '0');
 	assert (value <= '~');
-	auto result (base58_reverse[value - 0x30] - 0x30);
-	return result;
+	return static_cast<uint8_t> (base58_reverse[value - 0x30] - 0x30);
 }
 char const * account_lookup ("13456789abcdefghijkmnopqrstuwxyz");
 char const * account_reverse ("~0~1234567~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~89:;<=>?@AB~CDEFGHIJK~LMNO~~~~~");
@@ -31,12 +50,16 @@ uint8_t account_decode (char value)
 {
 	assert (value >= '0');
 	assert (value <= '~');
-	auto result (account_reverse[value - 0x30] - 0x30);
+	auto result (account_reverse[value - 0x30]);
+	if (result != '~')
+	{
+		result -= 0x30;
+	}
 	return result;
 }
 }
 
-void rai::uint256_union::encode_account (std::string & destination_a) const
+void badem::uint256_union::encode_account (std::string & destination_a) const
 {
 	assert (destination_a.empty ());
 	destination_a.reserve (64);
@@ -45,9 +68,9 @@ void rai::uint256_union::encode_account (std::string & destination_a) const
 	blake2b_init (&hash, 5);
 	blake2b_update (&hash, bytes.data (), bytes.size ());
 	blake2b_final (&hash, reinterpret_cast<uint8_t *> (&check), 5);
-	rai::uint512_t number_l (number ());
+	badem::uint512_t number_l (number ());
 	number_l <<= 40;
-	number_l |= rai::uint512_t (check);
+	number_l |= badem::uint512_t (check);
 	for (auto i (0); i < 60; ++i)
 	{
 		uint8_t r (number_l & static_cast<uint8_t> (0x1f));
@@ -58,22 +81,14 @@ void rai::uint256_union::encode_account (std::string & destination_a) const
 	std::reverse (destination_a.begin (), destination_a.end ());
 }
 
-std::string rai::uint256_union::to_account_split () const
-{
-	auto result (to_account ());
-	assert (result.size () == 64);
-	result.insert (32, "\n");
-	return result;
-}
-
-std::string rai::uint256_union::to_account () const
+std::string badem::uint256_union::to_account () const
 {
 	std::string result;
 	encode_account (result);
 	return result;
 }
 
-bool rai::uint256_union::decode_account (std::string const & source_a)
+bool badem::uint256_union::decode_account (std::string const & source_a)
 {
 	auto error (source_a.size () < 5);
 	if (!error)
@@ -87,7 +102,7 @@ bool rai::uint256_union::decode_account (std::string const & source_a)
 				auto i (source_a.begin () + (bdm_prefix ? 4 : 5));
 				if (*i == '1' || *i == '3')
 				{
-					rai::uint512_t number_l;
+					badem::uint512_t number_l;
 					for (auto j (source_a.end ()); !error && i != j; ++i)
 					{
 						uint8_t character (*i);
@@ -105,7 +120,7 @@ bool rai::uint256_union::decode_account (std::string const & source_a)
 					}
 					if (!error)
 					{
-						*this = (number_l >> 40).convert_to<rai::uint256_t> ();
+						*this = (number_l >> 40).convert_to<badem::uint256_t> ();
 						uint64_t check (number_l & static_cast<uint64_t> (0xffffffffff));
 						uint64_t validation (0);
 						blake2b_state hash;
@@ -129,47 +144,43 @@ bool rai::uint256_union::decode_account (std::string const & source_a)
 	return error;
 }
 
-rai::uint256_union::uint256_union (rai::uint256_t const & number_a)
+badem::uint256_union::uint256_union (badem::uint256_t const & number_a)
 {
-	rai::uint256_t number_l (number_a);
-	for (auto i (bytes.rbegin ()), n (bytes.rend ()); i != n; ++i)
-	{
-		*i = static_cast<uint8_t> (number_l & static_cast<uint8_t> (0xff));
-		number_l >>= 8;
-	}
+	bytes.fill (0);
+	boost::multiprecision::export_bits (number_a, bytes.rbegin (), 8, false);
 }
 
-bool rai::uint256_union::operator== (rai::uint256_union const & other_a) const
+bool badem::uint256_union::operator== (badem::uint256_union const & other_a) const
 {
 	return bytes == other_a.bytes;
 }
 
 // Construct a uint256_union = AES_ENC_CTR (cleartext, key, iv)
-void rai::uint256_union::encrypt (rai::raw_key const & cleartext, rai::raw_key const & key, uint128_union const & iv)
+void badem::uint256_union::encrypt (badem::raw_key const & cleartext, badem::raw_key const & key, uint128_union const & iv)
 {
 	CryptoPP::AES::Encryption alg (key.data.bytes.data (), sizeof (key.data.bytes));
 	CryptoPP::CTR_Mode_ExternalCipher::Encryption enc (alg, iv.bytes.data ());
 	enc.ProcessData (bytes.data (), cleartext.data.bytes.data (), sizeof (cleartext.data.bytes));
 }
 
-bool rai::uint256_union::is_zero () const
+bool badem::uint256_union::is_zero () const
 {
 	return qwords[0] == 0 && qwords[1] == 0 && qwords[2] == 0 && qwords[3] == 0;
 }
 
-std::string rai::uint256_union::to_string () const
+std::string badem::uint256_union::to_string () const
 {
 	std::string result;
 	encode_hex (result);
 	return result;
 }
 
-bool rai::uint256_union::operator< (rai::uint256_union const & other_a) const
+bool badem::uint256_union::operator< (badem::uint256_union const & other_a) const
 {
-	return number () < other_a.number ();
+	return std::memcmp (bytes.data (), other_a.bytes.data (), 32) < 0;
 }
 
-rai::uint256_union & rai::uint256_union::operator^= (rai::uint256_union const & other_a)
+badem::uint256_union & badem::uint256_union::operator^= (badem::uint256_union const & other_a)
 {
 	auto j (other_a.qwords.begin ());
 	for (auto i (qwords.begin ()), n (qwords.end ()); i != n; ++i, ++j)
@@ -179,9 +190,9 @@ rai::uint256_union & rai::uint256_union::operator^= (rai::uint256_union const & 
 	return *this;
 }
 
-rai::uint256_union rai::uint256_union::operator^ (rai::uint256_union const & other_a) const
+badem::uint256_union badem::uint256_union::operator^ (badem::uint256_union const & other_a) const
 {
-	rai::uint256_union result;
+	badem::uint256_union result;
 	auto k (result.qwords.begin ());
 	for (auto i (qwords.begin ()), j (other_a.qwords.begin ()), n (qwords.end ()); i != n; ++i, ++j, ++k)
 	{
@@ -190,30 +201,26 @@ rai::uint256_union rai::uint256_union::operator^ (rai::uint256_union const & oth
 	return result;
 }
 
-rai::uint256_union::uint256_union (std::string const & hex_a)
+badem::uint256_union::uint256_union (std::string const & hex_a)
 {
-	decode_hex (hex_a);
+	auto error (decode_hex (hex_a));
+
+	release_assert (!error);
 }
 
-void rai::uint256_union::clear ()
+void badem::uint256_union::clear ()
 {
 	qwords.fill (0);
 }
 
-rai::uint256_t rai::uint256_union::number () const
+badem::uint256_t badem::uint256_union::number () const
 {
-	rai::uint256_t result;
-	auto shift (0);
-	for (auto i (bytes.begin ()), n (bytes.end ()); i != n; ++i)
-	{
-		result <<= shift;
-		result |= *i;
-		shift = 8;
-	}
+	badem::uint256_t result;
+	boost::multiprecision::import_bits (result, bytes.begin (), bytes.end (), false);
 	return result;
 }
 
-void rai::uint256_union::encode_hex (std::string & text) const
+void badem::uint256_union::encode_hex (std::string & text) const
 {
 	assert (text.empty ());
 	std::stringstream stream;
@@ -222,14 +229,14 @@ void rai::uint256_union::encode_hex (std::string & text) const
 	text = stream.str ();
 }
 
-bool rai::uint256_union::decode_hex (std::string const & text)
+bool badem::uint256_union::decode_hex (std::string const & text)
 {
 	auto error (false);
 	if (!text.empty () && text.size () <= 64)
 	{
 		std::stringstream stream (text);
 		stream << std::hex << std::noshowbase;
-		rai::uint256_t number_l;
+		badem::uint256_t number_l;
 		try
 		{
 			stream >> number_l;
@@ -251,7 +258,7 @@ bool rai::uint256_union::decode_hex (std::string const & text)
 	return error;
 }
 
-void rai::uint256_union::encode_dec (std::string & text) const
+void badem::uint256_union::encode_dec (std::string & text) const
 {
 	assert (text.empty ());
 	std::stringstream stream;
@@ -260,14 +267,14 @@ void rai::uint256_union::encode_dec (std::string & text) const
 	text = stream.str ();
 }
 
-bool rai::uint256_union::decode_dec (std::string const & text)
+bool badem::uint256_union::decode_dec (std::string const & text)
 {
 	auto error (text.size () > 78 || (text.size () > 1 && text[0] == '0') || (text.size () > 0 && text[0] == '-'));
 	if (!error)
 	{
 		std::stringstream stream (text);
 		stream << std::dec << std::noshowbase;
-		rai::uint256_t number_l;
+		badem::uint256_t number_l;
 		try
 		{
 			stream >> number_l;
@@ -285,50 +292,52 @@ bool rai::uint256_union::decode_dec (std::string const & text)
 	return error;
 }
 
-rai::uint256_union::uint256_union (uint64_t value0)
+badem::uint256_union::uint256_union (uint64_t value0)
 {
-	*this = rai::uint256_t (value0);
+	*this = badem::uint256_t (value0);
 }
 
-bool rai::uint256_union::operator!= (rai::uint256_union const & other_a) const
+bool badem::uint256_union::operator!= (badem::uint256_union const & other_a) const
 {
 	return !(*this == other_a);
 }
 
-bool rai::uint512_union::operator== (rai::uint512_union const & other_a) const
+bool badem::uint512_union::operator== (badem::uint512_union const & other_a) const
 {
 	return bytes == other_a.bytes;
 }
 
-rai::uint512_union::uint512_union (rai::uint512_t const & number_a)
+badem::uint512_union::uint512_union (badem::uint256_union const & upper, badem::uint256_union const & lower)
 {
-	rai::uint512_t number_l (number_a);
-	for (auto i (bytes.rbegin ()), n (bytes.rend ()); i != n; ++i)
-	{
-		*i = static_cast<uint8_t> (number_l & static_cast<uint8_t> (0xff));
-		number_l >>= 8;
-	}
+	uint256s[0] = upper;
+	uint256s[1] = lower;
 }
 
-void rai::uint512_union::clear ()
+badem::uint512_union::uint512_union (badem::uint512_t const & number_a)
+{
+	bytes.fill (0);
+	boost::multiprecision::export_bits (number_a, bytes.rbegin (), 8, false);
+}
+
+bool badem::uint512_union::is_zero () const
+{
+	return qwords[0] == 0 && qwords[1] == 0 && qwords[2] == 0 && qwords[3] == 0
+	&& qwords[4] == 0 && qwords[5] == 0 && qwords[6] == 0 && qwords[7] == 0;
+}
+
+void badem::uint512_union::clear ()
 {
 	bytes.fill (0);
 }
 
-rai::uint512_t rai::uint512_union::number () const
+badem::uint512_t badem::uint512_union::number () const
 {
-	rai::uint512_t result;
-	auto shift (0);
-	for (auto i (bytes.begin ()), n (bytes.end ()); i != n; ++i)
-	{
-		result <<= shift;
-		result |= *i;
-		shift = 8;
-	}
+	badem::uint512_t result;
+	boost::multiprecision::import_bits (result, bytes.begin (), bytes.end (), false);
 	return result;
 }
 
-void rai::uint512_union::encode_hex (std::string & text) const
+void badem::uint512_union::encode_hex (std::string & text) const
 {
 	assert (text.empty ());
 	std::stringstream stream;
@@ -337,14 +346,14 @@ void rai::uint512_union::encode_hex (std::string & text) const
 	text = stream.str ();
 }
 
-bool rai::uint512_union::decode_hex (std::string const & text)
+bool badem::uint512_union::decode_hex (std::string const & text)
 {
 	auto error (text.size () > 128);
 	if (!error)
 	{
 		std::stringstream stream (text);
 		stream << std::hex << std::noshowbase;
-		rai::uint512_t number_l;
+		badem::uint512_t number_l;
 		try
 		{
 			stream >> number_l;
@@ -362,125 +371,130 @@ bool rai::uint512_union::decode_hex (std::string const & text)
 	return error;
 }
 
-bool rai::uint512_union::operator!= (rai::uint512_union const & other_a) const
+bool badem::uint512_union::operator!= (badem::uint512_union const & other_a) const
 {
 	return !(*this == other_a);
 }
 
-rai::uint512_union & rai::uint512_union::operator^= (rai::uint512_union const & other_a)
+badem::uint512_union & badem::uint512_union::operator^= (badem::uint512_union const & other_a)
 {
 	uint256s[0] ^= other_a.uint256s[0];
 	uint256s[1] ^= other_a.uint256s[1];
 	return *this;
 }
 
-std::string rai::uint512_union::to_string () const
+std::string badem::uint512_union::to_string () const
 {
 	std::string result;
 	encode_hex (result);
 	return result;
 }
 
-rai::raw_key::~raw_key ()
+badem::raw_key::~raw_key ()
 {
 	data.clear ();
 }
 
-bool rai::raw_key::operator== (rai::raw_key const & other_a) const
+bool badem::raw_key::operator== (badem::raw_key const & other_a) const
 {
 	return data == other_a.data;
 }
 
-bool rai::raw_key::operator!= (rai::raw_key const & other_a) const
+bool badem::raw_key::operator!= (badem::raw_key const & other_a) const
 {
 	return !(*this == other_a);
 }
 
 // This this = AES_DEC_CTR (ciphertext, key, iv)
-void rai::raw_key::decrypt (rai::uint256_union const & ciphertext, rai::raw_key const & key_a, uint128_union const & iv)
+void badem::raw_key::decrypt (badem::uint256_union const & ciphertext, badem::raw_key const & key_a, uint128_union const & iv)
 {
 	CryptoPP::AES::Encryption alg (key_a.data.bytes.data (), sizeof (key_a.data.bytes));
 	CryptoPP::CTR_Mode_ExternalCipher::Decryption dec (alg, iv.bytes.data ());
 	dec.ProcessData (data.bytes.data (), ciphertext.bytes.data (), sizeof (ciphertext.bytes));
 }
 
-rai::uint512_union rai::sign_message (rai::raw_key const & private_key, rai::public_key const & public_key, rai::uint256_union const & message)
+badem::uint512_union badem::sign_message (badem::raw_key const & private_key, badem::public_key const & public_key, badem::uint256_union const & message)
 {
-	rai::uint512_union result;
+	badem::uint512_union result;
 	ed25519_sign (message.bytes.data (), sizeof (message.bytes), private_key.data.bytes.data (), public_key.bytes.data (), result.bytes.data ());
 	return result;
 }
 
-void rai::deterministic_key (rai::uint256_union const & seed_a, uint32_t index_a, rai::uint256_union & prv_a)
+void badem::deterministic_key (badem::uint256_union const & seed_a, uint32_t index_a, badem::uint256_union & prv_a)
 {
 	blake2b_state hash;
 	blake2b_init (&hash, prv_a.bytes.size ());
 	blake2b_update (&hash, seed_a.bytes.data (), seed_a.bytes.size ());
-	rai::uint256_union index (index_a);
+	badem::uint256_union index (index_a);
 	blake2b_update (&hash, reinterpret_cast<uint8_t *> (&index.dwords[7]), sizeof (uint32_t));
 	blake2b_final (&hash, prv_a.bytes.data (), prv_a.bytes.size ());
 }
 
-bool rai::validate_message (rai::public_key const & public_key, rai::uint256_union const & message, rai::uint512_union const & signature)
+badem::public_key badem::pub_key (badem::private_key const & privatekey_a)
+{
+	badem::uint256_union result;
+	ed25519_publickey (privatekey_a.bytes.data (), result.bytes.data ());
+	return result;
+}
+
+bool badem::validate_message (badem::public_key const & public_key, badem::uint256_union const & message, badem::uint512_union const & signature)
 {
 	auto result (0 != ed25519_sign_open (message.bytes.data (), sizeof (message.bytes), public_key.bytes.data (), signature.bytes.data ()));
 	return result;
 }
 
-rai::uint128_union::uint128_union (std::string const & string_a)
+bool badem::validate_message_batch (const unsigned char ** m, size_t * mlen, const unsigned char ** pk, const unsigned char ** RS, size_t num, int * valid)
 {
-	decode_hex (string_a);
+	bool result (0 == ed25519_sign_open_batch (m, mlen, pk, RS, num, valid));
+	return result;
 }
 
-rai::uint128_union::uint128_union (uint64_t value_a)
+badem::uint128_union::uint128_union (std::string const & string_a)
 {
-	*this = rai::uint128_t (value_a);
+	auto error (decode_hex (string_a));
+
+	release_assert (!error);
 }
 
-rai::uint128_union::uint128_union (rai::uint128_t const & value_a)
+badem::uint128_union::uint128_union (uint64_t value_a)
 {
-	rai::uint128_t number_l (value_a);
-	for (auto i (bytes.rbegin ()), n (bytes.rend ()); i != n; ++i)
-	{
-		*i = static_cast<uint8_t> (number_l & static_cast<uint8_t> (0xff));
-		number_l >>= 8;
-	}
+	*this = badem::uint128_t (value_a);
 }
 
-bool rai::uint128_union::operator== (rai::uint128_union const & other_a) const
+badem::uint128_union::uint128_union (badem::uint128_t const & number_a)
+{
+	bytes.fill (0);
+	boost::multiprecision::export_bits (number_a, bytes.rbegin (), 8, false);
+}
+
+bool badem::uint128_union::operator== (badem::uint128_union const & other_a) const
 {
 	return qwords[0] == other_a.qwords[0] && qwords[1] == other_a.qwords[1];
 }
 
-bool rai::uint128_union::operator!= (rai::uint128_union const & other_a) const
+bool badem::uint128_union::operator!= (badem::uint128_union const & other_a) const
 {
 	return !(*this == other_a);
 }
 
-bool rai::uint128_union::operator< (rai::uint128_union const & other_a) const
+bool badem::uint128_union::operator< (badem::uint128_union const & other_a) const
 {
-	return number () < other_a.number ();
+	return std::memcmp (bytes.data (), other_a.bytes.data (), 16) < 0;
 }
 
-bool rai::uint128_union::operator> (rai::uint128_union const & other_a) const
+bool badem::uint128_union::operator> (badem::uint128_union const & other_a) const
 {
-	return number () > other_a.number ();
+	return std::memcmp (bytes.data (), other_a.bytes.data (), 16) > 0;
 }
 
-rai::uint128_t rai::uint128_union::number () const
+badem::uint128_t badem::uint128_union::number () const
 {
-	rai::uint128_t result;
-	auto shift (0);
-	for (auto i (bytes.begin ()), n (bytes.end ()); i != n; ++i)
-	{
-		result <<= shift;
-		result |= *i;
-		shift = 8;
-	}
+	badem::uint128_t result;
+	boost::multiprecision::import_bits (result, bytes.begin (), bytes.end (), false);
 	return result;
 }
 
-void rai::uint128_union::encode_hex (std::string & text) const
+void badem::uint128_union::encode_hex (std::string & text) const
 {
 	assert (text.empty ());
 	std::stringstream stream;
@@ -489,14 +503,14 @@ void rai::uint128_union::encode_hex (std::string & text) const
 	text = stream.str ();
 }
 
-bool rai::uint128_union::decode_hex (std::string const & text)
+bool badem::uint128_union::decode_hex (std::string const & text)
 {
 	auto error (text.size () > 32);
 	if (!error)
 	{
 		std::stringstream stream (text);
 		stream << std::hex << std::noshowbase;
-		rai::uint128_t number_l;
+		badem::uint128_t number_l;
 		try
 		{
 			stream >> number_l;
@@ -514,7 +528,7 @@ bool rai::uint128_union::decode_hex (std::string const & text)
 	return error;
 }
 
-void rai::uint128_union::encode_dec (std::string & text) const
+void badem::uint128_union::encode_dec (std::string & text) const
 {
 	assert (text.empty ());
 	std::stringstream stream;
@@ -523,7 +537,7 @@ void rai::uint128_union::encode_dec (std::string & text) const
 	text = stream.str ();
 }
 
-bool rai::uint128_union::decode_dec (std::string const & text)
+bool badem::uint128_union::decode_dec (std::string const & text)
 {
 	auto error (text.size () > 39 || (text.size () > 1 && text[0] == '0') || (text.size () > 0 && text[0] == '-'));
 	if (!error)
@@ -534,7 +548,7 @@ bool rai::uint128_union::decode_dec (std::string const & text)
 		try
 		{
 			stream >> number_l;
-			rai::uint128_t unchecked (number_l);
+			badem::uint128_t unchecked (number_l);
 			*this = unchecked;
 			if (!stream.eof ())
 			{
@@ -549,7 +563,7 @@ bool rai::uint128_union::decode_dec (std::string const & text)
 	return error;
 }
 
-void format_frac (std::ostringstream & stream, rai::uint128_t value, rai::uint128_t scale, int precision)
+void format_frac (std::ostringstream & stream, badem::uint128_t value, badem::uint128_t scale, int precision)
 {
 	auto reduce = scale;
 	auto rem = value;
@@ -563,9 +577,9 @@ void format_frac (std::ostringstream & stream, rai::uint128_t value, rai::uint12
 	}
 }
 
-void format_dec (std::ostringstream & stream, rai::uint128_t value, char group_sep, const std::string & groupings)
+void format_dec (std::ostringstream & stream, badem::uint128_t value, char group_sep, const std::string & groupings)
 {
-	auto largestPow10 = rai::uint256_t (1);
+	auto largestPow10 = badem::uint256_t (1);
 	int dec_count = 1;
 	while (1)
 	{
@@ -606,8 +620,8 @@ void format_dec (std::ostringstream & stream, rai::uint128_t value, char group_s
 		}
 	}
 
-	auto reduce = rai::uint128_t (largestPow10);
-	rai::uint128_t rem = value;
+	auto reduce = badem::uint128_t (largestPow10);
+	badem::uint128_t rem = value;
 	while (reduce > 0)
 	{
 		auto val = rem / reduce;
@@ -622,7 +636,7 @@ void format_dec (std::ostringstream & stream, rai::uint128_t value, char group_s
 	}
 }
 
-std::string format_balance (rai::uint128_t balance, rai::uint128_t scale, int precision, bool group_digits, char thousands_sep, char decimal_point, std::string & grouping)
+std::string format_balance (badem::uint128_t balance, badem::uint128_t scale, int precision, bool group_digits, char thousands_sep, char decimal_point, std::string & grouping)
 {
 	std::ostringstream stream;
 	auto int_part = balance / scale;
@@ -659,7 +673,7 @@ std::string format_balance (rai::uint128_t balance, rai::uint128_t scale, int pr
 	return stream.str ();
 }
 
-std::string rai::uint128_union::format_balance (rai::uint128_t scale, int precision, bool group_digits)
+std::string badem::uint128_union::format_balance (badem::uint128_t scale, int precision, bool group_digits)
 {
 	auto thousands_sep = std::use_facet<std::numpunct<char>> (std::locale ()).thousands_sep ();
 	auto decimal_point = std::use_facet<std::numpunct<char>> (std::locale ()).decimal_point ();
@@ -667,7 +681,7 @@ std::string rai::uint128_union::format_balance (rai::uint128_t scale, int precis
 	return ::format_balance (number (), scale, precision, group_digits, thousands_sep, decimal_point, grouping);
 }
 
-std::string rai::uint128_union::format_balance (rai::uint128_t scale, int precision, bool group_digits, const std::locale & locale)
+std::string badem::uint128_union::format_balance (badem::uint128_t scale, int precision, bool group_digits, const std::locale & locale)
 {
 	auto thousands_sep = std::use_facet<std::moneypunct<char>> (locale).thousands_sep ();
 	auto decimal_point = std::use_facet<std::moneypunct<char>> (locale).decimal_point ();
@@ -675,24 +689,24 @@ std::string rai::uint128_union::format_balance (rai::uint128_t scale, int precis
 	return ::format_balance (number (), scale, precision, group_digits, thousands_sep, decimal_point, grouping);
 }
 
-void rai::uint128_union::clear ()
+void badem::uint128_union::clear ()
 {
 	qwords.fill (0);
 }
 
-bool rai::uint128_union::is_zero () const
+bool badem::uint128_union::is_zero () const
 {
 	return qwords[0] == 0 && qwords[1] == 0;
 }
 
-std::string rai::uint128_union::to_string () const
+std::string badem::uint128_union::to_string () const
 {
 	std::string result;
 	encode_hex (result);
 	return result;
 }
 
-std::string rai::uint128_union::to_string_dec () const
+std::string badem::uint128_union::to_string_dec () const
 {
 	std::string result;
 	encode_dec (result);
